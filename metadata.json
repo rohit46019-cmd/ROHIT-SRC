@@ -1,0 +1,6 @@
+{
+  "name": "Telegram Bot Studio",
+  "description": "A management dashboard and backend for an official Telegram Bot using the Telegram Bot API.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
