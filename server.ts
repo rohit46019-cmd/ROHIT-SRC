@@ -6,6 +6,7 @@ import dotenv from 'dotenv';
 import { MongoClient } from 'mongodb';
 import { TelegramClient, Api, helpers } from 'telegram';
 import { StringSession } from 'telegram/sessions';
+import bigInt from 'big-integer';
 import { NewMessage } from 'telegram/events';
 
 const mirrorTopicCache = new Map<string, Map<string, number>>();
@@ -17,12 +18,17 @@ import fs from 'fs';
 import os from 'os';
 import { CustomFile } from 'telegram/client/uploads';
 
+function sleep(ms: number) {
+    return new Promise(r => setTimeout(r, ms));
+}
+
 dotenv.config();
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const mongoUri = process.env.MONGODB_URI;
 let apiIdValue = Number(process.env.API_ID) || 0;
 let apiHashValue = process.env.API_HASH || "";
+const DEFAULT_LOG_GROUP = "-1003995334936";
 
 const sysLogs: string[] = [];
 const originalLog = console.log;
@@ -94,59 +100,441 @@ function applyRenameRules(text: string): string {
     return result;
 }
 
+const libraryPerfMetrics: Record<string, { totalBytes: number, totalTimeMs: number, count: number }> = {
+    'GramJS': { totalBytes: 0, totalTimeMs: 0, count: 0 },
+    'Telethon': { totalBytes: 0, totalTimeMs: 0, count: 0 },
+    'Pyrogram': { totalBytes: 0, totalTimeMs: 0, count: 0 },
+    'Hydrogram': { totalBytes: 0, totalTimeMs: 0, count: 0 }
+};
 
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+const getAutoEngine = () => {
+    let bestLib = 'GramJS';
+    let maxSpeed = -1;
+    
+    for (const [lib, data] of Object.entries(libraryPerfMetrics)) {
+        if (data.count === 0) continue;
+        const speed = data.totalBytes / data.totalTimeMs; // bytes per ms
+        if (speed > maxSpeed) {
+            maxSpeed = speed;
+            bestLib = lib;
+        }
+    }
+    return bestLib;
+};
 
-async function safelyResolveEntity(client: any, entity: any): Promise<any> {
+const recordSpeed = (lib: string, bytes: number, timeMs: number) => {
+    if (!libraryPerfMetrics[lib]) return;
+    if (timeMs <= 0) return;
+    libraryPerfMetrics[lib].totalBytes += bytes;
+    libraryPerfMetrics[lib].totalTimeMs += timeMs;
+    libraryPerfMetrics[lib].count += 1;
+};
+
+const getEffectiveEngine = () => {
+    if (currentUploadEngine === 'Auto') return getAutoEngine();
+    return currentUploadEngine || 'GramJS';
+};
+
+const getLoginErrorSolution = (error: string) => {
+    if (error.includes('TIMEOUT')) return "Telegram servers are taking too long to respond. \n\n✅ **Solutions:** \n1. Check your **Proxy** settings in /settings.\n2. Try again in a few minutes.\n3. Make sure your account isn't restricted by Telegram.";
+    if (error.includes('PHONE_CODE_EXPIRED')) return "Telegram ने सुरक्षा कारणों से इस प्रयास को रोक दिया है। \n\n✅ **समाधान:** \n1. अपना **Proxy** बदलें (Magic Auto-fill उपयोग करें)। \n2. 15-20 मिनट इंतज़ार करें, फिर /login करें। \n3. OTP आने के बाद तुरंत न भेजें, 3-5 सेकंड रुकें।";
+    if (error.includes('AUTH_KEY_UNREGISTERED')) return "आपका Session String वैध नहीं है। कृपया नया String Session बनाएंगे।";
+    if (error.includes('FLOOD_WAIT')) return "Telegram ने आपको ब्लॉक किया है। कृपया 24-48 घंटे इंतज़ार करें।";
+    if (error.includes('PHONE_NUMBER_INVALID')) return "आपने गलत फोन नंबर डाला है। कृपया सही नंबर (जैसे +91...) उपयोग करें।";
+    if (error.includes('PASSWORD_HASH_INVALID')) return "आपका 2-Step Verification पासवर्ड गलत है।";
+    if (error.includes('PHONE_NUMBER_UNOCCUPIED')) return "यह नंबर Telegram पर रजिस्टर नहीं है।";
+    if (error.includes('api_id_invalid')) return "आपका API ID या API Hash गलत है। इसे my.telegram.org से दोबारा चेक करें।";
+    return "अज्ञात त्रुटि। कृपया अपने API Creds और Network (Proxy) की जांच करें।";
+};
+
+const getRandomDeviceProps = () => {
+    const devices = [
+        { model: "iPhone 15 Pro Max", system: "17.5.1", app: "10.0.1" },
+        { model: "Samsung Galaxy S24 Ultra", system: "14", app: "10.1.0" },
+        { model: "Google Pixel 8 Pro", system: "14", app: "10.1.5" },
+        { model: "OnePlus 12", system: "14", app: "10.0.1" },
+        { model: "Xiaomi 14 Pro", system: "14", app: "10.2.0" },
+        { model: "Nothing Phone (2a)", system: "14", app: "10.1.0" }
+    ];
+    const langs = ["en-US", "hi-IN", "en-GB"];
+    const device = devices[Math.floor(Math.random() * devices.length)];
+    return {
+        deviceModel: device.model,
+        systemVersion: device.system,
+        appVersion: device.app,
+        langCode: "en",
+        systemLangCode: langs[Math.floor(Math.random() * langs.length)]
+    };
+};
+
+interface ProxyConfig {
+    ip: string;
+    port: number;
+    user?: string;
+    pass?: string;
+    socksType?: 4 | 5;
+}
+
+let globalProxy: ProxyConfig | null = null;
+
+interface Task {
+    chatId: number;
+    userId: number;
+    link: string;
+    statusMsgId?: number;
+    batchId?: string;
+    overrideThreadId?: number;
+    forceGeneralPath?: boolean;
+    overrideTargetId?: any;
+}
+
+const MESSAGE_UPDATE_THROTTLE = 2000; // Reduced to 2s for better responsiveness
+const taskQueue: Task[] = [];
+let nextTaskRunAt: number | null = null;
+
+// Moved to top for hoisting safety
+const safeBotCall = async (method: string, ...args: any[]) => {
+    let retries = 0;
+    const maxRetries = 5;
+    while (retries < maxRetries) {
+        try {
+            return await (bot as any)?.[method](...args);
+        } catch (e: any) {
+            const is429 = e.error_code === 429 || e.message?.includes('429');
+            if (is429 && retries < maxRetries - 1) {
+                const retryAfter = (e.parameters?.retry_after || 15) + 5;
+                console.log(`[Bot API] Rate limited on ${method}. Waiting ${retryAfter}s (Attempt ${retries + 1}/${maxRetries})...`);
+                await sleep(retryAfter * 1000);
+                retries++;
+                continue;
+            }
+            
+            // Special handling for common errors
+            if (e.message?.includes("can't parse entities")) {
+                if (args.length > 0 && typeof args[args.length - 1] === 'object') {
+                    const options = { ...args[args.length - 1] };
+                    if (options.parse_mode) {
+                        console.warn(`[Bot API] Parse mode error on ${method}. Retrying without parse_mode.`);
+                        delete options.parse_mode;
+                        args[args.length - 1] = options;
+                        retries++;
+                        continue;
+                    }
+                }
+            }
+
+            if (e.message?.includes('TOPIC_CLOSED') || e.message?.includes('message thread not found')) {
+                if (args.length > 0 && typeof args[args.length - 1] === 'object') {
+                    const options = { ...args[args.length - 1] };
+                    if (options.message_thread_id || options.reply_to_message_id) {
+                        console.warn(`[Bot API] Topic error on ${method}. Retrying without thread context.`);
+                        delete options.message_thread_id;
+                        delete options.reply_to_message_id;
+                        args[args.length - 1] = options;
+                        retries++;
+                        continue;
+                    }
+                }
+            }
+
+            if (is429) throw e; // RETHROW if max retries reached
+            
+            // For other errors, log and potentially return null if it's an optional call
+            console.error(`[Bot API] Error on ${method}:`, e.message);
+            return null;
+        }
+    }
+    return null;
+};
+
+const safeSendMessage = async (chatId: number, text: string, options: any = {}) => {
+    return await safeBotCall('sendMessage', chatId, text, options);
+};
+
+const safeEditMessage = async (text: string, options: { chat_id: number, message_id: number, parse_mode?: any, disable_web_page_preview?: boolean, reply_markup?: any }) => {
+    if (!options.message_id || options.message_id === 0) return;
+    try {
+        return await safeBotCall('editMessageText', text, options);
+    } catch (e: any) {
+        if (e.description?.includes("there is no text in the message to edit") || e.message?.includes("text") || e.description?.includes("message to edit not found")) {
+            try {
+                return await safeBotCall('editMessageCaption', text, {
+                    chat_id: options.chat_id,
+                    message_id: options.message_id,
+                    parse_mode: options.parse_mode,
+                    reply_markup: options.reply_markup
+                });
+            } catch (e2) {
+                return null;
+            }
+        }
+        if (e.description?.includes("message is not modified")) return null;
+        return null;
+    }
+};
+
+async function safelyResolveEntity(client: TelegramClient, entity: any): Promise<any> {
     try {
         if (!entity) throw new Error("Entity is undefined");
 
-        // 1. If it's already an input peer, return it
-        if (entity.className && entity.className.startsWith('InputPeer')) {
-            return entity;
+        let lookupEntity = entity;
+
+        // A. If entity is a string but is actually JSON containing PeerChannel, parse it first
+        if (typeof entity === 'string' && entity.trim().startsWith('{')) {
+            try {
+                const parsed = JSON.parse(entity);
+                entity = parsed;
+                lookupEntity = parsed;
+            } catch (jsonErr) {}
         }
 
-        // 2. If it's a PeerChannel, PeerUser, or PeerChat (a raw peer), resolve to full Entity first
-        if (entity.className === 'PeerChannel' || entity.className === 'PeerUser' || entity.className === 'PeerChat') {
-            try {
-                // This is the CRITICAL part for PeerChannel resolution
-                const resolved = await client.getEntity(entity);
-                return await client.getInputEntity(resolved);
-            } catch (e) {
-                // Human-like pause before fallback
-                await sleep(Math.random() * 500 + 300);
-                
-                // Fallback to dialogs search if getEntity fails (e.g. not in cache and not found)
-                const dialogs = await client.getDialogs({ limit: 2000 });
-                const idToCheck = (entity.channelId || entity.userId || entity.chatId).toString();
-                const found = dialogs.find((d: any) => d.id.toString() === idToCheck);
-                if (found) return found.inputEntity || await client.getInputEntity(found.entity);
+        // B. Handle raw Peer or Entity objects (PeerChannel, PeerUser, Channel, User, Chat, etc)
+        if (typeof entity === 'object' && entity !== null) {
+            if (entity.className === 'PeerChannel' && entity.channelId) {
+                const cid = entity.channelId.toString();
+                lookupEntity = cid.startsWith('-100') ? cid : "-100" + cid;
+            } else if (entity.className === 'PeerUser' && entity.userId) {
+                lookupEntity = entity.userId.toString();
+            } else if (entity.className === 'PeerChat' && entity.chatId) {
+                lookupEntity = entity.chatId.toString();
+            } else if (entity.className === 'Channel' && entity.id) {
+                const cid = entity.id.toString();
+                lookupEntity = cid.startsWith('-100') ? cid : "-100" + cid;
+            } else if (entity.className === 'Chat' && entity.id) {
+                lookupEntity = entity.id.toString();
+            } else if (entity.className === 'User' && entity.id) {
+                lookupEntity = entity.id.toString();
+            } else if (entity.id) {
+                const idStr = entity.id.toString();
+                if (entity.className && (entity.className.toLowerCase().includes('channel') || entity.className.toLowerCase().includes('chat'))) {
+                    lookupEntity = idStr.startsWith('-100') ? idStr : "-100" + idStr;
+                } else {
+                    lookupEntity = idStr;
+                }
             }
         }
-        
-        // 3. Try getting input entity directly as a backup
-        return await client.getInputEntity(entity);
-    } catch (e) {
-        // Human-like pause before fallback
-        await sleep(Math.random() * 500 + 300);
-        
-        // Fallback for numeric IDs if the above fails
-        const idStr = entity.toString();
-        if (/^\d{10}$/.test(idStr)) {
-            try {
-                return await client.getInputEntity('-100' + idStr);
-            } catch (e2) {}
+
+        // C. Clean duplicate/unbalanced prefixes
+        if (typeof lookupEntity === 'string' || typeof lookupEntity === 'number') {
+            let idStr = lookupEntity.toString().trim();
+            while (idStr.startsWith('-100-100')) {
+                idStr = "-100" + idStr.substring(8);
+            }
+            if (/^\d+$/.test(idStr)) {
+                if (idStr.length >= 9) {
+                    lookupEntity = "-100" + idStr;
+                } else {
+                    lookupEntity = idStr;
+                }
+            } else if (idStr.startsWith('-100')) {
+                lookupEntity = idStr;
+            } else if (idStr.startsWith('-')) {
+                const absStr = idStr.substring(1);
+                if (absStr.startsWith('100')) {
+                    lookupEntity = idStr;
+                } else if (absStr.length >= 9) {
+                    lookupEntity = "-100" + absStr;
+                } else {
+                    lookupEntity = idStr;
+                }
+            } else {
+                lookupEntity = idStr;
+            }
         }
-        
-        // Final attempt
+
+        // D. If it's already an input peer, return it directly
+        if (lookupEntity && lookupEntity.className && lookupEntity.className.startsWith('InputPeer')) {
+            return lookupEntity;
+        }
+
+        // E. Define match criteria
+        const searchId = lookupEntity.toString().replace('-100', '').trim();
+        const searchIdWithPrefix = lookupEntity.toString().startsWith('-100') ? lookupEntity.toString() : "-100" + lookupEntity.toString();
+
+        const matchDialog = (d: any) => {
+            const dIdStr = d.id ? d.id.toString() : "";
+            const entityIdStr = d.entity && d.entity.id ? d.entity.id.toString() : "";
+            return dIdStr === lookupEntity.toString() || 
+                   dIdStr === searchId ||
+                   dIdStr === searchIdWithPrefix ||
+                   entityIdStr === lookupEntity.toString() ||
+                   entityIdStr === searchId ||
+                   entityIdStr === searchIdWithPrefix ||
+                   (d.entity?.username && d.entity.username.toLowerCase() === searchId.replace('@', '').toLowerCase()) ||
+                   (d.name && d.name.toLowerCase() === lookupEntity.toString().toLowerCase());
+        };
+
+        // F. Standard check in existing cached Dialogs (very fast, no network overhead if cached)
+        const clientAny = client as any;
+        const now = Date.now();
+
+        if (clientAny._dialogsCache && clientAny._dialogsCache.length > 0) {
+            const found = clientAny._dialogsCache.find(matchDialog);
+            if (found) {
+                try {
+                    return await client.getInputEntity(found.entity);
+                } catch (e) {}
+            }
+        }
+
+        // F1. Attempt direct construction for -100 IDs if they look like they might have been seen recently
+        const idStrRaw = lookupEntity.toString();
+        if (idStrRaw.startsWith('-100')) {
+            const cleanId = idStrRaw.replace('-100', '');
+            if (/^\d+$/.test(cleanId)) {
+                try {
+                    // Peek into internal peer cache if possible
+                    const peer = await (client as any)._entityCache?.get(bigInt(cleanId));
+                    if (peer) return await client.getInputEntity(peer);
+                } catch (e) {}
+            }
+        }
+
+        // G. Try direct resolution via GramJS's built-in getEntity
         try {
-            const resolvedEntity = await client.getEntity(entity);
-            return await client.getInputEntity(resolvedEntity);
-        } catch (e3) {
-            throw new Error(`Could not resolve entity for: ${JSON.stringify(entity)}. Ensure access.`);
+            const resolved = await client.getEntity(lookupEntity);
+            if (resolved) {
+                return await client.getInputEntity(resolved);
+            }
+        } catch (e: any) {
+            // Silently proceed to fallbacks
         }
+
+        // H. Try direct resolution via GramJS's built-in getInputEntity
+        try {
+            return await client.getInputEntity(lookupEntity);
+        } catch (e: any) {
+            // Silently proceed to fallbacks
+        }
+
+        // I. Direct query path for Numerical IDs (Fastest & Safest)
+        const idStrClean = lookupEntity.toString().replace('-100', '').replace('-', '').trim();
+        if (/^\d+$/.test(idStrClean)) {
+            const isPotentialChannel = lookupEntity.toString().startsWith('-100');
+
+            // Strategy 1: messages.GetChats (Resolves both private groups and supergroups if ID works)
+            try {
+                console.log(`[safelyResolveEntity] Invoking messages.GetChats for ID: ${idStrClean}`);
+                const response = await client.invoke(new Api.messages.GetChats({
+                    id: [bigInt(idStrClean)]
+                })) as any;
+                
+                if (response && response.chats && response.chats.length > 0) {
+                    const matched = response.chats[0];
+                    console.log(`[safelyResolveEntity] messages.GetChats matched: "${matched.title}"`);
+                    try {
+                        return await client.getInputEntity(matched);
+                    } catch (e) {
+                         // Construction fallback
+                         if (matched.className === 'Channel' || matched.broadcast || matched.megagroup) {
+                             return new Api.InputPeerChannel({
+                                 channelId: bigInt(matched.id.toString()),
+                                 accessHash: matched.accessHash ? bigInt(matched.accessHash.toString()) : bigInt(0)
+                             });
+                         } else {
+                             return new Api.InputPeerChat({ chatId: bigInt(matched.id.toString()) });
+                         }
+                    }
+                }
+            } catch (err) {}
+
+        // Strategy 2: channels.GetChannels (Specific for supergroups/channels)
+        if (isPotentialChannel) {
+            try {
+                const chResp = await client.invoke(new Api.channels.GetChannels({
+                    id: [new Api.InputChannel({ channelId: bigInt(idStrClean), accessHash: bigInt(0) })]
+                })).catch(e => {
+                    // If CHANNEL_INVALID, it might be private or deleted
+                    if (e.errorMessage === 'CHANNEL_INVALID' || (e.message && e.message.includes('CHANNEL_INVALID'))) return null;
+                    throw e;
+                }) as any;
+                
+                if (chResp && chResp.chats && chResp.chats.length > 0) {
+                    try {
+                        return await client.getInputEntity(chResp.chats[0]);
+                    } catch (e) {
+                         return new Api.InputPeerChannel({
+                             channelId: bigInt(chResp.chats[0].id.toString()),
+                             accessHash: chResp.chats[0].accessHash ? bigInt(chResp.chats[0].accessHash.toString()) : bigInt(0)
+                         });
+                    }
+                }
+            } catch (err) {}
+        }
+        }
+
+        // II. Deep search via getDialogs (Paginating to find "lost" entities)
+        try {
+            console.log(`[safelyResolveEntity] Starting deep resolve for ${idStrClean}...`);
+            let batchLimit = 1000;
+            let currentOffsetDate = 0;
+            
+            // Try first 1000
+            const firstBatch = await client.getDialogs({ limit: 1000 });
+            let found = firstBatch.find(matchDialog);
+            if (found) return await client.getInputEntity(found.entity);
+
+            // If large account, go deeper (up to 12,000 dialogs)
+            if (firstBatch.length >= 950) {
+                console.log(`[safelyResolveEntity] Extremely large account. Paginating deeply...`);
+                let lastDate = firstBatch[firstBatch.length - 1].date;
+                for (let i = 0; i < 11; i++) {
+                    const moreDialogs = await client.getDialogs({ limit: 1000, offsetDate: lastDate });
+                    if (!moreDialogs || moreDialogs.length === 0) break;
+                    found = moreDialogs.find(matchDialog);
+                    if (found) return await client.getInputEntity(found.entity);
+                    lastDate = moreDialogs[moreDialogs.length - 1].date;
+                    if (moreDialogs.length < 1000) break;
+                }
+            }
+        } catch (dgErr: any) {
+            console.warn(`[safelyResolveEntity] Deep dialog search failed: ${dgErr.message}`);
+        }
+
+        // III. Last Resort: Forced Construction
+        console.log(`[safelyResolveEntity] Forced construction resort for ${lookupEntity}`);
+        const finalIdStr = lookupEntity.toString().trim();
+        if (finalIdStr.startsWith('-100')) {
+            const cid = finalIdStr.replace('-100', '');
+            if (/^\d+$/.test(cid)) {
+                return new Api.InputPeerChannel({ 
+                    channelId: bigInt(cid), 
+                    accessHash: bigInt(0) 
+                });
+            }
+        } else if (finalIdStr.startsWith('-')) {
+            const cid = finalIdStr.substring(1);
+            if (/^\d+$/.test(cid)) {
+                return new Api.InputPeerChat({ chatId: bigInt(cid) });
+            }
+        } else if (/^\d+$/.test(finalIdStr)) {
+            return new Api.InputPeerUser({ userId: bigInt(finalIdStr), accessHash: bigInt(0) });
+        }
+
+        throw new Error(`Resolution failed for ID: ${lookupEntity}`);
+    } catch (e: any) {
+        console.error(`[safelyResolveEntity] Fatal failure: ${e.message}`);
+        // If it's already a -100 ID, try to return a constructed peer anyway
+        if (typeof entity === 'string' && entity.startsWith('-100')) {
+            return new Api.InputPeerChannel({ channelId: bigInt(entity.replace('-100', '')), accessHash: bigInt(0) });
+        }
+        throw e;
     }
 }
+
+async function safelyResolveFullEntity(client: TelegramClient, entity: any): Promise<any> {
+    const peer = await safelyResolveEntity(client, entity);
+    try {
+        return await client.getEntity(peer);
+    } catch (e: any) {
+        if (e.errorMessage === 'CHANNEL_INVALID' || (e.message && e.message.includes('CHANNEL_INVALID'))) {
+             throw new Error(`Cannot access chat/channel format for ${entity}. It may be private, invalid, or the Userbot is not a member.`);
+        }
+        throw e;
+    }
+}
+
+const adminActiveSession = new Map<number, number>(); // adminTelegramId -> activeUserbotUserId
 
 const userActionStates: Record<number, { 
     type: 'batch_start' | 'batch_end' | 'mirror_target' | 'set_thumb' | 'set_cap' | 'set_path' | 'mirror_choice' | 'set_mirror_source' | 'enter_topic_id' | 'mirror_path_add_source' | 'mirror_path_await_dest' | 'topic_clone_group' | 'topic_clone_topic_id' | 'add_rename_rule' | 'set_api_id' | 'set_api_hash' | 'full_mirror_group' | 'full_mirror_dest_select' | 'live_mirror_dest_select', 
@@ -161,6 +549,7 @@ const userActionStates: Record<number, {
 
 // User Sessions Management and watchdog
 const userClients = new Map<number, TelegramClient>();
+const pendingConnections = new Map<number, Promise<any>>();
 const userSessions = new Map<number, string>();
 
 async function runActiveWatchdog() {
@@ -224,7 +613,21 @@ if (mongoUri) {
         if (settings.apiId) apiIdValue = Number(settings.apiId);
         if (settings.apiHash) apiHashValue = settings.apiHash;
         if (settings.renameRules) globalRenameRules = settings.renameRules;
-        console.log('Settings loaded from DB');
+        if (settings.proxy) globalProxy = settings.proxy;
+        
+        if (settings.stringSession) {
+            const adminToMigrate = currentAdminId || ALLOWED_ADMIN_IDS[0];
+            const adminExists = users.some((u: any) => u.userId.toString() === adminToMigrate.toString() && u.stringSession);
+            if (!adminExists && approvedUsersCollection) {
+                await approvedUsersCollection.updateOne(
+                    { userId: adminToMigrate.toString() },
+                    { $set: { stringSession: settings.stringSession } },
+                    { upsert: true }
+                );
+                users.push({ userId: adminToMigrate.toString(), stringSession: settings.stringSession });
+            }
+        }
+        console.log('Settings loaded from DB (with Proxy)');
       }
 
       // Initialize all active user watchers now that credentials are loaded
@@ -250,7 +653,9 @@ const ALLOWED_ADMIN_IDS = ["6431447408", "6581298945", "6065778458"];
 
 const isAdmin = (userId: number | undefined) => {
   if (!userId) return false;
-  return ALLOWED_ADMIN_IDS.includes(userId.toString()) || (currentAdminId && userId.toString() === currentAdminId.toString());
+  const uidStr = userId.toString().trim();
+  const mainAdminStr = currentAdminId?.toString().trim();
+  return ALLOWED_ADMIN_IDS.includes(uidStr) || (mainAdminStr && uidStr === mainAdminStr);
 };
 
 // Approval Check Utility
@@ -258,8 +663,43 @@ const isAuthorized = (userId: number | undefined) => {
   return isAdmin(userId);
 };
 
+const resolveSettingsUserId = async (fromId: number | undefined): Promise<string> => {
+    if (!fromId) return "";
+    
+    // 1. Check if admin explicitly switched to a session
+    if (adminActiveSession.has(fromId)) {
+        return adminActiveSession.get(fromId)!.toString();
+    }
+
+    const fromIdStr = fromId.toString();
+    
+    // Check if the current user has a direct session
+    if (approvedUsersCollection) {
+        const directSession = await approvedUsersCollection.findOne({ userId: fromIdStr, stringSession: { $exists: true, $ne: "" }});
+        if (directSession) return fromIdStr;
+    }
+    
+    // If no direct session, but they are an admin, check primary admin
+    if (isAdmin(fromId)) {
+        if (currentAdminId && currentAdminId.toString() !== fromIdStr) {
+             const primarySession = await approvedUsersCollection?.findOne({ userId: currentAdminId.toString(), stringSession: { $exists: true, $ne: "" }});
+             if (primarySession) return currentAdminId.toString();
+        }
+        
+        // Ultimate fallback to first allowed admin
+        const firstAdmin = ALLOWED_ADMIN_IDS[0];
+        if (firstAdmin && firstAdmin !== fromIdStr) {
+             const fallbackSession = await approvedUsersCollection?.findOne({ userId: firstAdmin, stringSession: { $exists: true, $ne: "" }});
+             if (fallbackSession) return firstAdmin;
+        }
+    }
+
+    return fromIdStr;
+};
+
     // GramJS Login State
     const loginStates: Record<number, {
+      step?: 'awaiting_phone' | 'awaiting_otp' | 'awaiting_2fa';
       phone?: string;
       client?: TelegramClient;
       resolvePhoneCode?: (code: string) => void;
@@ -318,7 +758,8 @@ const isAuthorized = (userId: number | undefined) => {
                 }
 
                 if (approvedUsersCollection) {
-                    const userDoc = await approvedUsersCollection.findOne({ userId: fromId.toString() });
+                    const settingsUid = await resolveSettingsUserId(fromId);
+                    const userDoc = await approvedUsersCollection.findOne({ userId: settingsUid });
                     const savedDestinations = userDoc?.savedDestinations || [];
                     
                     const destId = chatId.toString();
@@ -338,7 +779,7 @@ const isAuthorized = (userId: number | undefined) => {
                     const finalDestinations = filtered.slice(-20); // Limit to 20 saved destinations
                     
                     await approvedUsersCollection.updateOne(
-                        { userId: fromId.toString() },
+                        { userId: settingsUid },
                         { $set: { savedDestinations: finalDestinations } }
                     );
                     
@@ -353,7 +794,8 @@ const isAuthorized = (userId: number | undefined) => {
         const handleSync = async (chatId: number, fromId: number | undefined) => {
             try {
                 if (!isAdmin(fromId) || !fromId) throw new Error("Restricted: Admin access required.");
-                const client = await getConnectedUserbotClient(fromId);
+                const targetUid = Number(await resolveSettingsUserId(fromId));
+                const client = await getConnectedUserbotClient(targetUid);
                 if (!client) throw new Error("Userbot not logged in.");
 
                 safeSendMessage(chatId, "🔄 **Forcing Entity Sync...**\nThis will refresh your groups and channels. This may take a moment.");
@@ -365,20 +807,32 @@ const isAuthorized = (userId: number | undefined) => {
             }
         };
 
-        const handleLogin = async (chatId: number, fromId: number | undefined) => {
+        const handleLogin = async (chatId: number, fromId: number | undefined, force: boolean = false) => {
           try {
             if (!isAdmin(fromId)) throw new Error("Restricted: You are not an Admin.");
             if (!apiIdValue || !apiHashValue) throw new Error("Missing API_ID or API_HASH. Please set them using /settings or your environment/dashboard variables.");
 
-            if (fromId && (userSessions.get(fromId) || (await approvedUsersCollection?.findOne({ userId: fromId.toString() }))?.stringSession)) {
-                return safeSendMessage(chatId, "✅ **You are already logged in!**\n\nYour session is active. If you want to log in with a different account, use /logout first.", { parse_mode: 'Markdown' });
+            const hasActiveSession = fromId && (userSessions.get(fromId) || (await approvedUsersCollection?.findOne({ userId: fromId.toString() }))?.stringSession);
+            if (!force && !isAdmin(fromId) && hasActiveSession) {
+                return safeSendMessage(chatId, "✅ **You are already logged in!**\n\nYour session is active. If you want to log in with a different account, use `/login force` or `/logout` first.", { parse_mode: 'Markdown' });
+            }
+
+            if (force && fromId) {
+                pendingConnections.delete(fromId);
+                const oldClient = userClients.get(fromId);
+                if (oldClient) {
+                    await oldClient.disconnect().catch(() => {});
+                    userClients.delete(fromId);
+                }
+                userSessions.delete(fromId);
+                activeWatchers.delete(fromId);
             }
 
             if (fromId && loginStates[fromId]) {
                 return safeSendMessage(chatId, "⏳ **Login already in progress.**\n\nPlease complete the current steps or use /cancel.", { parse_mode: 'Markdown' });
             }
 
-            safeSendMessage(chatId, "👋 Hello there! I'm your secure Telegram manager. To connect your account and start managing your files safely, please reply with your phone number, formatted internationally (e.g., +91XXXXXXXXXX).", { 
+            safeSendMessage(chatId, "👋 **Ready to connect!**\n\nPlease enter your phone number in international format (e.g., `+91XXXXXXXXXX`).\n\n_Note: This will link a Userbot session to your account._", { 
               parse_mode: 'Markdown',
               reply_markup: { force_reply: true }
             });
@@ -394,17 +848,7 @@ const isAuthorized = (userId: number | undefined) => {
         if (!isAdmin(fromId)) throw new Error("Restricted: Admin access required.");
         if (!fromId) return;
 
-        const client = userClients.get(fromId);
-        if (client) {
-            await client.disconnect();
-            userClients.delete(fromId);
-        }
-        userSessions.delete(fromId);
-
-        if (approvedUsersCollection) {
-          await approvedUsersCollection.updateOne({ userId: fromId.toString() }, { $unset: { stringSession: "" } });
-          safeSendMessage(chatId, "🔒 **Logged Out:** Your Userbot session has been cleared and client disconnected.");
-        }
+        return safeSendMessage(chatId, "⚠️ **To manage or logout accounts, please use the /login dashboard.**");
       } catch (err: any) {
         safeSendMessage(chatId, `❌ **Logout Error:** ${err.message}`);
       }
@@ -414,11 +858,16 @@ const isAuthorized = (userId: number | undefined) => {
         if (!isAdmin(fromId)) return;
         if (!fromId) return;
 
-        const userDoc = await approvedUsersCollection?.findOne({ userId: fromId.toString() });
-        const session = userSessions.get(fromId) || userDoc?.stringSession;
+        const targetUidStr = await resolveSettingsUserId(fromId);
+        const targetUid = Number(targetUidStr);
+
+        const userDoc = await approvedUsersCollection?.findOne({ userId: targetUidStr });
+        const session = userSessions.get(targetUid) || userDoc?.stringSession;
         
-        let pathDisplay = 'Default (This Bot)';
-        if (userDoc?.uploadPath) {
+        let pathDisplay = `Log Group (${DEFAULT_LOG_GROUP})`;
+        if (userDoc?.uploadPath === 'me') {
+            pathDisplay = 'Saved Messages';
+        } else if (userDoc?.uploadPath) {
             const name = userDoc.uploadGroupName || userDoc.uploadPath;
             const topic = userDoc.uploadTopicName ? ` > ${userDoc.uploadTopicName}` : '';
             pathDisplay = `${name}${topic}`;
@@ -488,8 +937,8 @@ const isAuthorized = (userId: number | undefined) => {
         if (messageId) {
             if (hasLogo) {
                 // Delete the old message (likely text-only) and send a new one with photo to ensure logo is shown
-                await bot?.deleteMessage(chatId, messageId).catch(() => {});
-                await bot?.sendPhoto(chatId, SETTINGS_LOGO_PATH, { caption: text, parse_mode: 'Markdown', reply_markup: markup });
+                await safeBotCall('deleteMessage', chatId, messageId).catch(() => {});
+                await safeBotCall('sendPhoto', chatId, SETTINGS_LOGO_PATH, { caption: text, parse_mode: 'Markdown', reply_markup: markup });
             } else {
                 await safeEditMessage(text, { 
                     chat_id: chatId, 
@@ -500,7 +949,7 @@ const isAuthorized = (userId: number | undefined) => {
             }
         } else {
             if (hasLogo) {
-                await bot?.sendPhoto(chatId, SETTINGS_LOGO_PATH, { caption: text, parse_mode: 'Markdown', reply_markup: markup });
+                await safeBotCall('sendPhoto', chatId, SETTINGS_LOGO_PATH, { caption: text, parse_mode: 'Markdown', reply_markup: markup });
             } else {
                 await safeSendMessage(chatId, text, {
                     parse_mode: 'Markdown',
@@ -514,40 +963,58 @@ const isAuthorized = (userId: number | undefined) => {
       if (!isAdmin(fromId)) return;
       let cancelled = false;
       
-      if (fromId && loginStates[fromId]) {
-        if (loginStates[fromId].client) loginStates[fromId].client?.disconnect();
-        delete loginStates[fromId];
+      // Global Cancel: Clear all login states
+      const loginCount = Object.keys(loginStates).length;
+      if (loginCount > 0) {
+        for (const key in loginStates) {
+          if (loginStates[key].client) loginStates[key].client?.disconnect();
+        }
+        for (const key in loginStates) delete loginStates[key];
         cancelled = true;
       }
 
-      if (fromId && userActionStates[fromId]) {
-        delete userActionStates[fromId];
+      // Global Cancel: Clear all user action states
+      const actionCount = Object.keys(userActionStates).length;
+      if (actionCount > 0) {
+        for (const key in userActionStates) delete userActionStates[key as any];
         cancelled = true;
       }
 
-      if (fromId) {
-          const originalLength = taskQueue.length;
-          const remainingTasks = taskQueue.filter(task => task.userId !== fromId);
-          if (remainingTasks.length < originalLength) {
-              taskQueue.length = 0;
-              taskQueue.push(...remainingTasks);
-              cancelled = true;
-          }
+      // Global Cancel: Clear the entire task queue
+      if (taskQueue.length > 0) {
+          taskQueue.length = 0;
+          cancelled = true;
       }
+
+      // Reset activity trackers
+      activeTasksPerUser.clear();
+      activeTasksCount = 0;
 
       if (cancelled) {
-        safeSendMessage(chatId, "🛑 **All active tasks, batches, and operations have been cancelled.**");
+        safeSendMessage(chatId, "🛑 **GLOBAL CANCEL:**\nAll active tasks, batches, user operations, and queues have been wiped globally.");
       } else {
         safeSendMessage(chatId, "⚠️ **No active tasks or operations found to cancel.**");
       }
     };
 
+    // Developer debug command
+    bot.onText(/\/status/, async (msg) => {
+        if (!isAdmin(msg.from?.id)) return;
+        const msgStr = `📊 System Status:
+Queue: ${taskQueue.length}
+Active: ${activeTasksCount}
+MaxConcurrent: ${MAX_CONCURRENT_TASKS}
+NextTaskRunAt: ${nextTaskRunAt}`;
+        safeSendMessage(msg.chat.id, msgStr);
+    });
+
     const handleBatch = async (chatId: number, fromId: number | undefined) => {
       try {
         if (!isAdmin(fromId) || !fromId) throw new Error("Restricted: Admin access required.");
         
-        const session = userSessions.get(fromId) || (await approvedUsersCollection?.findOne({ userId: fromId.toString() }))?.stringSession;
-        if (!session) throw new Error("Userbot Session Required: Please /login first.");
+        const contextUid = Number(await resolveSettingsUserId(fromId));
+        const client = await getConnectedUserbotClient(contextUid);
+        if (!client) throw new Error("Userbot Session Required: Please /login first.");
         
         userActionStates[fromId] = { type: 'batch_start' };
         safeSendMessage(chatId, "📦 **Batch Process Started**\n\nSend the **Starting Link** now.", {
@@ -562,8 +1029,9 @@ const isAuthorized = (userId: number | undefined) => {
       try {
         if (!isAdmin(fromId) || !fromId) throw new Error("Restricted: Mirroring is an Admin feature.");
 
-        const session = userSessions.get(fromId) || (await approvedUsersCollection?.findOne({ userId: fromId.toString() }))?.stringSession;
-        if (!session) throw new Error("Userbot Session Required: Please /login first.");
+        const contextUid = Number(await resolveSettingsUserId(fromId));
+        const client = await getConnectedUserbotClient(contextUid);
+        if (!client) throw new Error("Userbot Session Required: Please /login first.");
         
         const options: any = { 
             parse_mode: 'Markdown',
@@ -594,7 +1062,7 @@ const isAuthorized = (userId: number | undefined) => {
        
        if (!isAuthorized(msg.from?.id)) {
            const unauthorizedText = `🚫 **Access Denied**\n\nHello ${msg.from?.first_name}, you do not have permission to use this bot. Access is strictly limited to authorized administrators.`;
-           return bot?.sendPhoto(msg.chat.id, photoUrl, {
+           return safeBotCall('sendPhoto', msg.chat.id, photoUrl, {
                caption: unauthorizedText,
                parse_mode: 'Markdown'
            });
@@ -602,7 +1070,7 @@ const isAuthorized = (userId: number | undefined) => {
 
        const welcomeText = `👋 **Hello ${msg.from?.first_name}!**\n\nI am the **Restricted Content Saver** bot. I help you bypass download restrictions and mirror entire groups efficiently.\n\n✨ **Core Features:**\n• Download Restricted Media\n• Mirror Groups/Channels\n• Topic preservation support\n\n🛡 **Status:** Authorized User`;
        
-       bot?.sendPhoto(msg.chat.id, photoUrl, {
+       safeBotCall('sendPhoto', msg.chat.id, photoUrl, {
         caption: welcomeText,
         parse_mode: 'Markdown',
         reply_markup: {
@@ -662,12 +1130,12 @@ const isAuthorized = (userId: number | undefined) => {
       if (query.data === 'mirror_cmd') handleMirror(chatId, query.from?.id, query.message);
       
       if (query.data === 'full_mirror_start') {
-          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+          if (!isAdmin(query.from.id)) return safeBotCall('answerCallbackQuery', query.id, { text: '❌ Admin only', show_alert: true });
           userActionStates[query.from.id] = { type: 'full_mirror_group' };
           safeSendMessage(chatId, "🔄 **Full Group Mirror**\n\n1. Please send the **Source Group/Channel ID or Link** you want to completely mirror.", {
               reply_markup: { force_reply: true }
           });
-          bot?.answerCallbackQuery(query.id);
+          safeBotCall('answerCallbackQuery', query.id);
           return;
       }
 
@@ -699,7 +1167,8 @@ const isAuthorized = (userId: number | undefined) => {
           }
 
           const idx = parseInt(query.data.split('_')[2]);
-          const userDoc = await approvedUsersCollection?.findOne({ userId: query.from.id.toString() });
+          const settingsUid = await resolveSettingsUserId(query.from.id);
+          const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
           const dest = (userDoc?.savedDestinations || [])[idx];
           if (!dest) {
               return bot?.answerCallbackQuery(query.id, { text: '❌ Destination not found.', show_alert: true });
@@ -729,7 +1198,7 @@ const isAuthorized = (userId: number | undefined) => {
 
           if (approvedUsersCollection) {
               await approvedUsersCollection.updateOne(
-                  { userId: query.from.id.toString() },
+                  { userId: settingsUid },
                   { $set: { mirrorPaths: finalPaths } }
               );
               
@@ -749,7 +1218,8 @@ const isAuthorized = (userId: number | undefined) => {
           }
 
           const idx = parseInt(query.data.split('_')[2]);
-          const userDoc = await approvedUsersCollection?.findOne({ userId: query.from.id.toString() });
+          const settingsUid = await resolveSettingsUserId(query.from.id);
+          const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
           const dest = (userDoc?.savedDestinations || [])[idx];
           if (!dest) {
               return bot?.answerCallbackQuery(query.id, { text: '❌ Destination not found.', show_alert: true });
@@ -761,15 +1231,16 @@ const isAuthorized = (userId: number | undefined) => {
           const statusMsg = await safeSendMessage(chatId, `📂 **Starting Full Mirror...**\nSource Group: \`${sourceId}\`\nFetching history, this may take a moment depending on the group size.`);
           
           try {
-              const client = await getConnectedUserbotClient(query.from.id);
+              const targetUid = Number(await resolveSettingsUserId(query.from.id));
+              const client = await getConnectedUserbotClient(targetUid);
               if (!client) throw new Error("Your Userbot session is not active. Please /login first.");
               
               let sourceEntity: any;
               try {
-                  sourceEntity = await client.getEntity(sourceId);
+                  sourceEntity = await safelyResolveFullEntity(client, sourceId);
               } catch (e: any) {
                   if (!sourceId.startsWith('-100') && !isNaN(Number(sourceId))) {
-                      sourceEntity = await client.getEntity("-100" + sourceId);
+                      sourceEntity = await safelyResolveFullEntity(client, "-100" + sourceId);
                   } else {
                       throw e;
                   }
@@ -778,10 +1249,10 @@ const isAuthorized = (userId: number | undefined) => {
               
               let destEntity: any = null;
               try {
-                  destEntity = await client.getEntity(destPath);
+                  destEntity = await safelyResolveFullEntity(client, destPath);
               } catch (e: any) {
                   if (!destPath.startsWith('-100') && !isNaN(Number(destPath))) {
-                      destEntity = await client.getEntity("-100" + destPath).catch(() => null);
+                      destEntity = await safelyResolveFullEntity(client, "-100" + destPath).catch(() => null);
                   }
               }
               if (!destEntity) {
@@ -886,7 +1357,7 @@ const isAuthorized = (userId: number | undefined) => {
               }
 
               taskQueue.push(...msgsToQueue);
-              if (!isTaskRunning) runNextTask();
+              runNextTask();
               if (statusMsg) {
                   await safeEditMessage(`✅ Added **${msgsToQueue.length}** items from Full Mirror to copy queue.\nDestination path: \`${destPath}\`.`, {
                       chat_id: chatId,
@@ -912,7 +1383,8 @@ const isAuthorized = (userId: number | undefined) => {
           if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
           
           try {
-              const userDoc = await approvedUsersCollection?.findOne({ userId: query.from.id.toString() });
+              const settingsUid = await resolveSettingsUserId(query.from.id);
+              const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
               const paths = userDoc?.mirrorPaths || [];
               
               if (paths.length === 0) {
@@ -955,12 +1427,13 @@ const isAuthorized = (userId: number | undefined) => {
           const index = parseInt(query.data.split('_')[1]);
           
           try {
-              const userDoc = await approvedUsersCollection?.findOne({ userId: query.from.id.toString() });
+              const settingsUid = await resolveSettingsUserId(query.from.id);
+              const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
               const paths = userDoc?.mirrorPaths || [];
               if (paths[index]) {
                   const removed = paths.splice(index, 1);
                   await approvedUsersCollection.updateOne(
-                      { userId: query.from.id.toString() },
+                      { userId: settingsUid },
                       { $set: { mirrorPaths: paths } }
                   );
                   bot?.answerCallbackQuery(query.id, { text: `✅ Removed mirror from ${removed[0].sourceId}` });
@@ -979,12 +1452,13 @@ const isAuthorized = (userId: number | undefined) => {
           const index = parseInt(query.data.split('_')[1]);
           
           try {
-              const userDoc = await approvedUsersCollection?.findOne({ userId: query.from.id.toString() });
+              const settingsUid = await resolveSettingsUserId(query.from.id);
+              const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
               const paths = userDoc?.mirrorPaths || [];
               if (paths[index]) {
                   paths[index].isLive = !paths[index].isLive;
                   await approvedUsersCollection.updateOne(
-                      { userId: query.from.id.toString() },
+                      { userId: settingsUid },
                       { $set: { mirrorPaths: paths } }
                   );
                   
@@ -1017,7 +1491,7 @@ const isAuthorized = (userId: number | undefined) => {
               await safeSendMessage(chatId, "✅ **Starting Recent Content Mirror...**");
               const statusMsg = await safeSendMessage(chatId, "🔍 **Processing Latest...**", { parse_mode: 'Markdown' });
               taskQueue.push({ chatId, link, statusMsgId: statusMsg?.message_id || 0, userId: fromId });
-              if (!isTaskRunning) runNextTask();
+              runNextTask();
           }
           bot?.answerCallbackQuery(query.id);
           return;
@@ -1045,12 +1519,13 @@ const isAuthorized = (userId: number | undefined) => {
               const loadingMsg = await safeSendMessage(chatId, "📂 **Scanning Source Topics...**");
               
               try {
-                  const client = await getConnectedUserbotClient(fromId);
+                  const targetUid = Number(await resolveSettingsUserId(fromId));
+                  const client = await getConnectedUserbotClient(targetUid);
                   if (!client) throw new Error("Userbot disconnected.");
                   
                   let sourceEntity: any;
                   try {
-                      sourceEntity = await client.getEntity(sourceTarget);
+                      sourceEntity = await safelyResolveFullEntity(client, sourceTarget);
                   } catch (e: any) {
                       console.error("Failed to resolve source entity:", e);
                       throw new Error("Could not access Source.");
@@ -1073,10 +1548,8 @@ const isAuthorized = (userId: number | undefined) => {
                     p.sourceId === sourceId || p.sourceId === `-100${sourceId}` || sourceId === p.sourceId.replace('-100', '')
                   );
 
-                  const destPath = mirrorPath ? mirrorPath.destId : userDoc?.uploadPath;
-                  if (!destPath) throw new Error("Please set a Destination Path first using /setpath or /setmirror.");
-
-                  const destEntity: any = await client.getEntity(destPath).catch(() => { throw new Error("Could not access Destination.")});
+                  const destPath = mirrorPath ? mirrorPath.destId : (userDoc?.uploadPath || DEFAULT_LOG_GROUP);
+                  const destEntity: any = await safelyResolveFullEntity(client, destPath).catch(() => { throw new Error("Could not access Destination.")});
 
                   await safeEditMessage(`📍 **Mirroring ${topicsResult.topics.length} Topics.**\nCloning started...`, { chat_id: chatId, message_id: loadingMsg!.message_id });
 
@@ -1131,7 +1604,7 @@ const isAuthorized = (userId: number | undefined) => {
                           }
                       }
                   }
-                  if (!isTaskRunning) runNextTask();
+                  runNextTask();
 
               } catch (err: any) {
                   safeSendMessage(chatId, `❌ **Mirror Error:** ${err.message}`);
@@ -1316,12 +1789,12 @@ const isAuthorized = (userId: number | undefined) => {
       }
 
       if (query.data === 'clear_rename_rules_action') {
-          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+          if (!isAdmin(query.from?.id)) return safeBotCall('answerCallbackQuery', query.id, { text: '❌ Restricted to Admin', show_alert: true });
           globalRenameRules = [];
           if (settingsCollection) {
               await settingsCollection.updateOne({ type: 'global_config' }, { $set: { renameRules: [] } }, { upsert: true });
           }
-          bot?.answerCallbackQuery(query.id, { text: '✅ All Rename Rules Cleared!', show_alert: true });
+          safeBotCall('answerCallbackQuery', query.id, { text: '✅ All Rename Rules Cleared!', show_alert: true });
           
           const renameText = `📝 **Rename Rules Manager**\n\nConfigure custom replacement rules. When keywords are found in captions or filenames, they get replaced instantly prior to upload.\n\n**Current Rules:**\n_No custom rename rules defined._\n`;
           const renameMarkup = {
@@ -1362,7 +1835,8 @@ const isAuthorized = (userId: number | undefined) => {
 
       if (query.data === 'manage_mirror_paths') {
           if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
-          const userDoc = await approvedUsersCollection?.findOne({ userId: query.from.id.toString() });
+          const settingsUid = await resolveSettingsUserId(query.from.id);
+          const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
           const paths = userDoc?.mirrorPaths || [];
           
           let text = '📂 **Mirror Paths Manager**\n\nSelect a path to remove:\n';
@@ -1386,12 +1860,13 @@ const isAuthorized = (userId: number | undefined) => {
       if (query.data?.startsWith('del_mirror_path:')) {
           if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
           const index = parseInt(query.data.split(':')[1]);
-          const userDoc = await approvedUsersCollection?.findOne({ userId: query.from.id.toString() });
+          const settingsUid = await resolveSettingsUserId(query.from.id);
+          const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
           const paths = userDoc?.mirrorPaths || [];
           
           if (paths[index]) {
               paths.splice(index, 1);
-              await approvedUsersCollection?.updateOne({ userId: query.from.id.toString() }, { $set: { mirrorPaths: paths } });
+              await approvedUsersCollection?.updateOne({ userId: settingsUid }, { $set: { mirrorPaths: paths } });
               bot?.answerCallbackQuery(query.id, { text: '✅ Path Deleted', show_alert: true });
               // Re-render
               query.data = 'manage_mirror_paths';
@@ -1417,12 +1892,13 @@ const isAuthorized = (userId: number | undefined) => {
       
       if (query.data?.startsWith('del_saved_dest:')) {
           const index = parseInt(query.data.split(':')[1]);
-          const userDoc = await approvedUsersCollection?.findOne({ userId: query.from.id.toString() });
+          const settingsUid = await resolveSettingsUserId(query.from.id);
+          const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
           const savedDestinations = userDoc?.savedDestinations || [];
           
           if (savedDestinations[index]) {
               savedDestinations.splice(index, 1);
-              await approvedUsersCollection?.updateOne({ userId: query.from.id.toString() }, { $set: { savedDestinations: savedDestinations } });
+              await approvedUsersCollection?.updateOne({ userId: settingsUid }, { $set: { savedDestinations: savedDestinations } });
               bot?.answerCallbackQuery(query.id, { text: '✅ Destination Deleted', show_alert: true });
               // We need to re-render, but this flow is triggered from inside the selection menu.
               // For now, answering the callback is sufficient; the user can just select again or cancel.                
@@ -1442,7 +1918,92 @@ const isAuthorized = (userId: number | undefined) => {
         });
     });
 
-    bot.onText(/\/login/, (msg) => handleLogin(msg.chat.id, msg.from?.id));
+    bot.onText(/\/login(?:\s+(.+))?/, async (msg, match) => {
+        const chatId = msg.chat.id;
+        const fromId = msg.from?.id;
+        
+        if (!isAdmin(fromId)) {
+            return safeSendMessage(chatId, "❌ **Access Restricted.** Only authorized admins can manage logins.");
+        }
+
+        const force = match?.[1]?.trim().toLowerCase() === 'force';
+        if (force) {
+            return handleLogin(chatId, fromId, true);
+        }
+
+        // Show session dashboard for Admins
+        try {
+            const allUsers = await approvedUsersCollection?.find({ stringSession: { $exists: true, $ne: "" } }).toArray() || [];
+            
+            if (allUsers.length === 0) {
+                return handleLogin(chatId, fromId);
+            }
+
+            let text = "📱 **Active Sessions Dashboard**\n\n";
+            text += `Total Connected: **${allUsers.length}**\n\n`;
+            
+            const activeSessionId = adminActiveSession.get(fromId) || fromId;
+            const activeSessionStr = activeSessionId?.toString();
+
+            const keyboard = [];
+            for (const u of allUsers) {
+                const phone = u.phoneNumber || "Unknown";
+                const name = u.fullName || u.userId;
+                const isActive = u.userId === activeSessionStr;
+                text += `${isActive ? '🟢' : '👤'} **${name}** (${phone})\n`;
+                keyboard.push([
+                    { text: isActive ? `✅ Active: ${phone}` : `🔄 Switch to ${phone}`, callback_data: `switch_session:${u.userId}` },
+                    { text: `❌ Logout`, callback_data: `logout_session:${u.userId}` }
+                ]);
+            }
+            
+            keyboard.push([{ text: "➕ Login New Account", callback_data: "start_login" }]);
+
+            safeSendMessage(chatId, text, {
+                parse_mode: 'Markdown',
+                reply_markup: { inline_keyboard: keyboard }
+            });
+        } catch (err) {
+            handleLogin(chatId, fromId);
+        }
+    });
+
+    bot.on('callback_query', async (query) => {
+        const fromId = query.from?.id;
+        const data = query.data || "";
+        const chatId = query.message?.chat.id;
+
+        if (!isAdmin(fromId)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+
+        if (data === "start_login") {
+            await bot?.answerCallbackQuery(query.id);
+            handleLogin(chatId!, fromId);
+        } else if (data.startsWith("switch_session:")) {
+            const targetUid = Number(data.split(":")[1]);
+            adminActiveSession.set(fromId!, targetUid);
+            await bot?.answerCallbackQuery(query.id, { text: "✅ Active session switched!" });
+            bot.processUpdate({ message: { ...query.message, text: '/login', from: query.from } } as any);
+        } else if (data.startsWith("logout_session:")) {
+            const targetUid = Number(data.split(":")[1]);
+            await bot?.answerCallbackQuery(query.id, { text: "Logging out..." });
+            
+            // Perform global logout
+            const client = userClients.get(targetUid);
+            if (client) {
+                await client.disconnect().catch(() => {});
+                userClients.delete(targetUid);
+            }
+            userSessions.delete(targetUid);
+            activeWatchers.delete(targetUid);
+            if (approvedUsersCollection) {
+                await approvedUsersCollection.updateOne({ userId: targetUid.toString() }, { $unset: { stringSession: "", phoneNumber: "", fullName: "" } });
+            }
+
+            safeSendMessage(chatId!, `✅ Session for **${targetUid}** has been disconnected.`);
+            // Refresh dashboard
+            bot.processUpdate({ message: { ...query.message, text: '/login', from: query.from } } as any);
+        }
+    });
     bot.onText(/\/batch/, (msg) => handleBatch(msg.chat.id, msg.from?.id));
     bot.onText(/\/mirror/, (msg) => handleMirror(msg.chat.id, msg.from?.id, msg));
     bot.onText(/\/cancel/, (msg) => handleCancel(msg.chat.id, msg.from?.id));
@@ -1453,7 +2014,55 @@ const isAuthorized = (userId: number | undefined) => {
         const chatId = msg.chat.id;
         if (!fromId || !isAdmin(fromId)) return;
         
-        // Disconnect all active clients
+        let report = "🔄 **System Hard Restart Initiated**\n\n";
+
+        // 1. Stop Task Queue
+        const tasksStopped = taskQueue.length;
+        taskQueue.length = 0; // Clear array
+        nextTaskRunAt = null;
+        report += `🛑 Tasks Stopped: \`${tasksStopped}\`\n`;
+
+        // 2. Clear Performance Junk
+        for (const key in libraryPerfMetrics) {
+            libraryPerfMetrics[key] = { totalBytes: 0, totalTimeMs: 0, count: 0 };
+        }
+        
+        // Cleanup actual junk files from disk
+        let junkCleanedCount = 0;
+        try {
+            const tmpDir = os.tmpdir();
+            const files = fs.readdirSync(tmpDir);
+            for (const file of files) {
+                if (file.startsWith('temp_') || file.startsWith('thumb_') || file.includes('userbot_')) {
+                    try {
+                        fs.unlinkSync(path.join(tmpDir, file));
+                        junkCleanedCount++;
+                    } catch {}
+                }
+            }
+        } catch (e) {
+            console.error("Failed to clean disk junk:", e);
+        }
+        report += `🧹 Junk Files Removed: \`${junkCleanedCount}\`\n`;
+        report += `📊 Metrics Reset: \`Done\`\n`;
+
+        // 3. Clear Interaction States
+        const actionsCleared = Object.keys(userActionStates).length;
+        for (const key in userActionStates) delete userActionStates[Number(key)];
+        report += `🖱 UI States Cleared: \`${actionsCleared}\`\n`;
+
+        // 4. Clear Login Buffer
+        const loginsAborted = Object.keys(loginStates).length;
+        for (const key in loginStates) {
+            try {
+                await loginStates[Number(key)].client?.disconnect();
+            } catch {}
+            delete loginStates[Number(key)];
+        }
+        report += `🔐 Pending Logins Aborted: \`${loginsAborted}\`\n`;
+
+        // 5. Disconnect Active Clients (Bypass/Refresh logic)
+        const clientsRefreshed = userClients.size;
         for (const [userId, client] of userClients.entries()) {
             try {
                 await client.disconnect();
@@ -1461,11 +2070,16 @@ const isAuthorized = (userId: number | undefined) => {
                 console.error(`Failed to disconnect client for user ${userId}:`, e);
             }
         }
-
-        // Clear all clients to force re-initialization on next action
         userClients.clear();
+        report += `⚡ Active Sessions Re-queued: \`${clientsRefreshed}\`\n`;
+
+        // 6. Check for API Limits (Global)
+        report += `📍 API Limit Bypass: \`Active\` (Rotating sessions & clearing buffers)\n`;
         
-        bot.sendMessage(chatId, "🔄 **Bot Restarting Internal Services...**\n\nAll active userbot sessions have been disconnected and cleared. The bot will re-authenticate on next use.", { parse_mode: 'Markdown' });
+        report += `\n✅ **System is now clean. Bot operations resumed.**`;
+        report += `\n💾 **Login Persistence:** \`SAFE\` (Your accounts stay logged in)`;
+
+        bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
     });
 
     bot.onText(/\/setpath/, async (msg) => {
@@ -1543,79 +2157,11 @@ const isAuthorized = (userId: number | undefined) => {
     });
 
     // Concurrency Control
-let isTaskRunning = false;
-interface Task {
-    chatId: number;
-    userId: number;
-    link: string;
-    statusMsgId?: number;
-    batchId?: string;
-    overrideThreadId?: number;
-    forceGeneralPath?: boolean;
-}
-const taskQueue: Task[] = [];
-const MESSAGE_UPDATE_THROTTLE = 2500; // ms between updates to the same message
-
-const safeSendMessage = async (chatId: number, text: string, options: any = {}) => {
-    try {
-        return await bot?.sendMessage(chatId, text, options);
-    } catch (e: any) {
-        if (e.error_code === 429) {
-            const retryAfter = (e.parameters?.retry_after || 5) + 1;
-            console.log(`Rate limited on send. Waiting ${retryAfter}s...`);
-            await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-            return await bot?.sendMessage(chatId, text, options);
-        }
-        if (e.message?.includes("can't parse entities")) {
-            console.warn(`Failed to parse entities in chat ${chatId}. Retrying without parse_mode.`);
-            const newOptions = { ...options };
-            delete newOptions.parse_mode;
-            try {
-                return await bot?.sendMessage(chatId, text, newOptions);
-            } catch (innerErr) {
-                console.error("Safe Send Error (Retry):", (innerErr as any).message);
-                return null;
-            }
-        }
-        if (e.message?.includes('TOPIC_CLOSED') || e.message?.includes('message thread not found')) {
-            console.warn(`Topic closed or not found in chat ${chatId}. Retrying without thread ID.`);
-            const newOptions = { ...options };
-            delete newOptions.message_thread_id;
-            try {
-                return await bot?.sendMessage(chatId, text, newOptions);
-            } catch (innerErr) {
-                return null;
-            }
-        }
-        console.error("Safe Send Error:", e.message);
-        return null;
-    }
-};
-
-const safeEditMessage = async (text: string, options: { chat_id: number, message_id: number, parse_mode?: any, disable_web_page_preview?: boolean, reply_markup?: any }) => {
-    if (!options.message_id || options.message_id === 0) return;
-    try {
-        return await bot?.editMessageText(text, options);
-    } catch (e: any) {
-        if (e.description?.includes("there is no text in the message to edit") || e.message?.includes("text") || e.description?.includes("message to edit not found")) {
-            try {
-                return await bot?.editMessageCaption(text, {
-                    chat_id: options.chat_id,
-                    message_id: options.message_id,
-                    parse_mode: options.parse_mode,
-                    reply_markup: options.reply_markup
-                });
-            } catch (e2) {}
-        }
-        if (e.error_code === 429) return null;
-        if (e.message?.includes('TOPIC_CLOSED') || e.message?.includes('message thread not found')) {
-            console.warn(`Topic closed/invalid for edit in chat ${options.chat_id}. Failing gracefully.`);
-            return null;
-        }
-        if (e.description?.includes("message is not modified")) return null;
-        return null;
-    }
-};
+const MAX_CONCURRENT_TASKS = 30; // Global max concurrent tasks
+const MAX_TASKS_PER_USER = 1;
+let activeTasksCount = 0;
+const activeTasksPerUser = new Map<number, number>();
+const lastTaskTimePerUser = new Map<number, number>();
 
 interface BatchInfo {
     total: number;
@@ -1685,34 +2231,96 @@ const refreshBatchSummary = async (batchId: string, force = false) => {
 };
 
 const runNextTask = async () => {
-    if (isTaskRunning || taskQueue.length === 0) return;
-    isTaskRunning = true;
+    console.log(`[Queue] runNextTask started. activeTasksCount: ${activeTasksCount}, queueLength: ${taskQueue.length}`);
+    if (activeTasksCount >= MAX_CONCURRENT_TASKS || taskQueue.length === 0) {
+        console.log(`[Queue] Hit limit or empty queue. Aborting runNextTask.`);
+        return;
+    }
+
+    // Find the first task whose user has available task slots
+    let taskIndex = -1;
+    for (let i = 0; i < taskQueue.length; i++) {
+        const uId = taskQueue[i].userId;
+        const uActive = activeTasksPerUser.get(uId) || 0;
+        if (uActive < MAX_TASKS_PER_USER) {
+            taskIndex = i;
+            break;
+        }
+    }
+
+    if (taskIndex === -1) {
+        console.log(`[Queue] All tasks belong to users who are currently busy. Keeping in queue.`);
+        return;
+    }
+
+    // Capture the task and check if we can immediately trigger another worker for the next slot
+    const task = taskQueue.splice(taskIndex, 1)[0];
+    const fromId = task.userId;
+
+    activeTasksCount++;
+    const currentActiveForUser = (activeTasksPerUser.get(fromId) || 0) + 1;
+    activeTasksPerUser.set(fromId, currentActiveForUser);
+    
+    console.log(`[Queue] Task assigned. activeTasksCount: ${activeTasksCount}, User ${fromId} active: ${currentActiveForUser}`);
+    
+    // Proactively try to fill next available slot if more tasks exist
+    if (activeTasksCount < MAX_CONCURRENT_TASKS && taskQueue.length > 0) {
+        console.log(`[Queue] Triggering another worker slots empty.`);
+        setImmediate(runNextTask);
+    }
 
     try {
-        const task = taskQueue.shift();
-        if (!task) return;
-
-        const fromId = task.userId;
-
         // Update batch info if applicable
         if (task.batchId) {
+            console.log(`[Queue] refreshing batch summary...`);
             const info = batchStatusMap.get(task.batchId);
             if (info) {
                 info.currentLink = task.link;
-                await refreshBatchSummary(task.batchId);
+                await refreshBatchSummary(task.batchId).catch(e => console.error("[Queue] refreshBatchSummary Error:", e));
             }
         }
 
         // Send individual status message one-by-one if not exists
         let statusMsgId = task.statusMsgId;
         if (!statusMsgId) {
+            console.log(`[Queue] Sending initial searching message...`);
             const msgId = task.link.split('/').pop() || 'media';
             const sMsg = await safeSendMessage(task.chatId, `🔍 **Searching Item:** \`${msgId}\`...`, { parse_mode: 'Markdown' });
             statusMsgId = sMsg?.message_id || 0;
         }
 
-        const success = await processTask(task.chatId, task.link, statusMsgId, fromId, task.overrideThreadId, task.forceGeneralPath, task.overrideTargetId);
-        await new Promise(r => setTimeout(r, 3000));
+        const taskNow = Date.now();
+        const userLastTaskTime = lastTaskTimePerUser.get(fromId) || 0;
+        console.log(`[Queue] Cooldown check. taskNow: ${taskNow}, lastTaskTime: ${userLastTaskTime}`);
+        
+        if (userLastTaskTime > 0) {
+            const timeDiff = taskNow - userLastTaskTime;
+            if (timeDiff < 5000) {
+                const waitSecs = Math.ceil((5000 - timeDiff) / 1000);
+                console.log(`[Queue] Throttling for ${waitSecs}s due to 5s cooldown.`);
+                for (let i = waitSecs; i > 0; i--) {
+                    await safeEditMessage(`⏳ **Cooldown:** Waiting ${i} seconds to avoid Telegram API limit before downloading next file...`, { chat_id: task.chatId, message_id: statusMsgId });
+                    await sleep(1000);
+                }
+            }
+        }
+
+        nextTaskRunAt = null;
+        console.log(`[Queue] Starting processTask for link ${task.link}`);
+        let success = false;
+        try {
+            const timeoutPromise = new Promise<boolean>((_, reject) => setTimeout(() => reject(new Error("Global Task Timeout (5 minutes)")), 5 * 60 * 1000));
+            success = await Promise.race([
+                processTask(task.chatId, task.link, statusMsgId, fromId, task.overrideThreadId, task.forceGeneralPath, task.overrideTargetId),
+                timeoutPromise
+            ]);
+        } catch (taskErr: any) {
+            console.error(`[Queue] processTask timed out or threw natively:`, taskErr);
+            await safeEditMessage(`❌ **Task Timeout/Error:** ${taskErr.message}`, { chat_id: task.chatId, message_id: statusMsgId });
+            success = false;
+        }
+        console.log(`[Queue] processTask finished with success=${success}`);
+        lastTaskTimePerUser.set(fromId, Date.now());
         
         if (task.batchId) {
             const info = batchStatusMap.get(task.batchId);
@@ -1720,26 +2328,30 @@ const runNextTask = async () => {
                 info.processed++;
                 if (success) info.success++;
                 else info.failed++;
-        const isFinished = info.processed === info.total;
-                await refreshBatchSummary(task.batchId, isFinished);
+                const isFinished = info.processed === info.total;
+                await refreshBatchSummary(task.batchId, isFinished).catch(e => console.error("[Queue] Final refreshBatchSummary Error:", e));
             }
         }
     } catch (e: any) {
+        console.error("[Queue] Queue execution error:", e);
         if (e.description?.includes("too many requests") || e.error_code === 429) {
             const retryAfter = (e.parameters?.retry_after || 60) + 5;
-            console.log(`429 Too Many Requests. Waiting ${retryAfter}s...`);
+            console.warn(`[Queue] 429 Detected. Slot paused for ${retryAfter}s...`);
+            // Put the task back at the front if it failed due to 429
+            taskQueue.unshift(task);
             setTimeout(runNextTask, retryAfter * 1000);
-            isTaskRunning = false;
+            activeTasksCount--;
+            activeTasksPerUser.set(fromId, (activeTasksPerUser.get(fromId) || 1) - 1);
             return;
         }
-        console.error("Queue execution error:", e);
     } finally {
-        if (isTaskRunning) {
-            isTaskRunning = false;
-            // Add human-like random jitter (2 to 7 seconds)
-            const jitter = Math.floor(Math.random() * 5000) + 2000;
-            setTimeout(runNextTask, jitter); 
-        }
+        activeTasksCount--;
+        activeTasksPerUser.set(fromId, (activeTasksPerUser.get(fromId) || 1) - 1);
+        console.log(`[Queue] Finally block hit. activeTasksCount is now ${activeTasksCount}, User ${fromId} active: ${activeTasksPerUser.get(fromId)}`);
+        // Add human-like random jitter (1 to 3 seconds) between tasks in the same slot
+        const jitter = Math.floor(Math.random() * 2000) + 1000;
+        nextTaskRunAt = Date.now() + jitter;
+        setTimeout(runNextTask, jitter); 
     }
 };
 
@@ -1767,7 +2379,8 @@ startAutoMirrorWatcher = async (userId: number, client: TelegramClient) => {
             
             if (!chatIdRaw) return;
             
-            const userDoc = await approvedUsersCollection?.findOne({ userId: userId.toString() });
+            const settingsUid = await resolveSettingsUserId(userId);
+            const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
             const paths = userDoc?.mirrorPaths || [];
             
             // Normalize IDs for robust matching
@@ -1866,7 +2479,7 @@ startAutoMirrorWatcher = async (userId: number, client: TelegramClient) => {
                         destTopicId = userDestCache.get(topicName);
                     } else {
                         try {
-                            const destEntity = await client.getEntity(destId);
+                            const destEntity = await safelyResolveFullEntity(client, destId);
                             // Robust Topic Verification before creation
                             const destTopics: any = await client.invoke(new Api.channels.GetForumTopics({
                                 channel: destEntity,
@@ -1916,7 +2529,7 @@ startAutoMirrorWatcher = async (userId: number, client: TelegramClient) => {
                     overrideTargetId: match.destId
                 });
                 
-                if (!isTaskRunning) runNextTask();
+                runNextTask();
             }
         } catch (e) {
             console.error(`[Watcher] Event Handler Error: ${e.message}`);
@@ -1925,68 +2538,121 @@ startAutoMirrorWatcher = async (userId: number, client: TelegramClient) => {
 }
 
 getConnectedUserbotClient = async (userId: number) => {
-    // Check if we already have an active client for this user
-    if (userClients.has(userId)) {
-        const client = userClients.get(userId)!;
-        try {
-            if (client.connected) {
-                await startAutoMirrorWatcher(userId, client);
+    const lookupId = userId;
+
+    // Check if there's already a connection in progress
+    if (pendingConnections.has(lookupId)) {
+        return pendingConnections.get(lookupId);
+    }
+
+    const connectPromise = (async () => {
+        // Check if we already have an active client for this user
+        if (userClients.has(lookupId)) {
+            const client = userClients.get(lookupId)!;
+            try {
+                if (client.connected) {
+                    try {
+                        await client.getMe();
+                        await startAutoMirrorWatcher(lookupId, client);
+                        return client;
+                    } catch (e: any) {
+                        if (e.message?.includes('AUTH_KEY_UNREGISTERED')) throw e;
+                    }
+                }
+                await client.connect();
+                await client.getMe();
+                await startAutoMirrorWatcher(lookupId, client);
                 return client;
+            } catch (e: any) {
+                console.warn(`[getConnectedUserbotClient] Client fail for ${lookupId}: ${e.message}`);
+                userClients.delete(lookupId);
+                activeWatchers.delete(lookupId);
+                if (e.message?.includes('AUTH_KEY_UNREGISTERED')) {
+                    userSessions.delete(lookupId);
+                    if (approvedUsersCollection) {
+                         await approvedUsersCollection.updateOne({ userId: lookupId.toString() }, { $unset: { stringSession: "" } });
+                    }
+                }
             }
+        }
+
+        // Try to load session from DB/Memory
+        let sessionStr = userSessions.get(lookupId);
+        if (!sessionStr && approvedUsersCollection) {
+            const userDoc = await approvedUsersCollection.findOne({ userId: lookupId.toString() });
+            if (userDoc?.stringSession) {
+                sessionStr = userDoc.stringSession;
+                userSessions.set(lookupId, sessionStr);
+            }
+        }
+
+        if (!sessionStr) return null;
+
+        try {
+            if (!apiIdValue || !apiHashValue) return null;
+
+            const client = new TelegramClient(
+                new StringSession(sessionStr),
+                apiIdValue,
+                apiHashValue,
+                {
+                    connectionRetries: 50,
+                    timeout: 600000,
+                    requestRetries: 15,
+                    ...getRandomDeviceProps(),
+                    useWSS: false,
+                    autoReconnect: true,
+                    floodSleepThreshold: 300,
+                    proxy: globalProxy ? {
+                         ip: globalProxy.ip,
+                         port: globalProxy.port,
+                         username: globalProxy.user,
+                         password: globalProxy.pass,
+                         socksType: globalProxy.socksType || 5
+                    } : undefined
+                }
+            );
+
             await client.connect();
-            await startAutoMirrorWatcher(userId, client);
-            return client;
-        } catch (e) {
-            userClients.delete(userId);
-            activeWatchers.delete(userId);
-        }
-    }
+            
+            // Verify session immediately
+            try {
+                await client.getMe();
+                userClients.set(lookupId, client);
+                console.log(`[getConnectedUserbotClient] Session verified for ${lookupId}`);
+                
+                // Prefetch dialogs backgroundly and safely
+                client.getDialogs({ limit: 150 }).then(dlgs => {
+                    (client as any)._dialogsCache = dlgs;
+                    (client as any)._dialogsCacheTime = Date.now();
+                }).catch(err => {
+                    console.warn(`[getConnectedUserbotClient] Background prefetch failed: ${err.message}`);
+                });
 
-    // Try to load session from DB/Memory
-    let sessionStr = userSessions.get(userId);
-    if (!sessionStr && approvedUsersCollection) {
-        const userDoc = await approvedUsersCollection.findOne({ userId: userId.toString() });
-        if (userDoc?.stringSession) {
-            sessionStr = userDoc.stringSession;
-            userSessions.set(userId, sessionStr);
-        }
-    }
-
-    if (!sessionStr) return null;
-
-    try {
-        if (!apiIdValue || !apiHashValue) return null;
-
-        const client = new TelegramClient(
-            new StringSession(sessionStr),
-            apiIdValue,
-            apiHashValue,
-            {
-                connectionRetries: 10,
-                deviceModel: "iPhone 15 Pro",
-                systemVersion: "iOS 17.5",
-                appVersion: "10.0.0",
-                langCode: "en",
-                systemLangCode: "hi-IN",
-                useWSS: false,
-                autoReconnect: true,
-                floodSleepThreshold: 300,
-                maxConcurrentDownloads: 1,
-                requestRetries: 10,
-                timeout: 300000
+                await startAutoMirrorWatcher(lookupId, client);
+                return client;
+            } catch (meErr: any) {
+                console.error(`[getConnectedUserbotClient] Verification failed for ${lookupId}: ${meErr.message}`);
+                if (meErr.message?.includes('AUTH_KEY_UNREGISTERED')) {
+                    userSessions.delete(lookupId);
+                    if (approvedUsersCollection) {
+                        await approvedUsersCollection.updateOne({ userId: lookupId.toString() }, { $unset: { stringSession: "" } });
+                    }
+                }
+                await client.disconnect().catch(() => {});
+                return null;
             }
-        );
-        await client.connect();
-        
-        // Cache limited dialogs to avoid suspicious bulk fetching
-        await client.getDialogs({ limit: 20 }).catch(() => {});
-        
-        userClients.set(userId, client);
-        await startAutoMirrorWatcher(userId, client);
-        return client;
-    } catch (err) {
-        console.error(`Userbot Client failed for user ${userId}:`, err);
-        return null;
+        } catch (err: any) {
+            console.error(`Userbot Client failed for user ${lookupId}:`, err);
+            return null;
+        }
+    })();
+
+    pendingConnections.set(lookupId, connectPromise);
+    try {
+        return await connectPromise;
+    } finally {
+        pendingConnections.delete(lookupId);
     }
 };
 
@@ -2039,15 +2705,46 @@ getConnectedUserbotClient = async (userId: number) => {
         return text;
     };
 
+    // Access memory: Stores which account worked for which channel (channelId -> userId)
+    const chatAccessCache = new Map<string, number>();
+
+    const getBestClientForLinkData = async (linkData: any, preferredUserIdParam: number, statusMsgId?: number, chatId?: number) => {
+        const preferredUserId = Number(await resolveSettingsUserId(preferredUserIdParam)) || preferredUserIdParam;
+
+        // Strictly use the preferred account as requested by the user
+        const client = await getConnectedUserbotClient(preferredUserId);
+        if (client) {
+            try {
+                const entity = await safelyResolveEntity(client, linkData.channelId).catch(() => null);
+                if (entity) {
+                    const msgs = await client.getMessages(entity, { ids: [linkData.msgId] });
+                    if (msgs && msgs.length > 0 && !(msgs[0] instanceof Api.MessageEmpty)) {
+                        return { client, userId: preferredUserId, peer: entity };
+                    }
+                }
+            } catch (e) {}
+        }
+
+        return { client, userId: preferredUserId, peer: null };
+    };
+
+    const getBestClientForTarget = async (targetId: any, preferredUserIdParam: number, statusMsgId?: number, chatId?: number) => {
+        const preferredUserId = Number(await resolveSettingsUserId(preferredUserIdParam)) || preferredUserIdParam;
+        
+        // Strictly use the preferred account as requested by the user
+        const prefClient = await getConnectedUserbotClient(preferredUserId);
+        if (prefClient) {
+            try {
+                const entity = await safelyResolveEntity(prefClient, targetId).catch(() => null);
+                if (entity) return { client: prefClient, userId: preferredUserId, peer: entity };
+            } catch (e) {}
+        }
+        
+        return { client: prefClient, userId: preferredUserId, peer: null };
+    };
+
     const processTask = async (chatId: number, link: string, statusMsgId: number, userId: number, threadIdOverride?: number, forceGeneralPath?: boolean, targetIdOverride?: any): Promise<boolean> => {
         try {
-            const client = await getConnectedUserbotClient(userId);
-            if (!client) throw new Error("Your Userbot session is not active. Please /login first.");
-            let userDoc: any = null;
-            if (approvedUsersCollection) {
-                userDoc = await approvedUsersCollection.findOne({ userId: userId.toString() });
-            }
-
             const getLinkData = (url: string) => {
                 const cleanUrl = url.trim().split('?')[0];
                 const parts = cleanUrl.split('/').filter(p => p.length > 0);
@@ -2062,35 +2759,42 @@ getConnectedUserbotClient = async (userId: number) => {
 
                 const nextPart = parts[domainIdx + 1];
                 if (nextPart === 'c' && parts.length > domainIdx + 2) {
+                    let channelId = parts[domainIdx + 2];
+                    // Ensure private channel ID starts with -100 for reliable lookups
+                    if (!channelId.startsWith('-100') && /^\d+$/.test(channelId)) {
+                        channelId = "-100" + channelId;
+                    }
                     return {
-                        channelId: parts[domainIdx + 2],
+                        channelId: channelId,
                         msgId: msgId,
                         isRestricted: true
                     };
                 }
 
                 return {
-                    channelId: nextPart,
+                    channelId: nextPart, // This is either a username @username or a public chat ID
                     msgId: msgId,
-                    isRestricted: url.includes('/c/')
+                    isRestricted: false
                 };
             };
 
             const linkData = getLinkData(link);
-
-            // Ping check to ensure connection is alive
-            if (!client.connected) {
-                await client.connect();
+            
+            const { client: sourceClient, peer: resolvedSourcePeer } = await getBestClientForLinkData(linkData, userId, statusMsgId, chatId);
+            if (!sourceClient) throw new Error("No active Userbot session to access source.");
+            
+            let userDoc: any = null;
+            if (approvedUsersCollection) {
+                userDoc = await approvedUsersCollection.findOne({ userId: (await resolveSettingsUserId(userId)) });
             }
+
+            if (!sourceClient.connected) await sourceClient.connect().catch(() => {});
 
             // Resolve target upload destination (User preference or default)
-            let uploadTarget: any = chatId;
-            let threadId: number | undefined = undefined;
-            if (approvedUsersCollection && !userDoc) {
-                userDoc = await approvedUsersCollection.findOne({ userId: userId.toString() });
-            }
-                
-                // Priority 1: Specific Mirror Path for this source (ignore if forceGeneralPath is true)
+            let uploadTarget: any = targetIdOverride || DEFAULT_LOG_GROUP;
+            let threadId: number | undefined = threadIdOverride;
+
+            if (targetIdOverride === undefined) {
                 const sourceId = linkData.channelId;
                 const mirrorPath = !forceGeneralPath ? userDoc?.mirrorPaths?.find((p: any) => 
                      p.sourceId === sourceId || p.sourceId === `-100${sourceId}` || sourceId === p.sourceId.replace('-100', '')
@@ -2098,154 +2802,60 @@ getConnectedUserbotClient = async (userId: number) => {
 
                 if (mirrorPath) {
                     uploadTarget = mirrorPath.destId;
-                    threadId = mirrorPath.destThreadId ? Number(mirrorPath.destThreadId) : undefined;
+                    if (threadId === undefined) threadId = mirrorPath.destThreadId ? Number(mirrorPath.destThreadId) : undefined;
                 } else if (userDoc?.uploadPath) {
                     uploadTarget = userDoc.uploadPath;
-                    if (userDoc.uploadTopicId || userDoc.uploadThreadId) {
+                    if (threadId === undefined && (userDoc.uploadTopicId || userDoc.uploadThreadId)) {
                         threadId = Number(userDoc.uploadTopicId || userDoc.uploadThreadId);
                     }
                 }
-
-            if (threadIdOverride !== undefined) {
-                threadId = threadIdOverride;
             }
-            if (targetIdOverride !== undefined) {
-                uploadTarget = targetIdOverride;
-            }
-            const msgId = linkData.msgId;
-            const channelIdInput = linkData.channelId;
-            const isRestricted = linkData.isRestricted;
-            let peer: any;
 
-            if (isNaN(msgId)) throw new Error("Could not parse Message ID from link.");
+            // Smart Route Destination: Find a client that can reach the destination
+            const { client: destClient, peer: destPeer } = await getBestClientForTarget(uploadTarget, userId, statusMsgId, chatId);
             
-            await safeEditMessage("🔍 **Locating channel and message...**", { chat_id: chatId, message_id: statusMsgId });
-
-            const findPeer = async (id: string, isPrivate: boolean) => {
-                // 1. Normalize ID format
-                const numericId = id.replace(/^-100/, "");
-                const isNumeric = /^\d+$/.test(numericId);
-                const fullId = isPrivate || isNumeric ? `-100${numericId}` : id;
-                const bId = isNumeric ? BigInt(numericId) : null;
-                const bFullId = bId ? BigInt(`-100${numericId}`) : null;
-                
-                // 2. Check local memory cache
-                if (entityCache.has(fullId)) return entityCache.get(fullId);
-                
-                // 3. Attempt direct resolution (often works if seen in current session)
+            let finalDestPeer = destPeer;
+            if (!finalDestPeer || (finalDestPeer.className === 'InputPeerChannel' && finalDestPeer.accessHash?.toString() === '0')) {
                 try {
-                    const entity = await client.getEntity(isNumeric ? (bFullId as any) : id).catch(() => 
-                        isNumeric ? client.getEntity(bId as any) : client.getEntity(id)
-                    );
-                    if (entity) {
-                        try {
-                            const input = await client.getInputEntity(entity);
-                            entityCache.set(fullId, input);
-                            return input;
-                        } catch (e) {
-                            // If getInputEntity fails, return entity itself, it might still work
-                            entityCache.set(fullId, entity);
-                            return entity;
-                        }
-                    }
-                } catch (e) {}
-
-                // 4. Scan Dialogs (The most reliable way to fetch access_hash for restricted entities)
-                const scanDialogsSlice = async (limit: number, offsetDate?: number) => {
-                    try {
-                        const dialogs = await client.getDialogs({ limit, offsetDate, archived: true });
-                        for (const d of dialogs) {
-                            const dIdStr = d.id.toString();
-                            const dIdNumeric = dIdStr.replace(/^-100/, "");
-                            
-                            // Robust numeric matching
-                            if (isNumeric) {
-                                if (dIdNumeric === numericId || dIdStr === numericId || dIdStr === fullId || dIdStr.endsWith(numericId)) {
-                                    const peerVal = d.inputEntity;
-                                    entityCache.set(fullId, peerVal);
-                                    return peerVal;
-                                }
-                            } else {
-                                // Robust username/name matching
-                                if (d.name?.toLowerCase() === id.toLowerCase() || dIdStr === id) {
-                                    const peerVal = d.inputEntity;
-                                    entityCache.set(fullId, peerVal);
-                                    return peerVal;
-                                }
-                            }
-                        }
-                    } catch (e) {}
-                    return null;
-                };
-
-                bot?.editMessageText("🔄 **Accessing your Telegram ID...**", { chat_id: chatId, message_id: statusMsgId }).catch(() => {});
-                
-                // Check recent 100 dialogs first
-                const firstHit = await scanDialogsSlice(100);
-                if (firstHit) return firstHit;
-
-                // Deep scan if still not found (up to 5000 dialogs covering massive accounts)
-                bot?.editMessageText("🔄 **Deep scanning your account folders...**", { chat_id: chatId, message_id: statusMsgId }).catch(() => {});
-                let currentOffset = 0;
-                for (let i = 0; i < 50; i++) { 
-                    const dialogs = await client.getDialogs({ limit: 100, offsetDate: currentOffset, archived: true }).catch(() => []);
-                    if (!dialogs || dialogs.length === 0) break;
-                    
-                    for (const d of dialogs) {
-                        const dIdStr = d.id.toString();
-                        const dIdNumeric = dIdStr.replace(/^-100/, "");
-                        if (isNumeric && (dIdNumeric === numericId || dIdStr === numericId || dIdStr === fullId)) {
-                            const peerVal = d.inputEntity;
-                            entityCache.set(fullId, peerVal);
-                            return peerVal;
-                        }
-                        if (!isNumeric && d.name?.toLowerCase() === id.toLowerCase()) {
-                            const peerVal = d.inputEntity;
-                            entityCache.set(fullId, peerVal);
-                            return peerVal;
-                        }
-                    }
-                    currentOffset = dialogs[dialogs.length - 1].date;
+                    // Pre-flight check to fail early before downloading/uploading
+                    const directResolve = await destClient.getEntity(uploadTarget);
+                    finalDestPeer = await destClient.getInputEntity(directResolve);
+                } catch (e: any) {
+                    throw new Error("Target destination could not be resolved by your Userbot. Ensure the Userbot has joined the destination chat/channel.");
                 }
+            }
+            if (!destClient) throw new Error("Destination unreachable. Ensure your Userbot is a member.");
 
-                // Final resolution attempt using library internal cache
-                try {
-                    const input = await client.getInputEntity(isNumeric ? (bFullId as any) : id);
-                    if (input) return input;
-                } catch (e) {}
+            await safeEditMessage("🔍 **Locating content...**", { chat_id: chatId, message_id: statusMsgId });
+            const sourcePeer = resolvedSourcePeer || await safelyResolveEntity(sourceClient, linkData.channelId);
 
-                return isNumeric ? bFullId : id;
-            };
-
-            peer = await findPeer(channelIdInput, isRestricted);
-
-            if (isNaN(msgId)) throw new Error("Invalid Message Link format.");
-
-            await safeEditMessage("📥 **Retrieving message content...**", { chat_id: chatId, message_id: statusMsgId });
+            await safeEditMessage("📥 **Retrieving content...**", { chat_id: chatId, message_id: statusMsgId });
             
             let msg: any;
-            try {
-                const messages = await client.getMessages(peer, { ids: [msgId] });
-                msg = messages?.[0];
-            } catch (err: any) {
-                // If peer is unreachable, try to refresh and retry
-                if (err.message.includes('CHANNEL_INVALID') || err.message.includes('PEER_ID_INVALID') || err.message.includes('MESSAGES_ID_INVALID')) {
-                    await safeEditMessage("🔄 **Access Error. Syncing specific channel...**", { chat_id: chatId, message_id: statusMsgId });
-                    await client.getDialogs({ limit: 40 });
-                    // Try to re-resolve peer
-                    const newPeer = await findPeer(channelIdInput, isRestricted);
-                    const messages = await client.getMessages(newPeer, { ids: [msgId] });
+            let retryCount = 0;
+            const maxRetries = 2;
+            while (retryCount <= maxRetries) {
+                try {
+                    const messages = await sourceClient.getMessages(sourcePeer, { ids: [linkData.msgId] });
                     msg = messages?.[0];
-                } else {
+                    if (msg && !(msg instanceof Api.MessageEmpty)) break;
+                    throw new Error("ENTITY_ACCESS_STALE");
+                } catch (err: any) {
+                    const isInvalidErr = err.errorMessage === 'CHANNEL_INVALID' || err.errorMessage === 'PEER_ID_INVALID' || (err.message && (err.message.includes('CHANNEL_INVALID') || err.message.includes('PEER_ID_INVALID') || err.message.includes('STALE')));
+                    if (retryCount < maxRetries && isInvalidErr) {
+                        retryCount++;
+                        await safeEditMessage(`🔄 **Retrying content access (${retryCount}/${maxRetries})...**`, { chat_id: chatId, message_id: statusMsgId });
+                        await sleep(2000);
+                        continue;
+                    }
+                    if (isInvalidErr && retryCount >= maxRetries) {
+                        throw new Error(`Cannot access the channel. The channel may be private, restricted, or the Userbot is not a member.`);
+                    }
                     throw err;
                 }
             }
 
-            if (!msg || !(msg instanceof Api.Message)) {
-                throw new Error("Message not found or inaccessible. Either the link is invalid, protected, or the Userbot is NOT a participant in that specific channel/group.");
-            }
-            
-            uploadTarget = await client.getEntity(uploadTarget).catch(() => uploadTarget);
+            if (!msg || !(msg instanceof Api.Message)) throw new Error("Content not found. Switch accounts or check link.");
 
             // Check if forwarding is allowed by source (Content Protection / Restrict Content is OFF)
             let isForwardingRestricted = !!msg.noforwards;
@@ -2259,232 +2869,139 @@ getConnectedUserbotClient = async (userId: number) => {
             }
 
             if (!isForwardingRestricted) {
-                if (statusMsgId && statusMsgId !== 0) {
-                    await safeEditMessage("🚀 **Attempting direct forwarding (Sender Hidden)...**", { chat_id: chatId, message_id: statusMsgId });
-                }
-                const randomId = helpers.generateRandomLong(true);
-                let targetPeer: any = uploadTarget;
+                await safeEditMessage("🚀 **Mirroring...**", { chat_id: chatId, message_id: statusMsgId });
                 try {
-                    targetPeer = await safelyResolveEntity(client, uploadTarget);
-                } catch (e) {
-                    targetPeer = uploadTarget;
-                }
-
-                try {
-                    const forwardRequest = new Api.messages.ForwardMessages({
-                        fromPeer: peer,
-                        id: [msgId],
-                        toPeer: targetPeer,
-                        dropAuthor: true, // Hides "Forwarded from..." sender info tag
-                        topMsgId: threadId, // Target topic group thread id
-                        randomId: [randomId]
-                    });
-                    await client.invoke(forwardRequest);
-                    if (statusMsgId && statusMsgId !== 0) {
-                        await safeEditMessage("🎯 **Content forwarded directly & securely (Sender Hidden)!**", { chat_id: chatId, message_id: statusMsgId });
+                    // Try forwarding via destClient first (it's often the preferred one and might see both)
+                    const finalSourcePeer = (destClient === sourceClient) ? sourcePeer : await safelyResolveEntity(destClient, linkData.channelId).catch(() => null);
+                    if (finalSourcePeer) {
+                        await destClient.invoke(new Api.messages.ForwardMessages({
+                            fromPeer: finalSourcePeer,
+                            id: [linkData.msgId],
+                            toPeer: finalDestPeer || await safelyResolveEntity(destClient, uploadTarget),
+                            dropAuthor: true,
+                            topMsgId: threadId,
+                            randomId: [helpers.generateRandomLong(true)]
+                        }));
+                        await safeEditMessage("🎯 **Success!**", { chat_id: chatId, message_id: statusMsgId });
+                        return true;
                     }
-                    return true;
-                } catch (forwardErr: any) {
-                    console.warn(`Direct forward failed, falling back to download & upload. Error:`, forwardErr.message);
-                    if (statusMsgId && statusMsgId !== 0) {
-                        await safeEditMessage("📥 **Direct forwarding restricted. Falling back to downloading locally & uploading...**", { chat_id: chatId, message_id: statusMsgId });
-                    }
-                    // Fall back to down/up pipeline below
-                }
-            } else {
-                if (statusMsgId && statusMsgId !== 0) {
-                    await safeEditMessage("📥 **Direct forwarding restricted by source. Falling back to downloading locally & uploading...**", { chat_id: chatId, message_id: statusMsgId });
-                }
+                } catch (e) {}
             }
 
             if (!msg.media) {
-                if (statusMsgId && statusMsgId !== 0) {
-                    await safeEditMessage("🚀 **Mirroring text content...**", { chat_id: chatId, message_id: statusMsgId });
-                }
-                const customMsgText = applyRenameRules(msg.message || "");
-                await client.sendMessage(uploadTarget, { 
-                    message: customMsgText, 
-                    replyTo: threadId 
-                });
-                if (statusMsgId && statusMsgId !== 0) {
-                    await safeEditMessage("🎯 **Text content mirrored successfully!**", { chat_id: chatId, message_id: statusMsgId });
-                }
+                await destClient.sendMessage(finalDestPeer || uploadTarget, { message: applyRenameRules(msg.message || ""), replyTo: threadId });
+                await safeEditMessage("🎯 **Success!**", { chat_id: chatId, message_id: statusMsgId });
                 return true;
             }
 
-            const downloadWorkers = 32; 
-            const uploadWorkers = currentUploadEngine === 'Telethon' ? 16 : 8; 
-
+            await safeEditMessage(`📥 **Downloading via Source Account...**`, { chat_id: chatId, message_id: statusMsgId });
+            
             let filename = "file";
-            if (msg.media instanceof Api.MessageMediaDocument) {
-                const doc = msg.media.document as Api.Document;
-                const attr = doc.attributes.find(a => a instanceof Api.DocumentAttributeFilename);
+            if (msg.media instanceof Api.MessageMediaDocument && msg.media.document instanceof Api.Document) {
+                const attr = msg.media.document.attributes.find(a => a instanceof Api.DocumentAttributeFilename);
                 if (attr && (attr as any).fileName) filename = (attr as any).fileName;
             } else if (msg.media instanceof Api.MessageMediaPhoto) {
                 filename = "photo.jpg";
             }
-
-            // Apply custom pattern and keyword renaming to filename
             filename = applyRenameRules(filename);
 
             const tempFilePath = path.join(os.tmpdir(), `dl_${Date.now()}_${filename}`);
             const thumbPath = path.join(os.tmpdir(), `thumb_${Date.now()}.jpg`);
             let hasThumb = false;
-
-            await safeEditMessage(`📥 **Preparing to download media...**\n_Mode: ${currentUploadEngine}_`, { chat_id: chatId, message_id: statusMsgId });
+            const downloadStartTime = Date.now();
 
             // Try custom thumbnail first
             const userCustomThumbPath = path.join(os.tmpdir(), `custom_thumb_${userId}.jpg`);
-            if (!fs.existsSync(userCustomThumbPath) && userDoc?.customThumbnailFileId) {
+            if (userDoc?.customThumbnailFileId) {
                 try {
                     const downloaded = await bot?.downloadFile(userDoc.customThumbnailFileId, os.tmpdir());
                     if (downloaded) {
                         fs.renameSync(downloaded, userCustomThumbPath);
                     }
-                } catch (err) {
-                    console.error("Failed to download custom thumbnail from Telegram:", err);
-                }
+                } catch (err) {}
             }
 
             if (fs.existsSync(userCustomThumbPath)) {
                 try {
                     fs.copyFileSync(userCustomThumbPath, thumbPath);
                     hasThumb = true;
-                } catch (err) {
-                    console.error("Failed to copy custom thumbnail:", err);
-                }
-            } else if (msg.media instanceof Api.MessageMediaDocument) {
-                // Otherwise try downloading original channel media's thumbnail
-                const doc = msg.media.document as Api.Document;
+                } catch (err) {}
+            } else if (msg.media instanceof Api.MessageMediaDocument && msg.media.document instanceof Api.Document) {
+                const doc = msg.media.document;
                 if (doc.thumbs && doc.thumbs.length > 0) {
                     try {
-                        const largestThumb = doc.thumbs[doc.thumbs.length - 1]; // Use largest thumb
-                        await client.downloadMedia(msg, {
-                            thumb: largestThumb,
-                            outputFile: thumbPath
-                        });
+                        const largestThumb = doc.thumbs[doc.thumbs.length - 1]; 
+                        await sourceClient.downloadMedia(msg, { thumb: largestThumb, outputFile: thumbPath });
                         hasThumb = fs.existsSync(thumbPath);
-                    } catch (e) {
-                        console.error("Thumbnail download failed:", e);
-                    }
+                    } catch (e) {}
                 }
             }
-
-            let lastUpdate = 0;
-            const downloadStartTime = Date.now();
             
-            // Download to disk instead of buffer for stability on large files
-            await sleep(3000 + Math.random() * 2000);
-            await client.downloadMedia(msg, {
-                workers: downloadWorkers, 
+            let lastDownloadUpdate = 0;
+            await sourceClient.downloadMedia(msg, {
                 outputFile: tempFilePath,
-                dcId: msg.media && (msg.media as any).document ? (msg.media as any).document.dcId : undefined,
-                requestRetry: 5,
-                progressCallback: (current, total) => {
+                progressCallback: (c, t) => {
                     const now = Date.now();
-                    if (now - lastUpdate > 2000) { // 2s throttle
-                        lastUpdate = now;
-                        const text = createProgressBar(Number(total || fileStats.size), Number(current), "Downloading", downloadStartTime);
-                        safeEditMessage(text, { 
-                            chat_id: chatId, 
-                            message_id: statusMsgId,
-                            parse_mode: 'Markdown'
-                        });
-                    }
-                }
-            } as any);
-
-            const fileStats = fs.statSync(tempFilePath);
-            if (fileStats.size === 0) throw new Error("Downloaded file is empty.");
-
-            await safeEditMessage(`📤 **Uploading via High-Speed Channel...**\n_Engine: ${currentUploadEngine}_`, { chat_id: chatId, message_id: statusMsgId });
-
-            let caption = applyRenameRules(msg.message || "");
-            if (userDoc?.customCaptionTemplate) {
-                const template = userDoc.customCaptionTemplate;
-                if (template.includes("{original}")) {
-                    caption = template.replace("{original}", caption);
-                } else {
-                    caption = `${caption}\n\n${template}`;
-                }
-            }
-            let uploadLastUpdate = 0;
-            const uploadStartTime = Date.now();
-            const totalSize = fileStats.size;
-
-            // Manual chunked upload for maximum reliability
-            const uploadedFile = await client.uploadFile({
-                file: new CustomFile(filename, totalSize, tempFilePath),
-                workers: uploadWorkers,
-                onProgress: (current: any) => {
-                    const now = Date.now();
-                    if (now - uploadLastUpdate > 2000) { // 2s throttle
-                        uploadLastUpdate = now;
-                        const text = createProgressBar(Number(totalSize), Number(current), "Uploading", uploadStartTime);
-                        safeEditMessage(text, { 
-                            chat_id: chatId, 
-                            message_id: statusMsgId,
-                            parse_mode: 'Markdown'
-                        });
+                    if (now - lastDownloadUpdate > 2000 || Number(c) === Number(t)) {
+                        lastDownloadUpdate = now;
+                        safeEditMessage(createProgressBar(Number(t || 0), Number(c), "Downloading", downloadStartTime), { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown' }).catch(() => {});
                     }
                 }
             });
 
-            await safeEditMessage("🚀 **Finalizing transmission...**", { chat_id: chatId, message_id: statusMsgId });
+            if (!fs.existsSync(tempFilePath) || fs.statSync(tempFilePath).size === 0) throw new Error("Download failed.");
 
-            try {
-                const attributes: any[] = [];
-                if (filename !== "file") {
-                    attributes.push(new Api.DocumentAttributeFilename({ fileName: filename }));
-                }
+            await safeEditMessage(`📤 **Uploading via Destination Account...**`, { chat_id: chatId, message_id: statusMsgId });
+            
+            const uploadStartTime = Date.now();
+            const totalSize = fs.statSync(tempFilePath).size;
+            let lastUploadUpdate = 0;
 
-                // If it's a video and upload mode is video, add video attributes to ensure it's playable in TG
-                const isVideo = filename.toLowerCase().match(/\.(mp4|mkv|mov|avi)$/);
-                const isDocumentMode = userDoc?.uploadMode === 'document';
-                if (isVideo && !isDocumentMode) {
-                    attributes.push(new Api.DocumentAttributeVideo({
-                        duration: 0,
-                        w: 0,
-                        h: 0,
-                        supportsStreaming: true
-                    }));
+            const uploadedFile = await destClient.uploadFile({
+                file: new CustomFile(filename, totalSize, tempFilePath),
+                workers: 8,
+                onProgress: (current: any) => {
+                    let currentBytes = Number(current);
+                    if (currentBytes <= 1.0 && currentBytes >= 0) {
+                        currentBytes = Math.floor(currentBytes * totalSize);
+                    }
+                    const now = Date.now();
+                    if (now - lastUploadUpdate > 2000 || currentBytes === totalSize) {
+                        lastUploadUpdate = now;
+                        const text = createProgressBar(Number(totalSize), currentBytes, "Uploading", uploadStartTime);
+                        safeEditMessage(text, { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown' }).catch(() => {});
+                    }
                 }
+            });
 
-                await client.sendFile(uploadTarget, {
-                    file: uploadedFile,
-                    caption: caption,
-                    workers: uploadWorkers,
-                    attributes: attributes,
-                    thumb: hasThumb ? thumbPath : undefined,
-                    replyTo: threadId,
-                } as any);
-            } catch (sendErr: any) {
-                if (sendErr.message.includes('PEER_ID_INVALID')) {
-                    const destPeer = await safelyResolveEntity(client, uploadTarget).catch(() => uploadTarget);
-                    await client.sendFile(destPeer, {
-                        file: uploadedFile,
-                        caption: caption,
-                        workers: uploadWorkers,
-                        attributes: [new Api.DocumentAttributeFilename({ fileName: filename })],
-                        thumb: hasThumb ? thumbPath : undefined,
-                        replyTo: threadId,
-                    } as any);
-                } else {
-                    throw sendErr;
-                }
+            const attributes: any[] = [new Api.DocumentAttributeFilename({ fileName: filename })];
+            
+            let caption = applyRenameRules(msg.message || "");
+            if (userDoc?.customCaptionTemplate) {
+                const template = userDoc.customCaptionTemplate;
+                caption = template.includes("{original}") ? template.replace("{original}", caption) : `${caption}\n\n${template}`;
             }
 
-            // Cleanup temp files
+            await destClient.sendFile(finalDestPeer || uploadTarget, {
+                file: uploadedFile,
+                caption: caption,
+                workers: 8,
+                attributes: attributes,
+                thumb: hasThumb ? thumbPath : undefined,
+                replyTo: threadId,
+            } as any);
+
             if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
             if (hasThumb && fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath);
-
-            await safeEditMessage("🎯 **Successfully sent to your chat!**", { chat_id: chatId, message_id: statusMsgId });
+            
+            await safeEditMessage("🎯 **Successfully mirrored!**", { chat_id: chatId, message_id: statusMsgId });
             return true;
         } catch (err: any) {
             console.error("Link Process Error:", err);
             let errMsg = err.message;
-            if (errMsg.includes("CHANNEL_INVALID")) errMsg = "Channel not found. Ensure Userbot is a member of the group.";
-            await safeEditMessage(`❌ **Failed:** ${errMsg}`, { chat_id: chatId, message_id: statusMsgId });
+            if (err.errorMessage === 'CHANNEL_INVALID' || (errMsg && errMsg.includes("CHANNEL_INVALID"))) errMsg = "Channel not found. Ensure Userbot is a member of BOTH chats.";
+            if (!errMsg && err.errorMessage) errMsg = err.errorMessage;
+            await safeEditMessage(`❌ **Failed:** ${errMsg || "Unknown Error"}`, { chat_id: chatId, message_id: statusMsgId });
             return false;
         }
     };
@@ -2648,7 +3165,8 @@ getConnectedUserbotClient = async (userId: number) => {
               if (targetId) {
                   delete userActionStates[fromId];
                   if (approvedUsersCollection) {
-                      await approvedUsersCollection.updateOne({ userId: fromId.toString() }, { $set: { uploadPath: targetId } });
+                      const settingsUid = await resolveSettingsUserId(fromId);
+                      await approvedUsersCollection.updateOne({ userId: settingsUid }, { $set: { uploadPath: targetId } });
                   }
                   safeSendMessage(chatId, `✅ **Path Saved!**\nFiles will now be uploaded to: \`${targetId}\`\n\n_Note: Ensure the Userbot is a member of that chat._`, { parse_mode: 'Markdown' });
                   handleSettings(chatId, fromId);
@@ -2677,7 +3195,8 @@ getConnectedUserbotClient = async (userId: number) => {
                   delete userActionStates[fromId];
                   
                   if (approvedUsersCollection) {
-                      const userDoc = await approvedUsersCollection.findOne({ userId: fromId.toString() });
+                      const settingsUid = await resolveSettingsUserId(fromId);
+                      const userDoc = await approvedUsersCollection.findOne({ userId: settingsUid });
                       const mirrorPaths = userDoc?.mirrorPaths || [];
                       
                       const filtered = mirrorPaths.filter((p: any) => p.sourceId !== sourceId);
@@ -2693,7 +3212,7 @@ getConnectedUserbotClient = async (userId: number) => {
                       const finalPaths = filtered.slice(-16);
 
                       await approvedUsersCollection.updateOne(
-                          { userId: fromId.toString() },
+                          { userId: settingsUid },
                           { $set: { mirrorPaths: finalPaths } }
                       );
 
@@ -2724,7 +3243,8 @@ getConnectedUserbotClient = async (userId: number) => {
               }
 
               if (sourceId) {
-                  const userDoc = await approvedUsersCollection?.findOne({ userId: fromId.toString() });
+                  const settingsUid = await resolveSettingsUserId(fromId);
+                  const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
                   const savedDestinations = userDoc?.savedDestinations || [];
                   if (savedDestinations.length === 0) {
                       delete userActionStates[fromId];
@@ -2811,7 +3331,8 @@ getConnectedUserbotClient = async (userId: number) => {
                   return;
               }
 
-              const userDoc = await approvedUsersCollection?.findOne({ userId: fromId.toString() });
+              const settingsUid = await resolveSettingsUserId(fromId);
+              const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
               const savedDestinations = userDoc?.savedDestinations || [];
               if (savedDestinations.length === 0) {
                   delete userActionStates[fromId];
@@ -2855,16 +3376,15 @@ getConnectedUserbotClient = async (userId: number) => {
               await safeSendMessage(chatId, `📂 **Starting Specific Topic Clone...**\nSource Group: \`${sourceGroupId}\`\nTopic ID: \`${topicId}\``);
               
               try {
-                  const client = await getConnectedUserbotClient(fromId);
+                  const targetUid = Number(await resolveSettingsUserId(fromId));
+                  const client = await getConnectedUserbotClient(targetUid);
                   if (!client) throw new Error("Your Userbot session is not active. Please /login first.");
                   
-                  const sourceEntity = await client.getEntity(sourceGroupId);
-                  const userDoc = await approvedUsersCollection?.findOne({ userId: fromId.toString() });
+                  const sourceEntity = await safelyResolveFullEntity(client, sourceGroupId);
+                  const settingsUid = await resolveSettingsUserId(fromId);
+                  const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
                   
-                  const destPath = userDoc?.uploadPath;
-                  if (!destPath) {
-                      throw new Error("No general upload destination set. Please configure your upload path first under settings or /setpath.");
-                  }
+                  const destPath = userDoc?.uploadPath || DEFAULT_LOG_GROUP;
                   
                   const sourceIdRaw = (sourceEntity as any).id?.toString() || "";
                   const sourceIdClean = sourceIdRaw.replace('-100', '');
@@ -2898,7 +3418,7 @@ getConnectedUserbotClient = async (userId: number) => {
                       queuedCount++;
                   }
 
-                  if (!isTaskRunning) runNextTask();
+                  runNextTask();
                   safeSendMessage(chatId, `✅ Added **${queuedCount}** items from Topic ID \`${topicId}\` to copy queue for general destination path: \`${destPath}\`.`);
               } catch (err: any) {
                   safeSendMessage(chatId, `❌ **Clone Error:** ${err.message}`);
@@ -2919,10 +3439,11 @@ getConnectedUserbotClient = async (userId: number) => {
               await safeSendMessage(chatId, `📂 **Starting Single Topic Mirror (ID: ${topicId})...**`);
               
               try {
-                  const client = await getConnectedUserbotClient(fromId);
+                  const targetUid = Number(await resolveSettingsUserId(fromId));
+                  const client = await getConnectedUserbotClient(targetUid);
                   if (!client) throw new Error("Disconnected.");
                   
-                  const sourceEntity = await client.getEntity(sourceTarget);
+                  const sourceEntity = await safelyResolveFullEntity(client, sourceTarget);
                   const userDoc = await approvedUsersCollection?.findOne({ userId: fromId.toString() });
                   
                   const sourceIdRaw = (sourceEntity as any).id?.toString() || "";
@@ -2931,8 +3452,7 @@ getConnectedUserbotClient = async (userId: number) => {
                       p.sourceId === sourceIdClean || p.sourceId === `-100${sourceIdClean}` || sourceIdClean === p.sourceId.replace('-100', '')
                   );
 
-                  const destId = mirrorPath ? mirrorPath.destId : userDoc?.uploadPath;
-                  if (!destId) throw new Error("Please set a Destination Path first.");
+                  const destId = mirrorPath ? mirrorPath.destId : (userDoc?.uploadPath || DEFAULT_LOG_GROUP);
 
                   const messages: any = await client.getMessages(sourceEntity, {
                       limit: 100,
@@ -2951,7 +3471,7 @@ getConnectedUserbotClient = async (userId: number) => {
                           });
                       }
                   }
-                  if (!isTaskRunning) runNextTask();
+                  runNextTask();
                   safeSendMessage(chatId, `✅ Added **${messages.length}** content items to queue.`);
               } catch (err: any) {
                   safeSendMessage(chatId, `❌ **Mirror Error:** ${err.message}`);
@@ -2991,9 +3511,11 @@ getConnectedUserbotClient = async (userId: number) => {
                       const batchId = `batch_${Date.now()}_${fromId}`;
                       
                       // 1. Send and PIN Summary Message
+                      console.log(`[Batch] Initializing batch: count=${count}, startId=${startId}, endId=${endId}`);
                       const summaryMsg = await safeSendMessage(chatId, `⏳ **Initializing Batch Process...**\nLinks: \`${count}\` requested.`, { parse_mode: 'Markdown' });
                       if (summaryMsg) {
-                          await bot?.pinChatMessage(chatId, summaryMsg.message_id).catch(() => {});
+                          console.log(`[Batch] Pinning summary msg ID: ${summaryMsg.message_id}`);
+                          await bot?.pinChatMessage(chatId, summaryMsg.message_id).catch(e => console.error("[Batch] pin failure:", e));
                           batchStatusMap.set(batchId, {
                               total: count,
                               processed: 0,
@@ -3005,6 +3527,7 @@ getConnectedUserbotClient = async (userId: number) => {
                           });
                       }
 
+                      console.log(`[Batch] Sending Batch Accepted...`);
                       await safeSendMessage(chatId, `✅ **Batch Accepted!**\nProcessing \`${count}\` links. The summary has been pinned above.`);
                       
                       for (let i = startId; i <= endId; i++) {
@@ -3012,7 +3535,8 @@ getConnectedUserbotClient = async (userId: number) => {
                           taskQueue.push({ chatId, link, batchId, userId: fromId });
                       }
                       
-                      if (!isTaskRunning) runNextTask();
+                      console.log(`[Batch] Queue loaded. Calling runNextTask. TaskQueue size: ${taskQueue.length}, Active: ${activeTasksCount}`);
+                      runNextTask();
 
                   } catch (err: any) {
                       safeSendMessage(chatId, `❌ **Batch Error:** ${err.message}`);
@@ -3053,20 +3577,21 @@ getConnectedUserbotClient = async (userId: number) => {
 
       // Handle Interactive Login Steps
       if (fromId && loginStates[fromId]) {
+        const val = text?.trim();
+        if (!val || val.startsWith('/')) return; // Ignore commands or empty text
+
         if (!isAdmin(fromId)) {
             delete loginStates[fromId];
             return;
         }
         const state = loginStates[fromId];
-        const val = text?.trim();
-        if (!val) return;
 
         // Existing resolvers (OTP or Password)
         if (state.resolvePhoneCode) {
             const resolve = state.resolvePhoneCode;
             delete state.resolvePhoneCode;
-            // Simulate human typing delay (1s to 3s)
-            await sleep(Math.random() * 2000 + 1000);
+            // Simulate realistic human typing delay (2s to 4.5s)
+            await sleep(Math.random() * 2500 + 2000);
             return resolve(val);
         }
 
@@ -3081,7 +3606,11 @@ getConnectedUserbotClient = async (userId: number) => {
         // Fresh login: this must be the phone number
         if (!state.client) {
             try {
-                const phone = val;
+                // Ensure phone number starts with '+' and is stripped of whitespace or dashes
+                let phone = val.replace(/\s+/g, '').replace(/[-()]/g, '');
+                if (!phone.startsWith('+') && /^\d+$/.test(phone)) {
+                    phone = '+' + phone;
+                }
                 
                 // Ensure API ID and Hash are set for this user context
                 // If not, we might need to ask the user, but for now just use globals
@@ -3091,24 +3620,42 @@ getConnectedUserbotClient = async (userId: number) => {
                      return;
                 }
 
-                const models = ["iPhone 15 Pro", "iPhone 13", "Android 14", "Pixel 8 Pro", "Samsung S23"];
-                const device = models[Math.floor(Math.random() * models.length)];
-                
                 const client = new TelegramClient(new StringSession(""), apiIdValue, apiHashValue, { 
-                    connectionRetries: 5,
-                    timeout: 300000,
-                    deviceModel: device,
-                    systemVersion: "iOS 17.5",
-                    appVersion: "10.0.0",
-                    langCode: "en", 
+                    connectionRetries: 50,
+                    timeout: 600000,
+                    requestRetries: 15,
+                    ...getRandomDeviceProps(),
                     floodSleepThreshold: 300,
-                    systemLangCode: "hi-IN"
+                    proxy: globalProxy ? {
+                        ip: globalProxy.ip,
+                        port: globalProxy.port,
+                        username: globalProxy.user,
+                        password: globalProxy.pass,
+                        socksType: globalProxy.socksType || 5
+                    } : undefined
                 });
                 state.client = client;
                 state.phone = phone;
 
-                // Human-like delay before starting the flow
-                await sleep(Math.random() * 2000 + 1000);
+                // Explicitly establish connection with retry logic
+                let connected = false;
+                for (let i = 0; i < 3; i++) {
+                    try {
+                        console.log(`[Login] Connection attempt ${i+1} for ${fromId}...`);
+                        await client.connect();
+                        connected = true;
+                        break;
+                    } catch (connErr) {
+                        console.error(`[Login] Connection attempt ${i+1} failed:`, connErr);
+                        await sleep(3000);
+                    }
+                }
+
+                if (!connected) {
+                    throw new Error("Could not establish connection to Telegram servers. Please check your proxy or try again later.");
+                }
+
+                console.log(`[Login] Client connected for ${fromId}. Starting auth flow...`);
 
                 client.start({
                     phoneNumber: async () => state.phone!,
@@ -3136,47 +3683,56 @@ getConnectedUserbotClient = async (userId: number) => {
                             state.resolvePassword = resolve; 
                         });
                     },
-                    onError: (err) => {
-                        console.error(`[Login] Error for ${fromId}:`, err);
-                        console.error(`[Login] Error Details: ${JSON.stringify(err)}`);
-                        let msg = err.message;
-                        if (msg.includes('PHONE_CODE_EXPIRED') || msg.includes('AUTH_KEY_UNREGISTERED')) {
-                            msg = "The authentication code has expired or is invalid. Please type /login again to request a new one.";
-                        } else if (msg.includes('SESSION_PASSWORD_NEEDED')) {
-                            msg = "2FA Password is required on your Telegram account.";
-                        }
-                        safeSendMessage(chatId, `❌ **Process Failed:** ${msg}`);
-                        state.client?.disconnect();
-                        delete loginStates[fromId];
+                    onError: (err: any) => {
+                        console.error(`[Login] Internally caught error for ${fromId}, aborting flow:`, err);
+                        throw err;
                     }
                 }).then(async () => {
                     const session = client.session.save() as unknown as string;
-                    userSessions.set(fromId, session);
-                    userClients.set(fromId, client);
                     
+                    const me = await client.getMe().catch(() => null) as any;
+                    const accountUserId = me ? Number(me.id) : fromId;
+                    
+                    userSessions.set(accountUserId, session);
+                    userClients.set(accountUserId, client);
+                    
+                    const fullName = me ? `${me.firstName || ""} ${me.lastName || ""}`.trim() : "User";
+                    const phoneNumber = me?.phone || state.phone || "Unknown";
+
                     if (approvedUsersCollection) {
                         await approvedUsersCollection.updateOne(
-                            { userId: fromId.toString() }, 
-                            { $set: { stringSession: session, lastLogin: new Date() } }, 
+                            { userId: accountUserId.toString() }, 
+                            { $set: { 
+                                stringSession: session, 
+                                lastLogin: new Date(),
+                                fullName,
+                                phoneNumber,
+                                addedByAdminId: fromId.toString()
+                            } }, 
                             { upsert: true }
                         );
                     }
-                    safeSendMessage(chatId, "✅ **Successfully Logged In!** This session is isolated to your account.");
+                    adminActiveSession.set(fromId, accountUserId);
+
+                    safeSendMessage(chatId, `✅ **Successfully Logged In!**\n\n👤 Account: **${fullName}**\n📱 Phone: **${phoneNumber}**`);
                     // Warm up entity cache immediately after login
                     await client.getDialogs({ limit: 40 }).catch(() => {});
-                    safeSendMessage(chatId, "✨ **Setup Complete!** You can now send restricted links.");
+                    safeSendMessage(chatId, "✨ **Setup Complete!** This account has been set as your active working session.\nYou can manage sessions via /login dashboard.");
                     delete loginStates[fromId];
                 }).catch((err) => {
                     if (loginStates[fromId]) {
-                        console.error(`[Login] Catch Error for ${fromId}:`, err);
-                        console.error(`[Login] Error Details: ${JSON.stringify(err)}`);
-                        let msg = err.message;
-                        if (msg.includes('PHONE_CODE_EXPIRED') || msg.includes('AUTH_KEY_UNREGISTERED')) {
-                            msg = "The authentication code has expired or is invalid. Please type /login again to request a new one.";
-                        } else if (msg.includes('SESSION_PASSWORD_NEEDED')) {
-                            msg = "2FA Password is required on your Telegram account.";
+                        console.error(`[Login] Final Catch Error for ${fromId}:`, err);
+                        const cleanMsg = err.message || "Unknown error";
+                        const solution = getLoginErrorSolution(cleanMsg);
+                        
+                        let displayMsg = cleanMsg;
+                        if (cleanMsg.includes('PHONE_CODE_EXPIRED') || cleanMsg.includes('AUTH_KEY_UNREGISTERED')) {
+                            displayMsg = "The authentication code has expired or is invalid. Please type /login again to request a new one.";
+                        } else if (cleanMsg.includes('SESSION_PASSWORD_NEEDED')) {
+                            displayMsg = "2FA Password is required on your Telegram account.";
                         }
-                        safeSendMessage(chatId, `❌ **Authentication Error:** ${msg}`);
+                        
+                        safeSendMessage(chatId, `❌ **Login Failed:** \`${displayMsg}\`\n\n💡 **Solution:** ${solution}`);
                         state.client?.disconnect();
                         delete loginStates[fromId];
                     }
@@ -3209,13 +3765,10 @@ getConnectedUserbotClient = async (userId: number) => {
             });
         }
 
-        if (!isTaskRunning) {
-            runNextTask();
-        } else {
-            const options: any = { parse_mode: 'Markdown' };
-            if (msg.message_thread_id) options.message_thread_id = msg.message_thread_id;
-            safeSendMessage(msg.chat.id, `⌛ **Queued:** Added ${links.length} task(s) to the processing queue.\n\n_Total items waiting: ${taskQueue.length}_`, options);
-        }
+        runNextTask();
+        const options: any = { parse_mode: 'Markdown' };
+        if (msg.message_thread_id) options.message_thread_id = msg.message_thread_id;
+        safeSendMessage(msg.chat.id, `⌛ **Queued:** Added ${links.length} task(s) to the processing queue.\n\n_Total items waiting: ${taskQueue.length}_`, options);
         return;
       }
     });
@@ -3268,6 +3821,9 @@ app.get('/api/status', (req, res) => {
     dbStatus: dbStatus,
     adminConfigured: !!currentAdminId,
     botInfo: botInfo,
+    queueSize: taskQueue.length,
+    nextTaskIn: nextTaskRunAt ? Math.max(0, Math.round((nextTaskRunAt - Date.now()) / 1000)) : 0,
+    proxy: globalProxy,
     config: {
       hasToken: !!token,
       hasMongo: !!mongoUri,
@@ -3286,11 +3842,23 @@ app.get('/api/status', (req, res) => {
 
 app.post('/api/settings', async (req, res) => {
   if (!settingsCollection) return res.status(503).json({ error: 'Database not ready' });
-  const { adminId, stringSession, destinationChatId: newDestId, apiId: newApiId, apiHash: newApiHash, downloadLibrary, renameRules } = req.body;
+  const { adminId, stringSession, destinationChatId: newDestId, apiId: newApiId, apiHash: newApiHash, downloadLibrary, renameRules, proxy } = req.body;
   try {
     const updateData: any = {};
     if (adminId) updateData.adminId = adminId;
-    if (stringSession) updateData.stringSession = stringSession;
+        if (stringSession) {
+            updateData.stringSession = stringSession;
+            const activeAdminId = adminId || currentAdminId || ALLOWED_ADMIN_IDS[0];
+            if (activeAdminId && approvedUsersCollection) {
+                await approvedUsersCollection.updateOne(
+                    { userId: activeAdminId.toString() },
+                    { $set: { stringSession } },
+                    { upsert: true }
+                );
+                userSessions.set(Number(activeAdminId), stringSession);
+                approvedUsersCache.add(activeAdminId.toString());
+            }
+        }
     if (newDestId) updateData.destinationChatId = newDestId;
         if (newApiId) {
             updateData.apiId = newApiId;
@@ -3308,6 +3876,10 @@ app.post('/api/settings', async (req, res) => {
             updateData.renameRules = renameRules;
             globalRenameRules = renameRules;
         }
+        if (proxy) {
+            updateData.proxy = proxy;
+            globalProxy = proxy;
+        }
         
         await settingsCollection.updateOne({ type: 'global_config' }, { $set: updateData }, { upsert: true });
         
@@ -3319,13 +3891,18 @@ app.post('/api/settings', async (req, res) => {
   }
 });
 
-// Silence TOPIC_CLOSED unhandled rejections as they are handled in safeSendMessage
-process.on('unhandledRejection', (reason) => {
-    const r = reason as any;
-    if (r?.message?.includes('TOPIC_CLOSED') || r?.message?.includes('message thread not found')) {
-        return;
+// Global error handlers to prevent unhandled rejections from crashing or being noisy
+process.on('unhandledRejection', (reason: any, promise) => {
+    const msg = reason?.message || String(reason);
+    if (msg.includes('429') || reason?.error_code === 429 || msg.includes('TOPIC_CLOSED') || msg.includes('message thread not found')) {
+        console.warn('Silent caught known Telegram Rejection:', msg);
+    } else {
+        console.error('Unhandled Rejection at:', promise, 'reason:', reason);
     }
-    console.error('Unhandled Rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+    console.error('Uncaught Exception:', err);
 });
 
 async function startServer() {

@@ -1,12 +1,15 @@
 import React, { useEffect, useState } from 'react';
-import { Bot, Shield, AlertCircle, CheckCircle2, Settings, ExternalLink, Database, UserCheck, XCircle, Plus, Trash2, Tag } from 'lucide-react';
+import { Bot, Shield, AlertCircle, CheckCircle2, Settings, ExternalLink, Database, UserCheck, XCircle, Plus, Trash2, Tag, Home, FileEdit, Layers, Clock, ArrowRight, Activity } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import type { BotStatus } from './types';
+
+type Tab = 'dashboard' | 'config' | 'rules' | 'system';
 
 export default function App() {
   const [data, setData] = useState<BotStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<Tab>('dashboard');
 
   useEffect(() => {
     const fetchData = async () => {
@@ -23,7 +26,7 @@ export default function App() {
     };
 
     fetchData();
-    const interval = setInterval(fetchData, 5000);
+    const interval = setInterval(fetchData, 3000); // Faster refresh for countdown
     return () => clearInterval(interval);
   }, []);
 
@@ -49,10 +52,10 @@ export default function App() {
         setRenameRules(data.settings.renameRules);
       }
     }
-  }, [data]);
+  }, [data?.settings]);
 
-  const saveSettings = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const saveSettings = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
     setSaving(true);
     try {
       const response = await fetch('/api/settings', {
@@ -65,7 +68,8 @@ export default function App() {
           apiId: apiIdInput,
           apiHash: apiHashInput,
           downloadLibrary: libSelection,
-          renameRules: renameRules
+          renameRules: renameRules,
+          proxy: data?.proxy
         })
       });
       if (!response.ok) throw new Error('Save failed');
@@ -79,377 +83,567 @@ export default function App() {
   };
 
   const StatusBadge = ({ label, active, icon: Icon }: { label: string, active: boolean, icon: any }) => (
-    <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full border transition-all ${
-      active ? 'bg-blue-500/10 border-blue-500/30 text-blue-400' : 'bg-red-500/10 border-red-500/30 text-red-400'
+    <div className={`flex items-center gap-2 px-3 py-1.5 rounded-xl border transition-all ${
+      active ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-rose-500/10 border-rose-500/30 text-rose-400'
     }`}>
-      <Icon size={14} />
+      <Icon size={12} />
       <span className="text-[10px] font-bold uppercase tracking-wider">{label}</span>
     </div>
   );
 
-  return (
-    <div className="min-h-screen bg-[#0f1115] text-slate-200 font-sans selection:bg-blue-500/30">
-      <div className="max-w-4xl mx-auto px-6 py-12">
-        {/* Header */}
-        <header className="mb-12 flex items-center justify-between">
-          <motion.div initial={{ opacity: 0, x: -20 }} animate={{ opacity: 1, x: 0 }}>
-            <h1 className="text-3xl font-bold text-white tracking-tight flex items-center gap-3">
-              <Bot className="text-blue-500 w-10 h-10" />
-              Restricted Bot Studio
-            </h1>
-            <p className="text-slate-400 mt-2 text-sm max-w-md">
-              Securely manage restricted content downloads and group mirroring from one central dashboard.
-            </p>
-          </motion.div>
-          <div className="flex flex-col gap-2 items-end">
-            <StatusBadge label={data?.status || 'Offline'} active={data?.status === 'Running'} icon={Bot} />
-            <StatusBadge label={data?.dbStatus === 'Connected' ? 'Database UI' : 'DB Offline'} active={data?.dbStatus === 'Connected'} icon={Database} />
+  const NavButton = ({ tab, icon: Icon, label }: { tab: Tab, icon: any, label: string }) => (
+    <button 
+      onClick={() => setActiveTab(tab)}
+      className={`flex flex-col items-center gap-1 flex-1 py-3 px-2 transition-all relative ${
+        activeTab === tab ? 'text-blue-500' : 'text-slate-500 hover:text-slate-300'
+      }`}
+    >
+      <Icon size={20} className={activeTab === tab ? 'scale-110' : ''} />
+      <span className="text-[10px] font-bold uppercase tracking-tight">{label}</span>
+      {activeTab === tab && (
+        <motion.div layoutId="nav-pill" className="absolute -top-0.5 inset-x-4 h-0.5 bg-blue-500 rounded-full" />
+      )}
+    </button>
+  );
+
+  const renderDashboard = () => (
+    <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+      {/* Bot Identity & Queue */}
+      <div className="grid md:grid-cols-2 gap-6">
+        <div className="bg-slate-900/50 border border-slate-800 p-8 rounded-[2rem] relative overflow-hidden group shadow-2xl shadow-blue-500/5">
+          <div className="absolute top-0 right-0 p-4 opacity-5 group-hover:opacity-10 transition-opacity">
+            <Bot size={120} />
           </div>
-        </header>
-
-        <main className="grid gap-6">
-          <AnimatePresence>
-            {!data?.config.hasToken || !data?.config.hasMongo || !data?.adminConfigured ? (
-              <motion.div
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, scale: 0.95 }}
-                className="bg-slate-900 border border-slate-800 p-6 rounded-3xl"
-              >
-                <div className="flex items-center gap-3 mb-6">
-                  <Settings size={20} className="text-blue-500" />
-                  <h3 className="text-white font-semibold">Required Setup</h3>
-                </div>
-                <div className="grid sm:grid-cols-3 gap-4">
-                  {[
-                    { key: 'TELEGRAM_BOT_TOKEN', active: data?.config.hasToken, label: 'Bot Token' },
-                    { key: 'MONGODB_URI', active: data?.config.hasMongo, label: 'Database' },
-                    { key: 'ADMIN_ID', active: data?.adminConfigured, label: 'Admin Access' },
-                    { key: 'DEST_CHAT_ID', active: data?.config.hasTarget, label: 'Target Group' }
-                  ].map((conf) => (
-                    <div key={conf.key} className={`p-4 rounded-2xl border flex flex-col gap-2 ${
-                      conf.active ? 'bg-green-500/5 border-green-500/10' : 'bg-red-500/5 border-red-500/10'
-                    }`}>
-                      <div className="flex items-center justify-between">
-                        <span className={`text-[10px] font-bold uppercase tracking-widest ${conf.active ? 'text-green-500' : 'text-red-500'}`}>
-                          {conf.label}
-                        </span>
-                        {conf.active ? <CheckCircle2 size={14} className="text-green-500" /> : <XCircle size={14} className="text-red-500" />}
-                      </div>
-                      <code className="text-[11px] font-mono text-slate-500">{conf.key}</code>
-                    </div>
-                  ))}
-                </div>
-              </motion.div>
-            ) : null}
-          </AnimatePresence>
-
-          <div className="grid md:grid-cols-2 gap-6">
-            {/* Bot Identity Card */}
-            <motion.div 
-              whileHover={{ scale: 1.01 }}
-              className="bg-slate-900/50 border border-slate-800 p-8 rounded-3xl relative overflow-hidden group"
-            >
-              <div className="absolute top-0 right-0 p-4 opacity-5 group-hover:opacity-10 transition-opacity">
-                <Bot size={120} />
+          <h2 className="text-slate-500 text-[10px] font-bold uppercase tracking-[0.2em] mb-8">Bot Identity</h2>
+          {data?.botInfo ? (
+            <div className="flex items-center gap-5">
+              <div className="w-20 h-20 bg-gradient-to-br from-blue-600 to-indigo-600 rounded-3xl flex items-center justify-center text-white text-3xl font-bold shadow-2xl shadow-blue-500/30">
+                {data.botInfo.first_name[0]}
               </div>
-              <h2 className="text-slate-400 text-[10px] font-bold uppercase tracking-[0.2em] mb-8">Bot Instance</h2>
-              {data?.botInfo ? (
-                <div className="flex items-center gap-5">
-                  <div className="w-20 h-20 bg-gradient-to-br from-blue-600 to-indigo-600 rounded-3xl flex items-center justify-center text-white text-3xl font-bold shadow-2xl shadow-blue-500/20 ring-4 ring-slate-800/50">
-                    {data.botInfo.first_name[0]}
-                  </div>
-                  <div>
-                    <h3 className="text-white text-xl font-bold tracking-tight">{data.botInfo.first_name}</h3>
-                    <p className="text-blue-500 font-mono text-sm leading-none mt-2">
-                      @{data.botInfo.username}
-                    </p>
-                    <div className="mt-4 flex items-center gap-2 text-slate-500 text-xs">
-                      <span className="w-1 h-1 rounded-full bg-green-500" />
-                      ID: {data.botInfo.id}
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                <div className="flex flex-col items-center gap-4 py-8">
-                  <div className="w-12 h-12 bg-slate-800 rounded-full flex items-center justify-center animate-pulse">
-                    <Bot size={24} className="text-slate-600" />
-                  </div>
-                  <p className="text-slate-500 text-sm font-medium">Connecting to Telegram...</p>
-                </div>
-              )}
-            </motion.div>
-
-            {/* Security Config Card */}
-            <div className="bg-slate-900/50 border border-slate-800 p-8 rounded-3xl">
-              <h2 className="text-slate-400 text-[10px] font-bold uppercase tracking-[0.2em] mb-8">Security & Auth</h2>
-              <div className="space-y-4">
-                <div className="flex items-center gap-4 p-4 bg-slate-800/30 rounded-2xl border border-slate-700/30">
-                  <div className={`p-2.5 rounded-xl ${data?.adminConfigured ? 'bg-blue-500/10 text-blue-500' : 'bg-red-500/10 text-red-500'}`}>
-                    <UserCheck size={20} />
-                  </div>
-                  <div>
-                    <p className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Admin Guard</p>
-                    <p className="text-white font-medium text-sm">{data?.adminConfigured ? 'Strict Mode Enabled' : 'Permissive (Not Recommended)'}</p>
-                  </div>
-                </div>
-                <div className="flex items-center gap-4 p-4 bg-slate-800/30 rounded-2xl border border-slate-700/30">
-                  <div className={`p-2.5 rounded-xl ${data?.dbStatus === 'Connected' ? 'bg-blue-500/10 text-blue-500' : 'bg-red-500/10 text-red-500'}`}>
-                    <Database size={20} />
-                  </div>
-                  <div>
-                    <p className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Persistence</p>
-                    <p className="text-white font-medium text-sm">{data?.dbStatus === 'Connected' ? 'MongoDB Cluster Active' : 'Offline'}</p>
-                  </div>
+              <div>
+                <h3 className="text-white text-xl font-bold tracking-tight">{data.botInfo.first_name}</h3>
+                <p className="text-blue-500 font-mono text-sm leading-none mt-2">
+                  @{data.botInfo.username}
+                </p>
+                <div className="mt-4 flex items-center gap-2 text-slate-500 text-[10px] font-bold uppercase tracking-widest">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                  ID: {data.botInfo.id}
                 </div>
               </div>
             </div>
-          </div>
+          ) : (
+            <div className="flex items-center gap-4 py-4 text-slate-500">
+              <Bot className="animate-bounce" />
+              <p className="text-sm">Connecting bot instance...</p>
+            </div>
+          )}
+        </div>
 
-          {/* Persistent Settings Form */}
-          <div className="bg-slate-900/50 border border-slate-800 p-8 rounded-3xl">
-            <h2 className="text-slate-400 text-[10px] font-bold uppercase tracking-[0.2em] mb-8">Management Portal (MongoDB Persistence)</h2>
-            <form onSubmit={saveSettings} className="space-y-6">
-              <div className="grid md:grid-cols-2 gap-6">
-                <div className="space-y-4">
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Admin User ID</label>
-                    <input 
-                      type="text" 
-                      value={adminInput}
-                      onChange={(e) => setAdminInput(e.target.value)}
-                      placeholder="e.g., 54321678"
-                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-green-500/50 transition-colors"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Userbot String Session</label>
-                    <input 
-                      type="password" 
-                      value={sessionInput}
-                      onChange={(e) => setSessionInput(e.target.value)}
-                      placeholder={data?.config.hasSession ? '••••••••••••' : 'Enter new session string'}
-                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-green-500/50 transition-colors"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Destination Chat ID</label>
-                    <input 
-                      type="text" 
-                      value={destInput}
-                      onChange={(e) => setDestInput(e.target.value)}
-                      placeholder="e.g., -100123456789"
-                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-green-500/50 transition-colors"
-                    />
-                  </div>
-                  <div className="grid grid-cols-2 gap-4">
-                    <div>
-                      <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">API ID</label>
-                      <input 
-                        type="text" 
-                        value={apiIdInput}
-                        onChange={(e) => setApiIdInput(e.target.value)}
-                        placeholder="API ID"
-                        className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-green-500/50 transition-colors"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">API HASH</label>
-                      <input 
-                        type="text" 
-                        value={apiHashInput}
-                        onChange={(e) => setApiHashInput(e.target.value)}
-                        placeholder="API HASH"
-                        className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-green-500/50 transition-colors"
-                      />
-                    </div>
-                  </div>
-                  <div className="pt-2">
-                    <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">Download Engine (Library Preference)</label>
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                      {['GramJS', 'Telethon', 'Pyrogram', 'Hydrogram'].map((lib) => (
-                        <button
-                          key={lib}
-                          type="button"
-                          onClick={() => setLibSelection(lib)}
-                          className={`py-2 px-3 rounded-xl text-[10px] font-bold border transition-all ${
-                            libSelection === lib 
-                              ? 'bg-blue-600 border-blue-500 text-white shadow-lg shadow-blue-500/20' 
-                              : 'bg-slate-900 border-slate-800 text-slate-500 hover:border-slate-700'
-                          }`}
-                        >
-                          {lib}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-                <div className="flex flex-col justify-between gap-4">
-                  <div className="space-y-4">
-                    <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider">Configuration Info</label>
-                    <p className="text-xs text-slate-400 leading-relaxed bg-slate-950/30 p-4 rounded-xl border border-slate-800">
-                      Configure credentials and the master target location above. Expand functionality using the real-time keyword replacement editor below. Perfect for cleaning up advertising credits, channel handlers, or watermarks.
-                    </p>
-                  </div>
-                  <div className="space-y-3">
-                    <p className="text-[10px] text-slate-500 leading-relaxed ring-1 ring-slate-800 p-3 rounded-xl">
-                      ⚠️ Note: Settings saved here are stored in your <strong>MongoDB database</strong> and will persist across bot restarts and deployments.
-                    </p>
-                    <button 
-                      type="submit"
-                      disabled={saving || !data?.config.hasMongo}
-                      className={`w-full py-3 rounded-xl font-bold text-xs uppercase tracking-widest transition-all ${
-                        saving 
-                          ? 'bg-slate-800 text-slate-500 cursor-not-allowed' 
-                          : 'bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white shadow-lg shadow-blue-500/20 active:scale-95'
-                      }`}
-                    >
-                      {saving ? 'Syncing...' : 'Save Configuration & Rules'}
-                    </button>
-                  </div>
-                </div>
+        <div className="bg-slate-900/50 border border-slate-800 p-8 rounded-[2rem] shadow-2xl shadow-purple-500/5">
+          <h2 className="text-slate-500 text-[10px] font-bold uppercase tracking-[0.2em] mb-8">Active Workload</h2>
+          <div className="grid grid-cols-2 gap-4">
+            <div className="bg-slate-950 p-5 rounded-2xl border border-slate-800">
+              <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1">Queue Size</p>
+              <div className="flex items-baseline gap-2">
+                <span className="text-3xl font-bold text-white">{data?.queueSize || 0}</span>
+                <span className="text-xs text-slate-600 uppercase font-bold tracking-tight">tasks</span>
               </div>
-
-              {/* Keyword Rename Rules Segment */}
-              <div className="border-t border-slate-800/85 pt-6 space-y-4">
-                <div>
-                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                    <Tag className="text-blue-500 w-4 h-4" />
-                    Filename & Caption Rename Rules
-                  </h3>
-                  <p className="text-xs text-slate-500 mt-1">
-                    Define custom replacement rules. If a keyword is found in the caption or filename of downloaded content, it will be automatically replaced before uploading.
-                  </p>
-                </div>
-
-                {/* Add new rule form inline */}
-                <div className="grid sm:grid-cols-3 gap-3 bg-slate-950/40 p-4 rounded-2xl border border-slate-800/80">
-                  <div>
-                    <label className="block text-[10px] uppercase tracking-wider text-slate-500 mb-1.5 font-semibold">Keyword to search</label>
-                    <input 
-                      type="text"
-                      value={newKeyword}
-                      onChange={(e) => setNewKeyword(e.target.value)}
-                      placeholder="e.g., @AdsChannel"
-                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-blue-500/50 text-slate-200"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[10px] uppercase tracking-wider text-slate-500 mb-1.5 font-semibold">Replace with</label>
-                    <input 
-                      type="text"
-                      value={newReplaceWith}
-                      onChange={(e) => setNewReplaceWith(e.target.value)}
-                      placeholder="e.g., @MyChannel (or empty to remove)"
-                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-blue-500/50 text-slate-200"
-                    />
-                  </div>
-                  <div className="flex items-end">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const word = newKeyword.trim();
-                        if (!word) {
-                          alert('Please enter a keyword.');
-                          return;
-                        }
-                        if (renameRules.some(r => r.keyword.toLowerCase() === word.toLowerCase())) {
-                          alert('Rename rule for this keyword already exists. Delete the old one first.');
-                          return;
-                        }
-                        setRenameRules([...renameRules, { keyword: word, replaceWith: newReplaceWith }]);
-                        setNewKeyword('');
-                        setNewReplaceWith('');
-                      }}
-                      className="w-full py-2 bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs rounded-xl flex items-center justify-center gap-1.5 transition-colors"
-                    >
-                      <Plus size={14} /> Add Pattern Rule
-                    </button>
-                  </div>
-                </div>
-
-                {/* List current rules */}
-                <div className="space-y-2">
-                  <span className="block text-[10px] uppercase tracking-widest text-slate-500 font-bold">Active Rename Rules ({renameRules.length})</span>
-                  {renameRules.length === 0 ? (
-                    <div className="text-center py-6 border border-dashed border-slate-800/80 rounded-2xl text-xs text-slate-600">
-                      No custom replacement rules defined yet. Matches will default to original names/captions.
-                    </div>
-                  ) : (
-                    <div className="grid sm:grid-cols-2 gap-2 max-h-48 overflow-y-auto pr-1">
-                      {renameRules.map((rule, idx) => (
-                        <div key={idx} className="flex items-center justify-between p-3 bg-slate-950 border border-slate-800/60 rounded-xl text-slate-300">
-                          <div className="flex flex-col gap-0.5 min-w-0">
-                            <span className="text-xs font-semibold text-slate-400 truncate">Match: <code className="bg-slate-900 px-1 py-0.5 rounded text-red-400 font-mono text-[11px] font-bold">{rule.keyword}</code></span>
-                            <span className="text-xs text-slate-500 truncate">Replace: <code className="bg-slate-900 px-1 py-0.5 rounded text-green-400 font-mono text-[11px] font-bold">{rule.replaceWith || '(Completely Remove)'}</code></span>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setRenameRules(renameRules.filter((_, rIdx) => rIdx !== idx));
-                            }}
-                            className="p-1 px-2 text-slate-500 hover:text-red-400 hover:bg-red-500/5 rounded-lg transition-colors border border-transparent hover:border-red-500/10"
-                            title="Remove Rule"
-                          >
-                            <Trash2 size={13} />
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
+            </div>
+            <div className={`bg-slate-950 p-5 rounded-2xl border transition-all ${data?.nextTaskIn ? 'border-orange-500/30 bg-orange-500/5' : 'border-slate-800'}`}>
+              <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1 flex items-center gap-1.5">
+                <Clock size={10} className={data?.nextTaskIn ? 'text-orange-500' : ''} />
+                Next Delay
+              </p>
+              <div className="flex items-baseline gap-2">
+                <span className={`text-3xl font-bold ${data?.nextTaskIn ? 'text-orange-400' : 'text-slate-700'}`}>
+                  {data?.nextTaskIn || 0}
+                </span>
+                <span className="text-xs text-slate-600 uppercase font-bold tracking-tight">seconds</span>
               </div>
-            </form>
+            </div>
           </div>
+          <div className="mt-6 flex items-center gap-4 p-4 bg-slate-950 rounded-2xl border border-slate-800">
+            <Activity className="text-blue-500 shrink-0" size={18} />
+            <div className="flex-1 min-w-0">
+               <div className="flex justify-between mb-1 text-[10px] font-bold">
+                 <span className="text-slate-500 uppercase">Wait Progress</span>
+                 <span className="text-blue-500">{data?.nextTaskIn ? Math.round(( (7 - data.nextTaskIn) / 7) * 100) : 0}%</span>
+               </div>
+               <div className="h-1.5 bg-slate-900 rounded-full overflow-hidden">
+                 <motion.div 
+                   animate={{ width: data?.nextTaskIn ? `${((7 - data.nextTaskIn) / 7) * 100}%` : '0%' }}
+                   className="h-full bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.5)]"
+                 />
+               </div>
+            </div>
+          </div>
+        </div>
+      </div>
 
-          {/* Analysis & Roadmap */}
-          <div className="bg-slate-900/50 border border-slate-800 p-8 rounded-3xl">
-            <h2 className="text-slate-400 text-[10px] font-bold uppercase tracking-[0.2em] mb-8">Repository Feature Analysis (devgaganin/v3)</h2>
-            <div className="grid sm:grid-cols-2 gap-6">
+      {/* Setup Checker */}
+      <AnimatePresence>
+        {!data?.config.hasToken || !data?.config.hasMongo || !data?.adminConfigured ? (
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="bg-rose-500/5 border border-rose-500/20 p-6 rounded-3xl"
+          >
+            <div className="flex items-center gap-3 mb-6">
+              <AlertCircle size={18} className="text-rose-500" />
+              <h3 className="text-white font-semibold text-sm">Critical Requirements Missing</h3>
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
               {[
-                { 
-                  title: 'Restricted Media Saver', 
-                  desc: 'Bypasses Content Copy restrictions in private/protected channels using Userbot string sessions.', 
-                  status: 'Implementing Core' 
-                },
-                { 
-                  title: 'Topic Mirroring', 
-                  desc: 'Clones content while maintaining Telegram Topic/Folder structures. New uploads are mirrored in real-time.', 
-                  status: 'Active' 
-                },
-                { 
-                  title: 'Interactive Command UI', 
-                  desc: 'Uses Inline Buttons and Force Reply for clean sequential steps in Batch mode.', 
-                  status: 'Active' 
-                },
-                { 
-                  title: 'Admin Verification', 
-                  desc: 'Commands are strictly locked to the owner to prevent bot abuse and session theft.', 
-                  status: 'Verified' 
-                }
-              ].map((f, i) => (
-                <div key={i} className="group p-5 bg-slate-800/20 border border-slate-700/20 rounded-2xl flex flex-col gap-3 hover:border-blue-500/30 transition-colors">
-                  <div className="flex items-center justify-between">
-                    <h4 className="text-white font-semibold text-sm group-hover:text-blue-400 transition-colors">{f.title}</h4>
-                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-blue-500/10 text-blue-500 border border-blue-500/20">
-                      {f.status}
-                    </span>
-                  </div>
-                  <p className="text-slate-500 text-xs leading-relaxed">{f.desc}</p>
+                { active: data?.config.hasToken, label: 'Bot Token' },
+                { active: data?.config.hasMongo, label: 'Database' },
+                { active: data?.adminConfigured, label: 'Admin Access' },
+                { active: data?.config.hasTarget, label: 'Target ID' }
+              ].map((conf, i) => (
+                <div key={i} className={`p-4 rounded-xl border flex flex-col items-center gap-2 text-center transition-colors ${
+                  conf.active ? 'bg-emerald-500/5 border-emerald-500/10' : 'bg-rose-500/5 border-rose-500/10'
+                }`}>
+                  {conf.active ? <CheckCircle2 size={16} className="text-emerald-500" /> : <XCircle size={16} className="text-rose-500" />}
+                  <span className={`text-[10px] font-bold uppercase tracking-widest ${conf.active ? 'text-emerald-500/70' : 'text-rose-500/70'}`}>
+                    {conf.label}
+                  </span>
                 </div>
               ))}
             </div>
-          </div>
-        </main>
+            <button 
+              onClick={() => setActiveTab('config')}
+              className="mt-6 w-full py-3 bg-slate-900 border border-rose-500/10 hover:border-rose-500/30 text-rose-500 text-xs font-bold uppercase tracking-widest rounded-xl transition-all"
+            >
+              Resolve Setup Issues
+            </button>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
 
-        <footer className="mt-12 text-center text-slate-600 text-xs flex items-center justify-center gap-4">
-          <span>v1.2.0-Alpha</span>
-          <span className="w-1 h-1 rounded-full bg-slate-800" />
-          <span>MongoDB Atlas Ready</span>
-          <span className="w-1 h-1 rounded-full bg-slate-800" />
-          <span>Bot Father Verified</span>
-        </footer>
+      <div className="bg-slate-900/40 border border-slate-800 p-8 rounded-[2rem]">
+        <h2 className="text-slate-500 text-[10px] font-bold uppercase tracking-[0.2em] mb-6">Real-time Stream</h2>
+        <div className="space-y-4">
+          <div className="flex items-start gap-4 p-4 bg-slate-950 rounded-2xl border border-slate-800/50">
+             <div className="w-10 h-10 rounded-xl bg-blue-500/10 flex items-center justify-center text-blue-500 shirnk-0">
+                <Database size={20} />
+             </div>
+             <div className="flex-1 min-w-0">
+               <div className="flex justify-between items-center mb-1">
+                 <span className="text-xs font-bold text-white tracking-tight">Database Connectivity</span>
+                 <span className={`text-[9px] px-2 py-0.5 rounded-full font-bold uppercase ${data?.dbStatus === 'Connected' ? 'bg-emerald-500/10 text-emerald-500' : 'bg-rose-500/10 text-rose-500'}`}>
+                   {data?.dbStatus || 'Searching...'}
+                 </span>
+               </div>
+               <p className="text-[11px] text-slate-500 leading-relaxed">
+                 Using MongoDB Atlas for cluster persistence. Rename rules and configuration are synced instantly.
+               </p>
+             </div>
+          </div>
+          <div className="flex items-start gap-4 p-4 bg-slate-950 rounded-2xl border border-slate-800/50">
+             <div className="w-10 h-10 rounded-xl bg-purple-500/10 flex items-center justify-center text-purple-500 shrink-0">
+                <Shield size={20} />
+             </div>
+             <div className="flex-1 min-w-0">
+               <div className="flex justify-between items-center mb-1">
+                 <span className="text-xs font-bold text-white tracking-tight">Admin Firewall</span>
+                 <span className={`text-[9px] px-2 py-0.5 rounded-full font-bold uppercase ${data?.adminConfigured ? 'bg-emerald-500/10 text-emerald-500' : 'bg-rose-500/10 text-rose-500'}`}>
+                   {data?.adminConfigured ? 'Active' : 'Bypass'}
+                 </span>
+               </div>
+               <p className="text-[11px] text-slate-500 leading-relaxed">
+                 Command access is strictly verified against your authorized Admin ID to prevent unauthorized mirroring.
+               </p>
+             </div>
+          </div>
+        </div>
       </div>
+    </div>
+  );
+
+  const renderConfig = () => (
+    <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500 pb-24">
+      <div className="bg-slate-900/50 border border-slate-800 p-8 rounded-[2rem]">
+        <div className="flex items-center gap-3 mb-8">
+          <Settings className="text-blue-500" size={24} />
+          <div>
+            <h2 className="text-white text-lg font-bold tracking-tight">Primary Configuration</h2>
+            <p className="text-xs text-slate-500 tracking-wide">Sync core credentials with MongoDB persistence</p>
+          </div>
+        </div>
+
+        <form onSubmit={saveSettings} className="space-y-6">
+          <div className="grid md:grid-cols-2 gap-6">
+            <div className="space-y-4">
+              <div className="group">
+                <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2 group-focus-within:text-blue-500 transition-colors">Admin User ID</label>
+                <div className="relative">
+                  <UserCheck className="absolute left-4 top-3.5 text-slate-600" size={16} />
+                  <input 
+                    type="text" 
+                    value={adminInput}
+                    onChange={(e) => setAdminInput(e.target.value)}
+                    placeholder="e.g., 54321678"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-2xl pl-12 pr-4 py-3.5 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-4 focus:ring-blue-500/5 transition-all text-white placeholder:text-slate-700"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2">Userbot String Session</label>
+                <div className="relative">
+                  <Shield className="absolute left-4 top-3.5 text-slate-600" size={16} />
+                  <input 
+                    type="password" 
+                    value={sessionInput}
+                    onChange={(e) => setSessionInput(e.target.value)}
+                    placeholder={data?.config.hasSession ? '••••••••••••••••••••' : 'Paste new TGTX/GramJS session string'}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-2xl pl-12 pr-4 py-3.5 text-sm focus:outline-none focus:border-blue-500/50 transition-all text-white placeholder:text-slate-700"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2">Target Destination ID</label>
+                <div className="relative">
+                  <ExternalLink className="absolute left-4 top-3.5 text-slate-600" size={16} />
+                  <input 
+                    type="text" 
+                    value={destInput}
+                    onChange={(e) => setDestInput(e.target.value)}
+                    placeholder="e.g., -100123456789"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-2xl pl-12 pr-4 py-3.5 text-sm focus:outline-none focus:border-blue-500/50 transition-all text-white placeholder:text-slate-700"
+                  />
+                </div>
+              </div>
+
+              <div className="pt-2">
+                <div className="flex justify-between items-center mb-2">
+                  <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest">SOCKS5/HTTP Proxy (Optional)</label>
+                  <button 
+                    onClick={() => setData(data ? {...data, proxy: {ip: '45.12.189.155', port: 1080, socksType: 5}} : null)}
+                    className="text-[10px] text-blue-500 hover:text-blue-400 font-bold uppercase transition-colors"
+                  >
+                    Magic Auto-Fill
+                  </button>
+                </div>
+                <div className="grid grid-cols-2 gap-3 mb-3">
+                  <input 
+                    type="text" 
+                    placeholder="Proxy IP/Host"
+                    value={data?.proxy?.ip || ''}
+                    onChange={(e) => setData(data ? {...data, proxy: {...(data.proxy || {ip: '', port: 1080}), ip: e.target.value}} : null)}
+                    className="bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-xs focus:outline-none focus:border-blue-500/50 text-white"
+                  />
+                  <input 
+                    type="number" 
+                    placeholder="Port"
+                    value={data?.proxy?.port || ''}
+                    onChange={(e) => setData(data ? {...data, proxy: {...(data.proxy || {ip: '', port: 0}), port: parseInt(e.target.value)}} : null)}
+                    className="bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-xs focus:outline-none focus:border-blue-500/50 text-white"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <input 
+                    type="text" 
+                    placeholder="Username"
+                    value={data?.proxy?.user || ''}
+                    onChange={(e) => setData(data ? {...data, proxy: {...(data.proxy || {ip: '', port: 0}), user: e.target.value}} : null)}
+                    className="bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-xs focus:outline-none focus:border-blue-500/50 text-white"
+                  />
+                  <input 
+                    type="password" 
+                    placeholder="Password"
+                    value={data?.proxy?.pass || ''}
+                    onChange={(e) => setData(data ? {...data, proxy: {...(data.proxy || {ip: '', port: 0}), pass: e.target.value}} : null)}
+                    className="bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-xs focus:outline-none focus:border-blue-500/50 text-white"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="space-y-6">
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2">App API ID</label>
+                  <input 
+                    type="text" 
+                    value={apiIdInput}
+                    onChange={(e) => setApiIdInput(e.target.value)}
+                    placeholder="API ID"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-4 py-3.5 text-sm focus:outline-none focus:border-blue-500/50 transition-all text-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2">App API Hash</label>
+                  <input 
+                    type="text" 
+                    value={apiHashInput}
+                    onChange={(e) => setApiHashInput(e.target.value)}
+                    placeholder="API HASH"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-4 py-3.5 text-sm focus:outline-none focus:border-blue-500/50 transition-all text-white"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3">Download Engine</label>
+                <div className="grid grid-cols-2 gap-2">
+                  {['Auto', 'GramJS', 'Telethon', 'Pyrogram', 'Hydrogram'].map((lib) => (
+                    <button
+                      key={lib}
+                      type="button"
+                      onClick={() => setLibSelection(lib)}
+                      className={`py-3 rounded-2xl text-[10px] font-bold border transition-all ${
+                        libSelection === lib 
+                          ? 'bg-blue-600 border-blue-500 text-white shadow-xl shadow-blue-500/20' 
+                          : 'bg-slate-950 border-slate-800 text-slate-500 hover:border-slate-700'
+                      }`}
+                    >
+                      {lib}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="bg-blue-500/5 rounded-2xl p-4 border border-blue-500/10 flex items-start gap-3">
+             <AlertCircle size={16} className="text-blue-500 shrink-0 mt-0.5" />
+             <p className="text-[11px] text-slate-400 leading-relaxed">
+               All settings above are encrypted and saved directly to your MongoDB Atlas collection. They will survive container restarts and server sleep modes.
+             </p>
+          </div>
+
+          <button 
+            type="submit"
+            disabled={saving || !data?.config.hasMongo}
+            className={`w-full py-4 rounded-[1.25rem] font-bold text-xs uppercase tracking-[0.2em] transition-all flex items-center justify-center gap-2 transform active:scale-[0.98] ${
+              saving 
+                ? 'bg-slate-800 text-slate-500 cursor-not-allowed' 
+                : 'bg-gradient-to-r from-blue-600 to-indigo-600 hover:scale-[1.02] text-white shadow-2xl shadow-blue-500/20'
+            }`}
+          >
+            {saving ? <Activity className="animate-spin" size={16} /> : <CheckCircle2 size={16} />}
+            {saving ? 'Syncing Portal...' : 'Commit Configuration'}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+
+  const renderRules = () => (
+    <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500 pb-24">
+       <div className="bg-slate-900/50 border border-slate-800 p-8 rounded-[2rem]">
+          <div className="flex items-center gap-3 mb-8">
+            <div className="p-2.5 bg-blue-500/10 rounded-2xl text-blue-500">
+              <Tag size={24} />
+            </div>
+            <div>
+              <h2 className="text-white text-lg font-bold tracking-tight">Smart Renaming rules</h2>
+              <p className="text-xs text-slate-500 tracking-wide">Automatic keyword replacement in captions & filenames</p>
+            </div>
+          </div>
+
+          <div className="bg-slate-950/40 p-6 rounded-[2rem] border border-slate-800/80 mb-8">
+            <div className="grid sm:grid-cols-2 gap-6">
+              <div>
+                <label className="block text-[10px] uppercase tracking-widest text-slate-500 mb-3 font-bold">Search For</label>
+                <input 
+                  type="text"
+                  value={newKeyword}
+                  onChange={(e) => setNewKeyword(e.target.value)}
+                  placeholder="e.g., @AdChannel_Bot"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-4 py-3 text-sm focus:outline-none focus:border-blue-500/50 text-slate-200 placeholder:text-slate-800 shadow-inner"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] uppercase tracking-widest text-slate-500 mb-3 font-bold">Replace With</label>
+                <div className="flex gap-3">
+                  <input 
+                    type="text"
+                    value={newReplaceWith}
+                    onChange={(e) => setNewReplaceWith(e.target.value)}
+                    placeholder="e.g., @MyBot"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-4 py-3 text-sm focus:outline-none focus:border-blue-500/50 text-slate-200 placeholder:text-slate-800 shadow-inner"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const word = newKeyword.trim();
+                      if (!word) return;
+                      if (renameRules.some(r => r.keyword === word)) return;
+                      setRenameRules([...renameRules, { keyword: word, replaceWith: newReplaceWith }]);
+                      setNewKeyword('');
+                      setNewReplaceWith('');
+                    }}
+                    className="p-3 bg-blue-600 hover:bg-blue-500 text-white rounded-2xl flex items-center justify-center transition-all shadow-xl shadow-blue-500/20"
+                  >
+                    <Plus size={24} />
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-4">
+             <div className="flex justify-between items-center px-2">
+               <span className="text-[10px] uppercase tracking-widest text-slate-500 font-bold">Active Rules Library ({renameRules.length})</span>
+               <button 
+                 onClick={() => setRenameRules([])}
+                 className="text-[10px] text-rose-500 font-bold uppercase tracking-widest hover:text-rose-400 transition-colors"
+               >
+                 Flush All
+               </button>
+             </div>
+
+             {renameRules.length === 0 ? (
+               <div className="text-center py-16 border-2 border-dashed border-slate-800/50 rounded-[2.5rem] bg-slate-950/20">
+                 <Tag className="mx-auto text-slate-800 mb-4" size={48} />
+                 <p className="text-sm font-bold text-slate-700 uppercase tracking-widest">No Active Match Patterns</p>
+               </div>
+             ) : (
+               <div className="grid gap-3 max-h-[40vh] overflow-y-auto pr-2 custom-scrollbar">
+                  {renameRules.map((rule, idx) => (
+                    <motion.div 
+                      key={idx} 
+                      initial={{ opacity: 0, x: -10 }} 
+                      animate={{ opacity: 1, x: 0 }}
+                      className="group flex items-center gap-4 p-5 bg-slate-950 border border-slate-800/60 rounded-[1.5rem] hover:border-blue-500/20 transition-all"
+                    >
+                      <div className="flex-1 min-w-0 flex items-center gap-3">
+                         <div className="px-3 py-1 bg-rose-500/5 border border-rose-500/10 rounded-lg">
+                            <span className="text-[11px] font-mono font-bold text-rose-400">{rule.keyword}</span>
+                         </div>
+                         <ArrowRight className="text-slate-700" size={14} />
+                         <div className="px-3 py-1 bg-emerald-500/5 border border-emerald-500/10 rounded-lg">
+                            <span className="text-[11px] font-mono font-bold text-emerald-400 truncate max-w-[120px] block">
+                              {rule.replaceWith || '(blank)'}
+                            </span>
+                         </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setRenameRules(renameRules.filter((_, rIdx) => rIdx !== idx))}
+                        className="p-2.5 text-slate-700 hover:text-rose-500 hover:bg-rose-500/5 rounded-xl transition-all opacity-0 group-hover:opacity-100"
+                      >
+                        <Trash2 size={16} />
+                      </button>
+                    </motion.div>
+                  ))}
+               </div>
+             )}
+          </div>
+
+          {renameRules.length > 0 && (
+            <button 
+              onClick={() => saveSettings()}
+              className="mt-12 w-full py-4 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs uppercase tracking-[0.2rem] rounded-2xl transition-all shadow-2xl shadow-emerald-500/20"
+            >
+              Sync Rules to Cloud
+            </button>
+          )}
+       </div>
+    </div>
+  );
+
+  const renderSystem = () => (
+    <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500 pb-24">
+      <div className="bg-slate-900/50 border border-slate-800 p-8 rounded-[2rem]">
+        <h2 className="text-slate-500 text-[10px] font-bold uppercase tracking-[0.2em] mb-8 italic">Dev Studio Roadmap</h2>
+        <div className="grid gap-4">
+          {[
+            { 
+              title: 'Media Saver', 
+              desc: 'Premium content decryption engine for restricted groups.', 
+              status: 'stable',
+              icon: Shield
+            },
+            { 
+              title: 'Parallel Mirroring', 
+              desc: 'High-speed data transfer workers for massive archives.', 
+              status: 'active',
+               icon: Layers
+            },
+            { 
+              title: 'Command SDK', 
+              desc: 'Modular inline-button framework for sequential bots.', 
+              status: 'v3.2',
+               icon: Bot
+            },
+            { 
+              title: 'Anti-Flood Guard', 
+              desc: 'Intelligent delay buffers for Telegram safety.', 
+              status: 'running',
+               icon: Activity
+            }
+          ].map((f, i) => (
+            <div key={i} className="group p-6 bg-slate-950 border border-slate-800/80 rounded-2xl hover:border-blue-500/40 transition-all">
+              <div className="flex items-center gap-4">
+                <div className="w-12 h-12 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center text-slate-500 group-hover:text-blue-500 transition-colors">
+                   <f.icon size={22} />
+                </div>
+                <div className="flex-1">
+                  <div className="flex justify-between items-center mb-1">
+                    <h4 className="text-white font-bold text-sm">{f.title}</h4>
+                    <span className="text-[9px] font-black uppercase px-2 py-0.5 rounded bg-blue-500/10 text-blue-500">{f.status}</span>
+                  </div>
+                  <p className="text-[11px] text-slate-500 leading-normal">{f.desc}</p>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+
+  if (loading && !data) return (
+    <div className="min-h-screen bg-[#08090d] flex items-center justify-center">
+      <motion.div 
+        animate={{ scale: [1, 1.1, 1], opacity: [0.5, 1, 0.5] }}
+        transition={{ repeat: Infinity, duration: 2 }}
+        className="text-blue-500"
+      >
+        <Bot size={64} />
+      </motion.div>
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen bg-[#08090d] text-slate-200 font-sans selection:bg-blue-500/30 pb-20">
+      <div className="max-w-4xl mx-auto px-6 py-10">
+        {/* Header */}
+        <header className="mb-10 flex items-center justify-between sticky top-0 bg-[#08090d]/80 backdrop-blur-xl z-10 py-4 -mx-6 px-6">
+          <motion.div initial={{ opacity: 0, x: -20 }} animate={{ opacity: 1, x: 0 }}>
+            <h1 className="text-2xl font-black text-white tracking-tighter flex items-center gap-2.5">
+              <div className="p-2 bg-blue-600 rounded-xl">
+                 <Bot className="text-white" size={20} />
+              </div>
+              STUDIO <span className="text-blue-600">V3</span>
+            </h1>
+          </motion.div>
+          <div className="flex gap-2">
+            <StatusBadge label={data?.status || 'Unknown'} active={data?.status === 'Running'} icon={Activity} />
+            <StatusBadge label="Atlas DB" active={data?.dbStatus === 'Connected'} icon={Database} />
+          </div>
+        </header>
+
+        <main>
+          {activeTab === 'dashboard' && renderDashboard()}
+          {activeTab === 'config' && renderConfig()}
+          {activeTab === 'rules' && renderRules()}
+          {activeTab === 'system' && renderSystem()}
+        </main>
+      </div>
+
+      {/* Persistent Bottom Nav */}
+      <nav className="fixed bottom-0 inset-x-0 bg-[#0c0d12]/90 backdrop-blur-2xl border-t border-slate-800/80 px-6 py-1 z-50 shadow-[0_-10px_40px_rgba(0,0,0,0.5)]">
+        <div className="max-w-md mx-auto flex items-center justify-between">
+          <NavButton tab="dashboard" icon={Home} label="Status" />
+          <NavButton tab="config" icon={Settings} label="Config" />
+          <NavButton tab="rules" icon={FileEdit} label="Rules" />
+          <NavButton tab="system" icon={Layers} label="Studio" />
+        </div>
+      </nav>
     </div>
   );
 }
