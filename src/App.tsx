@@ -3,7 +3,7 @@ import { Bot, Shield, AlertCircle, CheckCircle2, Settings, ExternalLink, Databas
 import { motion, AnimatePresence } from 'motion/react';
 import type { BotStatus } from './types';
 
-type Tab = 'dashboard' | 'config' | 'rules' | 'system';
+type Tab = 'dashboard' | 'config' | 'rules' | 'mirror' | 'system';
 
 export default function App() {
   const [data, setData] = useState<BotStatus | null>(null);
@@ -40,6 +40,9 @@ export default function App() {
   const [renameRules, setRenameRules] = useState<Array<{ keyword: string; replaceWith: string }>>([]);
   const [newKeyword, setNewKeyword] = useState('');
   const [newReplaceWith, setNewReplaceWith] = useState('');
+  const [pathChatId, setPathChatId] = useState('');
+  const [pathTopicId, setPathTopicId] = useState('');
+  const [settingPath, setSettingPath] = useState(false);
 
   useEffect(() => {
     if (data?.settings) {
@@ -545,6 +548,68 @@ export default function App() {
     </div>
   );
 
+  const renderMirror = () => {
+    const handleSetPath = async () => {
+      setSettingPath(true);
+      try {
+        const response = await fetch('/api/setpath', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chatId: pathChatId,
+            topicId: pathTopicId || null,
+            groupTitle: 'Group from UI',
+            topicName: pathTopicId ? `Topic ${pathTopicId}` : '',
+            userId: data?.adminId || '6431447408' // Fallback to a known admin ID
+          })
+        });
+        if (!response.ok) throw new Error('Failed to set path');
+        alert('Path successfully updated!');
+      } catch (err) {
+        alert(err instanceof Error ? err.message : 'Error setting path');
+      } finally {
+        setSettingPath(false);
+      }
+    };
+
+    return (
+      <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500 pb-24">
+        <div className="bg-slate-900/50 border border-slate-800 p-8 rounded-[2rem]">
+          <h2 className="text-white text-lg font-bold tracking-tight mb-8">Mirroring Destination</h2>
+          <div className="space-y-4">
+            <div>
+              <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2">Destination Chat ID</label>
+              <input 
+                type="text" 
+                value={pathChatId}
+                onChange={(e) => setPathChatId(e.target.value)}
+                placeholder="e.g., -100XXXXXXX"
+                className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-4 py-3.5 text-sm focus:outline-none focus:border-blue-500/50 text-white"
+              />
+            </div>
+            <div>
+              <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2">Topic ID (Optional)</label>
+              <input 
+                type="text" 
+                value={pathTopicId}
+                onChange={(e) => setPathTopicId(e.target.value)}
+                placeholder="e.g., 48"
+                className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-4 py-3.5 text-sm focus:outline-none focus:border-blue-500/50 text-white"
+              />
+            </div>
+            <button 
+              onClick={handleSetPath}
+              disabled={settingPath}
+              className="w-full py-4 bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs uppercase tracking-[0.2rem] rounded-2xl transition-all"
+            >
+              {settingPath ? 'Saving...' : 'Set Destination Path'}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   const renderSystem = () => (
     <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500 pb-24">
       <div className="bg-slate-900/50 border border-slate-800 p-8 rounded-[2rem]">
@@ -631,6 +696,7 @@ export default function App() {
           {activeTab === 'dashboard' && renderDashboard()}
           {activeTab === 'config' && renderConfig()}
           {activeTab === 'rules' && renderRules()}
+          {activeTab === 'mirror' && renderMirror()}
           {activeTab === 'system' && renderSystem()}
         </main>
       </div>
@@ -641,7 +707,8 @@ export default function App() {
           <NavButton tab="dashboard" icon={Home} label="Status" />
           <NavButton tab="config" icon={Settings} label="Config" />
           <NavButton tab="rules" icon={FileEdit} label="Rules" />
-          <NavButton tab="system" icon={Layers} label="Studio" />
+          <NavButton tab="mirror" icon={Layers} label="Mirror" />
+          <NavButton tab="system" icon={Bot} label="System" />
         </div>
       </nav>
     </div>

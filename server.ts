@@ -73,6 +73,7 @@ let botInfo: any = null;
 let client: MongoClient | null = null;
 let settingsCollection: any = null;
 let approvedUsersCollection: any = null;
+let mirroredMessagesCollection: any = null;
 
 // Global Settings State
 let currentAdminId = process.env.ADMIN_ID;
@@ -83,10 +84,11 @@ const uploadEngines = ['GramJS', 'Telethon', 'Pyrogram', 'Hydrogram'];
 const approvedUsersCache = new Set<string>();
 let globalRenameRules: Array<{ keyword: string; replaceWith: string }> = [];
 
-function applyRenameRules(text: string): string {
+function applyRenameRules(text: string, customRules?: Array<{ keyword: string; replaceWith: string }>): string {
     if (!text) return "";
     let result = text;
-    for (const rule of globalRenameRules) {
+    const rulesToUse = customRules || globalRenameRules || [];
+    for (const rule of rulesToUse) {
         if (rule.keyword) {
             try {
                 const escapedKeyword = rule.keyword.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
@@ -186,6 +188,7 @@ interface Task {
     overrideThreadId?: number;
     forceGeneralPath?: boolean;
     overrideTargetId?: any;
+    isMirror?: boolean;
 }
 
 const MESSAGE_UPDATE_THROTTLE = 2000; // Reduced to 2s for better responsiveness
@@ -201,9 +204,10 @@ const safeBotCall = async (method: string, ...args: any[]) => {
             return await (bot as any)?.[method](...args);
         } catch (e: any) {
             const is429 = e.error_code === 429 || e.message?.includes('429');
-            if (is429 && retries < maxRetries - 1) {
-                const retryAfter = (e.parameters?.retry_after || 15) + 5;
-                console.log(`[Bot API] Rate limited on ${method}. Waiting ${retryAfter}s (Attempt ${retries + 1}/${maxRetries})...`);
+            const isNetworkError = e.message?.includes('TIMEOUT') || e.message?.includes('ETIMEDOUT') || e.message?.includes('socket hang up') || e.message?.includes('ECONNRESET') || e.message?.includes('ECONNREFUSED');
+            if ((is429 || isNetworkError) && retries < maxRetries - 1) {
+                const retryAfter = is429 ? ((e.parameters?.retry_after || 15) + 5) : 3;
+                console.log(`[Bot API] Temporary issue (${e.message}) on ${method}. Waiting ${retryAfter}s (Attempt ${retries + 1}/${maxRetries})...`);
                 await sleep(retryAfter * 1000);
                 retries++;
                 continue;
@@ -240,7 +244,16 @@ const safeBotCall = async (method: string, ...args: any[]) => {
             if (is429) throw e; // RETHROW if max retries reached
             
             // For other errors, log and potentially return null if it's an optional call
-            console.error(`[Bot API] Error on ${method}:`, e.message);
+            const msgLower = (e.message || '').toLowerCase();
+            const isExpectedSilent = msgLower.includes("message is not modified") || 
+                                     msgLower.includes("there is no text in the message") ||
+                                     msgLower.includes("message can't be edited") ||
+                                     msgLower.includes("chat not found") ||
+                                     msgLower.includes("message to edit not found");
+            
+            if (!isExpectedSilent) {
+                console.error(`[Bot API] Error on ${method}:`, e.message);
+            }
             return null;
         }
     }
@@ -253,22 +266,29 @@ const safeSendMessage = async (chatId: number, text: string, options: any = {}) 
 
 const safeEditMessage = async (text: string, options: { chat_id: number, message_id: number, parse_mode?: any, disable_web_page_preview?: boolean, reply_markup?: any }) => {
     if (!options.message_id || options.message_id === 0) return;
+    
+    // 1. Attempt editMessageText
+    const res = await safeBotCall('editMessageText', text, options);
+    if (res) return res;
+
+    // 2. Fallback: Attempt editMessageCaption
+    const resCaption = await safeBotCall('editMessageCaption', text, {
+        chat_id: options.chat_id,
+        message_id: options.message_id,
+        parse_mode: options.parse_mode,
+        reply_markup: options.reply_markup
+    });
+    if (resCaption) return resCaption;
+
+    // 3. Ultimate Fallback: Delete and send new text message
     try {
-        return await safeBotCall('editMessageText', text, options);
-    } catch (e: any) {
-        if (e.description?.includes("there is no text in the message to edit") || e.message?.includes("text") || e.description?.includes("message to edit not found")) {
-            try {
-                return await safeBotCall('editMessageCaption', text, {
-                    chat_id: options.chat_id,
-                    message_id: options.message_id,
-                    parse_mode: options.parse_mode,
-                    reply_markup: options.reply_markup
-                });
-            } catch (e2) {
-                return null;
-            }
-        }
-        if (e.description?.includes("message is not modified")) return null;
+        await safeBotCall('deleteMessage', options.chat_id, options.message_id).catch(() => {});
+        return await safeSendMessage(options.chat_id, text, {
+            parse_mode: options.parse_mode,
+            disable_web_page_preview: options.disable_web_page_preview,
+            reply_markup: options.reply_markup
+        });
+    } catch (e3: any) {
         return null;
     }
 };
@@ -537,7 +557,7 @@ async function safelyResolveFullEntity(client: TelegramClient, entity: any): Pro
 const adminActiveSession = new Map<number, number>(); // adminTelegramId -> activeUserbotUserId
 
 const userActionStates: Record<number, { 
-    type: 'batch_start' | 'batch_end' | 'mirror_target' | 'set_thumb' | 'set_cap' | 'set_path' | 'mirror_choice' | 'set_mirror_source' | 'enter_topic_id' | 'mirror_path_add_source' | 'mirror_path_await_dest' | 'topic_clone_group' | 'topic_clone_topic_id' | 'add_rename_rule' | 'set_api_id' | 'set_api_hash' | 'full_mirror_group' | 'full_mirror_dest_select' | 'live_mirror_dest_select', 
+    type: 'batch_start' | 'batch_end' | 'mirror_target' | 'set_thumb' | 'set_cap' | 'set_path' | 'mirror_choice' | 'set_mirror_source' | 'enter_topic_id' | 'mirror_path_add_source' | 'mirror_path_await_dest' | 'topic_clone_group' | 'topic_clone_topic_id' | 'add_rename_rule' | 'set_api_id' | 'set_api_hash' | 'full_mirror_group' | 'full_mirror_dest_select' | 'live_mirror_dest_select' | 'set_cooldown_secs', 
     startLink?: string,
     mirrorTarget?: any,
     pendingMirrorDest?: string,
@@ -601,6 +621,7 @@ if (mongoUri) {
       const db = client!.db('bot_studio');
       settingsCollection = db.collection('settings');
       approvedUsersCollection = db.collection('approved_users');
+      mirroredMessagesCollection = db.collection('mirrored_messages');
 
       // Load approved users into cache
       const users = await approvedUsersCollection.find({}).toArray();
@@ -666,32 +687,90 @@ const isAuthorized = (userId: number | undefined) => {
 const resolveSettingsUserId = async (fromId: number | undefined): Promise<string> => {
     if (!fromId) return "";
     
-    // 1. Check if admin explicitly switched to a session
+    // 1. Check if admin explicitly switched to a session (in memory)
     if (adminActiveSession.has(fromId)) {
         return adminActiveSession.get(fromId)!.toString();
     }
 
     const fromIdStr = fromId.toString();
     
-    // Check if the current user has a direct session
+    // 2. Check if the admin has a persisted active userbot in their DB document
     if (approvedUsersCollection) {
-        const directSession = await approvedUsersCollection.findOne({ userId: fromIdStr, stringSession: { $exists: true, $ne: "" }});
-        if (directSession) return fromIdStr;
+        try {
+            const adminDoc = await approvedUsersCollection.findOne({ userId: fromIdStr });
+            if (adminDoc?.activeUserbotUserId) {
+                const activeUid = adminDoc.activeUserbotUserId.toString();
+                const ubotDoc = await approvedUsersCollection.findOne({ userId: activeUid, stringSession: { $exists: true, $ne: "" } });
+                if (ubotDoc) {
+                    adminActiveSession.set(fromId, Number(activeUid));
+                    return activeUid;
+                }
+            }
+        } catch (e: any) {
+            console.error(`[resolveSettingsUserId] Error getting persisted ubot: ${e.message}`);
+        }
+    }
+
+    // 3. Check if the current user has a direct session
+    if (approvedUsersCollection) {
+        try {
+            const directSession = await approvedUsersCollection.findOne({ userId: fromIdStr, stringSession: { $exists: true, $ne: "" }});
+            if (directSession) {
+                adminActiveSession.set(fromId, fromId);
+                return fromIdStr;
+            }
+        } catch (e) {}
+    }
+
+    // 4. Fallback to any userbot account logged in by this admin
+    if (approvedUsersCollection) {
+        try {
+            const loggedByThisAdmin = await approvedUsersCollection.findOne({ 
+                addedByAdminId: fromIdStr, 
+                stringSession: { $exists: true, $ne: "" }
+            });
+            if (loggedByThisAdmin) {
+                const uidStr = loggedByThisAdmin.userId;
+                adminActiveSession.set(fromId, Number(uidStr));
+                return uidStr;
+            }
+        } catch (e) {}
+    }
+
+    // 5. Ultimate Fallback: any userbot account with a valid stringSession in the database!
+    if (approvedUsersCollection) {
+        try {
+            const anyUbotSession = await approvedUsersCollection.findOne({ 
+                stringSession: { $exists: true, $ne: "" }
+            });
+            if (anyUbotSession) {
+                const uidStr = anyUbotSession.userId;
+                adminActiveSession.set(fromId, Number(uidStr));
+                return uidStr;
+            }
+        } catch (e) {}
     }
     
-    // If no direct session, but they are an admin, check primary admin
+    // 6. Fallback to primary admin search or ALLOWED_ADMIN_IDS
     if (isAdmin(fromId)) {
-        if (currentAdminId && currentAdminId.toString() !== fromIdStr) {
-             const primarySession = await approvedUsersCollection?.findOne({ userId: currentAdminId.toString(), stringSession: { $exists: true, $ne: "" }});
-             if (primarySession) return currentAdminId.toString();
-        }
-        
-        // Ultimate fallback to first allowed admin
-        const firstAdmin = ALLOWED_ADMIN_IDS[0];
-        if (firstAdmin && firstAdmin !== fromIdStr) {
-             const fallbackSession = await approvedUsersCollection?.findOne({ userId: firstAdmin, stringSession: { $exists: true, $ne: "" }});
-             if (fallbackSession) return firstAdmin;
-        }
+        try {
+            if (currentAdminId && currentAdminId.toString() !== fromIdStr) {
+                 const primarySession = await approvedUsersCollection?.findOne({ userId: currentAdminId.toString(), stringSession: { $exists: true, $ne: "" }});
+                 if (primarySession) {
+                     adminActiveSession.set(fromId, Number(currentAdminId));
+                     return currentAdminId.toString();
+                 }
+            }
+            
+            const firstAdmin = ALLOWED_ADMIN_IDS[0];
+            if (firstAdmin && firstAdmin !== fromIdStr) {
+                 const fallbackSession = await approvedUsersCollection?.findOne({ userId: firstAdmin, stringSession: { $exists: true, $ne: "" }});
+                 if (fallbackSession) {
+                     adminActiveSession.set(fromId, Number(firstAdmin));
+                     return firstAdmin;
+                 }
+            }
+        } catch (e) {}
     }
 
     return fromIdStr;
@@ -747,6 +826,7 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
           { command: 'mirror', description: 'Clone group/topic content' },
           { command: 'setpath', description: 'Set upload destination Topic/Group' },
           { command: 'setmirror', description: 'Configure a new auto-mirror path' },
+          { command: 'clearmirrorhistory', description: 'Clear mirrored links history' },
         ]);
 
         const handleSetMirror = async (chatId: number, fromId: number | undefined, msg: TelegramBot.Message) => {
@@ -890,12 +970,16 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
         const apiDisplayId = apiIdValue ? '✅ Set (Hidden for Security)' : '❌ Missing';
         const apiDisplayHash = apiHashValue ? '✅ Set (Hidden for Security)' : '❌ Missing';
 
+        const cooldownSecs = userDoc?.cooldownSeconds !== undefined ? userDoc.cooldownSeconds : 5;
+        const cooldownDisplay = cooldownSecs === 0 ? '🔴 OFF (0s)' : `🟢 ${cooldownSecs} seconds`;
+
         const text = `⚙️ **Advanced Configuration**\n\n` +
                      `• **Database:** ${dbStatus === 'Connected' ? '✅ Online' : '❌ Offline'}\n` +
                      `• **Userbot:** ${session ? '✅ Active' : '❌ Missing'}\n` +
                      `• **Upload Mode:** ${uploadModeDisplay}\n` +
                      `• **Engine:** 🚀 ${currentUploadEngine}\n` +
                      `• **Destination:** 📍 \`${pathDisplay}\`\n` +
+                     `• **Cooldown Between Tasks:** ${cooldownDisplay}\n` +
                      `• **API ID:** ${apiDisplayId}\n` +
                      `• **API Hash:** ${apiDisplayHash}\n\n` +
                      `${mirrorPathsText}\n` +
@@ -921,6 +1005,9 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                 { text: `Engine: ${currentUploadEngine}`, callback_data: 'toggle_engine' },
                 { text: userDoc?.uploadMode === 'document' ? '📁 Mode: File' : '📹 Mode: Video', callback_data: 'toggle_mode' },
                 { text: 'Rename Rules', callback_data: 'toggle_rename' }
+              ],
+              [
+                { text: `⏱ Cooldown: ${cooldownSecs === 0 ? 'OFF (0s)' : `${cooldownSecs}s`}`, callback_data: 'change_cooldown_start' }
               ],
               [
                 { text: 'Force Sync', callback_data: 're_login' },
@@ -1180,6 +1267,23 @@ NextTaskRunAt: ${nextTaskRunAt}`;
 
           const mirrorPaths = userDoc?.mirrorPaths || [];
           
+          let initialLastId = 0;
+          try {
+              const targetUid = Number(settingsUid);
+              const userbotClient = await getConnectedUserbotClient(targetUid);
+              if (userbotClient) {
+                  const sourceEntity = await safelyResolveFullEntity(userbotClient, sourceId).catch(() => null);
+                  if (sourceEntity) {
+                      const msgs = await userbotClient.getMessages(sourceEntity, { limit: 1 });
+                      if (msgs && msgs.length > 0) {
+                          initialLastId = msgs[0].id;
+                      }
+                  }
+              }
+          } catch (e: any) {
+              console.error("[Init Path] Failed to fetch last message ID for new live mirror:", e.message);
+          }
+
           const filtered = mirrorPaths.filter((p: any) => p.sourceId !== sourceId);
           filtered.push({
               sourceId,
@@ -1191,6 +1295,7 @@ NextTaskRunAt: ${nextTaskRunAt}`;
               groupName: dest.groupName,
               topicName: dest.topicName,
               isLive: true,
+              lastProcessedMsgId: initialLastId,
               createdAt: new Date()
           });
 
@@ -1203,7 +1308,7 @@ NextTaskRunAt: ${nextTaskRunAt}`;
               );
               
               const destDisplay = dest.destThreadId ? `${dest.groupName} (Topic: ${dest.destThreadId})` : dest.groupName;
-              safeSendMessage(chatId, `✅ **Live Mirror Path Setup Finished!**\n\n**Source:** \`${sourceName}\` (\`${sourceId}\`)\n**Destination:** ${destDisplay}\n⚡ **Live Status:** 🟢 Live ON (Auto-mirroring active!)`, { parse_mode: 'Markdown' });
+              safeSendMessage(chatId, `✅ **Live Mirror Path Setup Finished!**\n\n**Source:** \`${sourceName}\` (\`${sourceId}\`)\n**Destination:** ${destDisplay}\n⚡ **Live Status:** 🟢 Live ON (Auto-mirroring active!)${initialLastId > 0 ? `\n📥 **Starting from post ID:** \`${initialLastId}\`` : ''}`, { parse_mode: 'Markdown' });
           }
           
           bot?.answerCallbackQuery(query.id);
@@ -1348,7 +1453,8 @@ NextTaskRunAt: ${nextTaskRunAt}`;
                       userId: query.from.id,
                       forceGeneralPath: true,
                       overrideThreadId,
-                      overrideTargetId: destPath
+                      overrideTargetId: destPath,
+                      isMirror: true
                   });
               }
 
@@ -1490,7 +1596,7 @@ NextTaskRunAt: ${nextTaskRunAt}`;
               delete userActionStates[fromId];
               await safeSendMessage(chatId, "✅ **Starting Recent Content Mirror...**");
               const statusMsg = await safeSendMessage(chatId, "🔍 **Processing Latest...**", { parse_mode: 'Markdown' });
-              taskQueue.push({ chatId, link, statusMsgId: statusMsg?.message_id || 0, userId: fromId });
+              taskQueue.push({ chatId, link, statusMsgId: statusMsg?.message_id || 0, userId: fromId, isMirror: true });
               runNextTask();
           }
           bot?.answerCallbackQuery(query.id);
@@ -1598,7 +1704,8 @@ NextTaskRunAt: ${nextTaskRunAt}`;
                                       chatId, 
                                       link: virtualLink, 
                                       userId: fromId,
-                                      overrideThreadId: destTopicId
+                                      overrideThreadId: destTopicId,
+                                      isMirror: true
                                   });
                               }
                           }
@@ -1620,14 +1727,15 @@ NextTaskRunAt: ${nextTaskRunAt}`;
           `• /batch - Process multiple links\n` +
           `• /mirror - Copy entire group content\n` +
           `• /cancel - Stop current process\n` +
-          `• /settings - Configure bot behavior\n\n` +
+          `• /settings - Configure bot behavior\n` +
+          `• /clearmirrorhistory - Reset full mirror history\n\n` +
           `**Note:** You must have a valid \`STRING_SESSION\` for restricted content access.`;
         bot?.sendMessage(chatId, helpText, { parse_mode: 'Markdown' });
       }
 
       if (query.data === 'bot_settings') {
         if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
-        handleSettings(chatId, query.from?.id);
+        handleSettings(chatId, query.from?.id, query.message?.message_id);
       }
 
       if (query.data === 'set_path_cmd') {
@@ -1644,7 +1752,8 @@ NextTaskRunAt: ${nextTaskRunAt}`;
       if (query.data === 'clr_path_cmd') {
           if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
           if (approvedUsersCollection) {
-              await approvedUsersCollection.updateOne({ userId: query.from.id.toString() }, { $unset: { uploadPath: "" } });
+              const settingsUid = await resolveSettingsUserId(query.from?.id);
+              await approvedUsersCollection.updateOne({ userId: settingsUid }, { $unset: { uploadPath: "" } });
               bot?.answerCallbackQuery(query.id, { text: '✅ Destination Reset to Default', show_alert: true });
               handleSettings(chatId, query.from?.id, query.message!.message_id);
           }
@@ -1702,13 +1811,14 @@ NextTaskRunAt: ${nextTaskRunAt}`;
 
       if (query.data === 'clr_thumb') {
           if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+          const settingsUid = await resolveSettingsUserId(query.from?.id);
           if (approvedUsersCollection) {
               await approvedUsersCollection.updateOne(
-                  { userId: query.from.id.toString() },
+                  { userId: settingsUid },
                   { $unset: { customThumbnailFileId: "" } }
               );
           }
-          const userCustomThumbPath = path.join(os.tmpdir(), `custom_thumb_${query.from.id}.jpg`);
+          const userCustomThumbPath = path.join(os.tmpdir(), `custom_thumb_${settingsUid}.jpg`);
           if (fs.existsSync(userCustomThumbPath)) {
               try {
                   fs.unlinkSync(userCustomThumbPath);
@@ -1733,10 +1843,11 @@ NextTaskRunAt: ${nextTaskRunAt}`;
       if (query.data === 'toggle_mode') {
           if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
           if (approvedUsersCollection) {
-              const userDoc = await approvedUsersCollection.findOne({ userId: query.from.id.toString() });
+              const settingsUid = await resolveSettingsUserId(query.from?.id);
+              const userDoc = await approvedUsersCollection.findOne({ userId: settingsUid });
               const currentMode = userDoc?.uploadMode === 'document' ? 'video' : 'document';
               await approvedUsersCollection.updateOne(
-                  { userId: query.from.id.toString() },
+                  { userId: settingsUid },
                   { $set: { uploadMode: currentMode } }
               );
               bot?.answerCallbackQuery(query.id, { text: `✅ Upload Mode set to ${currentMode === 'document' ? 'Document/File' : 'Video'}` });
@@ -1747,9 +1858,13 @@ NextTaskRunAt: ${nextTaskRunAt}`;
 
       if (query.data === 'toggle_rename' || query.data === 'rename_rules_panel') {
           if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+          const settingsUid = await resolveSettingsUserId(query.from?.id);
+          const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
+          const userRules = userDoc?.renameRules || [];
+
           let rulesList = '';
-          if (globalRenameRules && globalRenameRules.length > 0) {
-              globalRenameRules.forEach((rule, idx) => {
+          if (userRules && userRules.length > 0) {
+              userRules.forEach((rule: any, idx: number) => {
                   rulesList += `${idx + 1}. \`${rule.keyword}\` ➔ \`${rule.replaceWith || '(blank)'}\`\n`;
               });
           } else {
@@ -1790,11 +1905,11 @@ NextTaskRunAt: ${nextTaskRunAt}`;
 
       if (query.data === 'clear_rename_rules_action') {
           if (!isAdmin(query.from?.id)) return safeBotCall('answerCallbackQuery', query.id, { text: '❌ Restricted to Admin', show_alert: true });
-          globalRenameRules = [];
-          if (settingsCollection) {
-              await settingsCollection.updateOne({ type: 'global_config' }, { $set: { renameRules: [] } }, { upsert: true });
+          const settingsUid = await resolveSettingsUserId(query.from?.id);
+          if (approvedUsersCollection) {
+              await approvedUsersCollection.updateOne({ userId: settingsUid }, { $unset: { renameRules: "" } });
           }
-          safeBotCall('answerCallbackQuery', query.id, { text: '✅ All Rename Rules Cleared!', show_alert: true });
+          safeBotCall('answerCallbackQuery', query.id, { text: '✅ All Rename Rules Cleared for this Session!', show_alert: true });
           
           const renameText = `📝 **Rename Rules Manager**\n\nConfigure custom replacement rules. When keywords are found in captions or filenames, they get replaced instantly prior to upload.\n\n**Current Rules:**\n_No custom rename rules defined._\n`;
           const renameMarkup = {
@@ -1812,6 +1927,77 @@ NextTaskRunAt: ${nextTaskRunAt}`;
               parse_mode: 'Markdown',
               reply_markup: renameMarkup
           });
+          return;
+      }
+
+      if (query.data === 'change_cooldown_start') {
+          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+          userActionStates[query.from.id] = { type: 'set_cooldown_secs' };
+          safeSendMessage(chatId, "⏱ **Set Cooldown Seconds**\n\nPlease enter the cooldown delay in seconds (e.g., \`5\`), or send \`0\` or \`off\` to disable cooldown entirely.", {
+              parse_mode: 'Markdown',
+              reply_markup: { force_reply: true }
+          });
+          bot?.answerCallbackQuery(query.id);
+          return;
+      }
+
+      if (query.data === 'check_perms') {
+          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+          bot?.answerCallbackQuery(query.id, { text: '🔍 Auditing System Permissions...' });
+
+          const settingsUid = await resolveSettingsUserId(query.from?.id);
+          const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
+          let userbotStatus = '❌ Offline / Missing Session';
+          let userbotUsername = 'N/A';
+          let destStatus = '⚠️ Default Destination';
+          let apiIdStatus = apiIdValue ? '✅ Configured' : '❌ Missing';
+          let apiHashStatus = apiHashValue ? '✅ Configured' : '❌ Missing';
+
+          try {
+              const targetUid = Number(settingsUid);
+              const client = await getConnectedUserbotClient(targetUid);
+              if (client) {
+                  const me = await client.getMe().catch(() => null);
+                  if (me) {
+                      userbotStatus = '✅ Connected (Session Live)';
+                      userbotUsername = `@${(me as any).username || (me as any).firstName || 'User'}`;
+                      
+                      // Check destination status if set
+                      if (userDoc?.uploadPath && userDoc.uploadPath !== 'me') {
+                          try {
+                              const destEntity = await safelyResolveFullEntity(client, userDoc.uploadPath).catch(() => null);
+                              if (destEntity) {
+                                  destStatus = `✅ Accessible (\`${userDoc.uploadGroupName || 'Group'}\`)`;
+                              } else {
+                                  destStatus = `❌ Not Found / Cannot Access (Userbot is not a member or blocked)`;
+                              }
+                          } catch (e) {
+                              destStatus = `❌ Access Error (Invalid channel/group or permission error)`;
+                          }
+                      } else if (userDoc?.uploadPath === 'me') {
+                          destStatus = '✅ Saved Messages (DM)';
+                      } else {
+                          destStatus = `✅ Default Log Group (${DEFAULT_LOG_GROUP})`;
+                      }
+                  } else {
+                      userbotStatus = '⚠️ Session exists but Failed to Authenticate';
+                  }
+              }
+          } catch (err: any) {
+              userbotStatus = `❌ Connection Error: ${err.message}`;
+          }
+
+          const auditText = `🛡 **Security & Permissions Audit**\n\n` +
+                            `• **Database Conn:** ${dbStatus === 'Connected' ? '✅ Online (MongoDB Connected)' : '❌ Offline'}\n` +
+                            `• **API ID:** ${apiIdStatus}\n` +
+                            `• **API Hash:** ${apiHashStatus}\n` +
+                            `• **Userbot Account:** ${userbotStatus}\n` +
+                            `• **Userbot Username:** \`${userbotUsername}\`\n` +
+                            `• **Upload Destination:** ${destStatus}\n` +
+                            `• **Mirror Pairings:** ${userDoc?.mirrorPaths?.length || 0} active configurations\n\n` +
+                            `💡 *Tip: If some destination channels or channels to mirror are inaccessible, make sure your userbot has joined them.*`;
+
+          safeSendMessage(chatId, auditText, { parse_mode: 'Markdown' });
           return;
       }
 
@@ -1981,6 +2167,13 @@ NextTaskRunAt: ${nextTaskRunAt}`;
         } else if (data.startsWith("switch_session:")) {
             const targetUid = Number(data.split(":")[1]);
             adminActiveSession.set(fromId!, targetUid);
+            if (approvedUsersCollection) {
+                await approvedUsersCollection.updateOne(
+                    { userId: fromId!.toString() },
+                    { $set: { activeUserbotUserId: targetUid } },
+                    { upsert: true }
+                ).catch((e: any) => console.error("[Switch DB Switch] Error:", e));
+            }
             await bot?.answerCallbackQuery(query.id, { text: "✅ Active session switched!" });
             bot.processUpdate({ message: { ...query.message, text: '/login', from: query.from } } as any);
         } else if (data.startsWith("logout_session:")) {
@@ -1997,6 +2190,10 @@ NextTaskRunAt: ${nextTaskRunAt}`;
             activeWatchers.delete(targetUid);
             if (approvedUsersCollection) {
                 await approvedUsersCollection.updateOne({ userId: targetUid.toString() }, { $unset: { stringSession: "", phoneNumber: "", fullName: "" } });
+                await approvedUsersCollection.updateMany(
+                    { activeUserbotUserId: targetUid },
+                    { $unset: { activeUserbotUserId: "" } }
+                ).catch(() => {});
             }
 
             safeSendMessage(chatId!, `✅ Session for **${targetUid}** has been disconnected.`);
@@ -2082,6 +2279,23 @@ NextTaskRunAt: ${nextTaskRunAt}`;
         bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
     });
 
+    bot.onText(/\/clearmirrorhistory/, async (msg) => {
+        const fromId = msg.from?.id;
+        const chatId = msg.chat.id;
+        if (!fromId || !isAdmin(fromId)) return;
+
+        if (mirroredMessagesCollection) {
+            try {
+                await mirroredMessagesCollection.deleteMany({});
+                safeSendMessage(chatId, "✅ **Mirror History Cleared Successfully!**\nAll previously processed/skipped files can now be cloned again.");
+            } catch (err: any) {
+                safeSendMessage(chatId, `❌ **Error clearing history:** ${err.message}`);
+            }
+        } else {
+            safeSendMessage(chatId, "⚠️ **Database not ready.** Please try again in a few seconds.");
+        }
+    });
+
     bot.onText(/\/setpath/, async (msg) => {
         const fromId = msg.from?.id;
         const chatId = msg.chat.id;
@@ -2095,17 +2309,23 @@ NextTaskRunAt: ${nextTaskRunAt}`;
         const topicId = msg.message_thread_id;
         
         if (approvedUsersCollection) {
-            await approvedUsersCollection.updateOne(
-                { userId: fromId.toString() },
-                { 
-                    $set: { 
-                        uploadPath: chatId.toString(),
-                        uploadTopicId: topicId || null,
-                        uploadGroupName: groupTitle,
-                        uploadTopicName: topicId ? `Topic ${topicId}` : ''
-                    } 
-                }
-            );
+            const adminIdStr = fromId.toString();
+            const settingsUid = await resolveSettingsUserId(fromId);
+            
+            const update = { 
+                $set: { 
+                    uploadPath: chatId.toString(),
+                    uploadTopicId: topicId || null,
+                    uploadGroupName: groupTitle,
+                    uploadTopicName: topicId ? `Topic ${topicId}` : ''
+                } 
+            };
+            
+            // Update both the admin's doc AND the session's doc to ensure settings persist
+            await approvedUsersCollection.updateOne({ userId: adminIdStr }, update);
+            if (settingsUid !== adminIdStr) {
+                await approvedUsersCollection.updateOne({ userId: settingsUid }, update);
+            }
             
             const dest = topicId ? `${groupTitle} (Topic: ${topicId})` : groupTitle;
             const confirmationText = `✅ **Destination Saved!**\n\nFiles will now be uploaded to:\n📍 \`${dest}\``;
@@ -2237,11 +2457,17 @@ const runNextTask = async () => {
         return;
     }
 
+    const fallbackIdVal = currentAdminId || ALLOWED_ADMIN_IDS[0] || 'admin';
+    const getTaskUserKey = (uId: any) => {
+        if (!uId) return fallbackIdVal.toString();
+        return uId.toString();
+    };
+
     // Find the first task whose user has available task slots
     let taskIndex = -1;
     for (let i = 0; i < taskQueue.length; i++) {
-        const uId = taskQueue[i].userId;
-        const uActive = activeTasksPerUser.get(uId) || 0;
+        const uIdKey = getTaskUserKey(taskQueue[i].userId);
+        const uActive = activeTasksPerUser.get(uIdKey) || 0;
         if (uActive < MAX_TASKS_PER_USER) {
             taskIndex = i;
             break;
@@ -2256,12 +2482,13 @@ const runNextTask = async () => {
     // Capture the task and check if we can immediately trigger another worker for the next slot
     const task = taskQueue.splice(taskIndex, 1)[0];
     const fromId = task.userId;
+    const fromIdKey = getTaskUserKey(fromId);
 
     activeTasksCount++;
-    const currentActiveForUser = (activeTasksPerUser.get(fromId) || 0) + 1;
-    activeTasksPerUser.set(fromId, currentActiveForUser);
+    const currentActiveForUser = (activeTasksPerUser.get(fromIdKey) || 0) + 1;
+    activeTasksPerUser.set(fromIdKey, currentActiveForUser);
     
-    console.log(`[Queue] Task assigned. activeTasksCount: ${activeTasksCount}, User ${fromId} active: ${currentActiveForUser}`);
+    console.log(`[Queue] Task assigned. activeTasksCount: ${activeTasksCount}, User ${fromIdKey} active: ${currentActiveForUser}`);
     
     // Proactively try to fill next available slot if more tasks exist
     if (activeTasksCount < MAX_CONCURRENT_TASKS && taskQueue.length > 0) {
@@ -2289,15 +2516,29 @@ const runNextTask = async () => {
             statusMsgId = sMsg?.message_id || 0;
         }
 
+        let cooldownSecs = 5; // Default to 5 seconds
+        if (approvedUsersCollection) {
+            try {
+                const targetUidStr = await resolveSettingsUserId(fromId);
+                const userDoc = await approvedUsersCollection.findOne({ userId: targetUidStr });
+                if (userDoc && userDoc.cooldownSeconds !== undefined) {
+                    cooldownSecs = Number(userDoc.cooldownSeconds);
+                }
+            } catch (dbErr) {
+                console.error("[Queue] Failed to fetch cooldownSeconds from DB:", dbErr);
+            }
+        }
+
         const taskNow = Date.now();
-        const userLastTaskTime = lastTaskTimePerUser.get(fromId) || 0;
-        console.log(`[Queue] Cooldown check. taskNow: ${taskNow}, lastTaskTime: ${userLastTaskTime}`);
+        const userLastTaskTime = lastTaskTimePerUser.get(fromIdKey) || 0;
+        console.log(`[Queue] Cooldown check. taskNow: ${taskNow}, lastTaskTime: ${userLastTaskTime}, configSecs: ${cooldownSecs}`);
         
-        if (userLastTaskTime > 0) {
+        const cooldownMs = cooldownSecs * 1000;
+        if (cooldownMs > 0 && userLastTaskTime > 0) {
             const timeDiff = taskNow - userLastTaskTime;
-            if (timeDiff < 5000) {
-                const waitSecs = Math.ceil((5000 - timeDiff) / 1000);
-                console.log(`[Queue] Throttling for ${waitSecs}s due to 5s cooldown.`);
+            if (timeDiff < cooldownMs) {
+                const waitSecs = Math.ceil((cooldownMs - timeDiff) / 1000);
+                console.log(`[Queue] Throttling for ${waitSecs}s due to ${cooldownSecs}s cooldown.`);
                 for (let i = waitSecs; i > 0; i--) {
                     await safeEditMessage(`⏳ **Cooldown:** Waiting ${i} seconds to avoid Telegram API limit before downloading next file...`, { chat_id: task.chatId, message_id: statusMsgId });
                     await sleep(1000);
@@ -2311,7 +2552,7 @@ const runNextTask = async () => {
         try {
             const timeoutPromise = new Promise<boolean>((_, reject) => setTimeout(() => reject(new Error("Global Task Timeout (5 minutes)")), 5 * 60 * 1000));
             success = await Promise.race([
-                processTask(task.chatId, task.link, statusMsgId, fromId, task.overrideThreadId, task.forceGeneralPath, task.overrideTargetId),
+                processTask(task.chatId, task.link, statusMsgId, fromId, task.overrideThreadId, task.forceGeneralPath, task.overrideTargetId, task.isMirror),
                 timeoutPromise
             ]);
         } catch (taskErr: any) {
@@ -2320,7 +2561,7 @@ const runNextTask = async () => {
             success = false;
         }
         console.log(`[Queue] processTask finished with success=${success}`);
-        lastTaskTimePerUser.set(fromId, Date.now());
+        lastTaskTimePerUser.set(fromIdKey, Date.now());
         
         if (task.batchId) {
             const info = batchStatusMap.get(task.batchId);
@@ -2341,19 +2582,174 @@ const runNextTask = async () => {
             taskQueue.unshift(task);
             setTimeout(runNextTask, retryAfter * 1000);
             activeTasksCount--;
-            activeTasksPerUser.set(fromId, (activeTasksPerUser.get(fromId) || 1) - 1);
+            activeTasksPerUser.set(fromIdKey, Math.max(0, (activeTasksPerUser.get(fromIdKey) || 1) - 1));
             return;
         }
     } finally {
         activeTasksCount--;
-        activeTasksPerUser.set(fromId, (activeTasksPerUser.get(fromId) || 1) - 1);
-        console.log(`[Queue] Finally block hit. activeTasksCount is now ${activeTasksCount}, User ${fromId} active: ${activeTasksPerUser.get(fromId)}`);
+        activeTasksPerUser.set(fromIdKey, Math.max(0, (activeTasksPerUser.get(fromIdKey) || 1) - 1));
+        console.log(`[Queue] Finally block hit. activeTasksCount is now ${activeTasksCount}, User ${fromIdKey} active: ${activeTasksPerUser.get(fromIdKey)}`);
         // Add human-like random jitter (1 to 3 seconds) between tasks in the same slot
         const jitter = Math.floor(Math.random() * 2000) + 1000;
         nextTaskRunAt = Date.now() + jitter;
         setTimeout(runNextTask, jitter); 
     }
 };
+
+async function updateMirrorPathLastId(userId: number, sourceId: string, lastId: number) {
+    if (!approvedUsersCollection) return;
+    try {
+        const settingsUid = await resolveSettingsUserId(userId);
+        const userDoc = await approvedUsersCollection.findOne({ userId: settingsUid });
+        if (!userDoc || !userDoc.mirrorPaths) return;
+        
+        const normalize = (id: any) => id?.toString().replace('-100', '');
+        const cleanSource = normalize(sourceId);
+        
+        let updated = false;
+        const newPaths = userDoc.mirrorPaths.map((p: any) => {
+            if (normalize(p.sourceId) === cleanSource || normalize(p.sourceNumericId) === cleanSource) {
+                if (!p.lastProcessedMsgId || lastId > p.lastProcessedMsgId) {
+                    p.lastProcessedMsgId = lastId;
+                    updated = true;
+                }
+            }
+            return p;
+        });
+        
+        if (updated) {
+            await approvedUsersCollection.updateOne(
+                { userId: settingsUid },
+                { $set: { mirrorPaths: newPaths } }
+            );
+        }
+    } catch (e: any) {
+        console.error(`[Watcher] Error updating last processed message ID: ${e.message}`);
+    }
+}
+
+async function catchUpLiveMirrors(userId: number, client: TelegramClient) {
+    if (!approvedUsersCollection) return;
+    try {
+        const settingsUid = await resolveSettingsUserId(userId);
+        const userDoc = await approvedUsersCollection.findOne({ userId: settingsUid });
+        if (!userDoc || !userDoc.mirrorPaths) return;
+
+        const livePaths = userDoc.mirrorPaths.filter((p: any) => p.isLive === true);
+        if (livePaths.length === 0) return;
+
+        console.log(`[CatchUp] Checking catch-up for user ${userId} with ${livePaths.length} live paths...`);
+
+        for (const pathObj of livePaths) {
+            const sourceId = pathObj.sourceId;
+            const lastId = pathObj.lastProcessedMsgId;
+            if (!lastId) {
+                // If there's no lastProcessedMsgId, initialize it with the latest message ID
+                try {
+                    const sourceEntity = await safelyResolveFullEntity(client, sourceId).catch(() => null);
+                    if (sourceEntity) {
+                        const msgs = await client.getMessages(sourceEntity, { limit: 1 });
+                        if (msgs && msgs.length > 0) {
+                            pathObj.lastProcessedMsgId = msgs[0].id;
+                            await approvedUsersCollection.updateOne(
+                                { userId: settingsUid },
+                                { $set: { mirrorPaths: userDoc.mirrorPaths } }
+                            );
+                            console.log(`[CatchUp] Initialized lastProcessedMsgId to ${msgs[0].id} for source ${sourceId}`);
+                        }
+                    }
+                } catch (err: any) {
+                    console.error(`[CatchUp] Failed to initialize lastProcessedMsgId for ${sourceId}:`, err.message);
+                }
+                continue;
+            }
+
+            console.log(`[CatchUp] Scanning ${sourceId} from message ID > ${lastId}`);
+
+            try {
+                const sourceEntity = await safelyResolveFullEntity(client, sourceId).catch(() => null);
+                if (!sourceEntity) {
+                    console.warn(`[CatchUp] Could not resolve source entity for ${sourceId}`);
+                    continue;
+                }
+
+                // Query messages with minId = lastId. This gets messages newer than lastId.
+                const messages: any = await client.getMessages(sourceEntity, {
+                    minId: lastId,
+                    limit: 100
+                });
+
+                if (messages && messages.length > 0) {
+                    console.log(`[CatchUp] Found ${messages.length} missed messages in source ${sourceId}`);
+                    // Since getMessages returns newest first, reverse it to process from oldest to newest
+                    const sortedMessages = [...messages].reverse();
+
+                    for (const m of sortedMessages) {
+                        if (m instanceof Api.MessageEmpty) continue;
+                        if (m.out) continue;
+                        if (m.action instanceof Api.MessageActionTopicCreate) {
+                            continue;
+                        }
+
+                        const destId = pathObj.destId;
+                        let destTopicId = pathObj.destThreadId ? Number(pathObj.destThreadId) : undefined;
+
+                        if (pathObj.topicName && pathObj.topicName !== 'General') {
+                            try {
+                                const destEntity = await safelyResolveFullEntity(client, destId);
+                                const destTopics: any = await client.invoke(new Api.channels.GetForumTopics({
+                                    channel: destEntity,
+                                    limit: 200
+                                }));
+                                const found = destTopics.topics?.find((t: any) => t.title?.trim().toLowerCase() === pathObj.topicName.trim().toLowerCase());
+                                if (found) {
+                                    destTopicId = found.id;
+                                } else {
+                                    const createResult: any = await client.invoke(new Api.channels.CreateForumTopic({
+                                        channel: destEntity,
+                                        title: pathObj.topicName
+                                    }));
+                                    const update = createResult.updates?.find((u: any) => u.className === 'UpdateNewForumTopic');
+                                    destTopicId = update?.topicId;
+                                }
+                            } catch (e: any) {
+                                console.error(`[CatchUp] Dest Topic resolution failed: ${e.message}`);
+                            }
+                        }
+
+                        const entityId = sourceId.toString().replace('-100', '');
+                        const virtualLink = `https://t.me/c/${entityId}/${m.id}`;
+
+                        console.log(`[CatchUp] Queueing missed message ${m.id} to task queue... -> Link: ${virtualLink}`);
+
+                        taskQueue.push({
+                            chatId: userId,
+                            link: virtualLink,
+                            userId: userId,
+                            overrideThreadId: destTopicId,
+                            overrideTargetId: destId,
+                            isMirror: true
+                        });
+
+                        pathObj.lastProcessedMsgId = m.id;
+                    }
+
+                    // Save the updated lastProcessedMsgId to the DB
+                    await approvedUsersCollection.updateOne(
+                        { userId: settingsUid },
+                        { $set: { mirrorPaths: userDoc.mirrorPaths } }
+                    );
+
+                    runNextTask();
+                }
+            } catch (err: any) {
+                console.error(`[CatchUp] Error during catch-up for ${sourceId}:`, err.message);
+            }
+        }
+    } catch (err: any) {
+        console.error(`[CatchUp] Error in catch-Up live mirrors:`, err.message);
+    }
+}
 
 startAutoMirrorWatcher = async (userId: number, client: TelegramClient) => {
     if (activeWatchers.has(userId)) return;
@@ -2526,15 +2922,24 @@ startAutoMirrorWatcher = async (userId: number, client: TelegramClient) => {
                     link: virtualLink,
                     userId: userId,
                     overrideThreadId: destTopicId,
-                    overrideTargetId: match.destId
+                    overrideTargetId: match.destId,
+                    isMirror: true
                 });
                 
                 runNextTask();
+                
+                // Keep track of the last processed message ID in real-time
+                await updateMirrorPathLastId(userId, chatIdRaw, message.id);
             }
         } catch (e) {
             console.error(`[Watcher] Event Handler Error: ${e.message}`);
         }
     }, new NewMessage({}));
+
+    // Trigger catch-up scanning for any messages sent during downtime
+    catchUpLiveMirrors(userId, client).catch((err: any) => {
+        console.error(`[Watcher] Catch-up failed for user ${userId}:`, err.message);
+    });
 }
 
 getConnectedUserbotClient = async (userId: number) => {
@@ -2603,13 +3008,7 @@ getConnectedUserbotClient = async (userId: number) => {
                     useWSS: false,
                     autoReconnect: true,
                     floodSleepThreshold: 300,
-                    proxy: globalProxy ? {
-                         ip: globalProxy.ip,
-                         port: globalProxy.port,
-                         username: globalProxy.user,
-                         password: globalProxy.pass,
-                         socksType: globalProxy.socksType || 5
-                    } : undefined
+                    proxy: undefined,
                 }
             );
 
@@ -2743,7 +3142,7 @@ getConnectedUserbotClient = async (userId: number) => {
         return { client: prefClient, userId: preferredUserId, peer: null };
     };
 
-    const processTask = async (chatId: number, link: string, statusMsgId: number, userId: number, threadIdOverride?: number, forceGeneralPath?: boolean, targetIdOverride?: any): Promise<boolean> => {
+    const processTask = async (chatId: number, link: string, statusMsgId: number, userId: number, threadIdOverride?: number, forceGeneralPath?: boolean, targetIdOverride?: any, isMirror?: boolean): Promise<boolean> => {
         try {
             const getLinkData = (url: string) => {
                 const cleanUrl = url.trim().split('?')[0];
@@ -2787,6 +3186,7 @@ getConnectedUserbotClient = async (userId: number) => {
             if (approvedUsersCollection) {
                 userDoc = await approvedUsersCollection.findOne({ userId: (await resolveSettingsUserId(userId)) });
             }
+            const customRules = userDoc?.renameRules || [];
 
             if (!sourceClient.connected) await sourceClient.connect().catch(() => {});
 
@@ -2826,6 +3226,26 @@ getConnectedUserbotClient = async (userId: number) => {
             }
             if (!destClient) throw new Error("Destination unreachable. Ensure your Userbot is a member.");
 
+            const destTargetStr = uploadTarget.toString();
+            const cleanLink = link.trim();
+            if (isMirror && mirroredMessagesCollection) {
+                const existing = await mirroredMessagesCollection.findOne({ link: cleanLink, destId: destTargetStr });
+                if (existing) {
+                    await safeEditMessage(`⚡ **Skipped:** Already mirrored to destination.`, { chat_id: chatId, message_id: statusMsgId });
+                    return true;
+                }
+            }
+
+            const recordSuccessfulMirror = async () => {
+                if (mirroredMessagesCollection) {
+                    await mirroredMessagesCollection.updateOne(
+                        { link: cleanLink, destId: destTargetStr },
+                        { $set: { link: cleanLink, destId: destTargetStr, mirroredAt: new Date() } },
+                        { upsert: true }
+                    ).catch(err => console.error("[recordSuccessfulMirror] Error:", err));
+                }
+            };
+
             await safeEditMessage("🔍 **Locating content...**", { chat_id: chatId, message_id: statusMsgId });
             const sourcePeer = resolvedSourcePeer || await safelyResolveEntity(sourceClient, linkData.channelId);
 
@@ -2859,6 +3279,12 @@ getConnectedUserbotClient = async (userId: number) => {
 
             // Check if forwarding is allowed by source (Content Protection / Restrict Content is OFF)
             let isForwardingRestricted = !!msg.noforwards;
+            if (globalRenameRules && globalRenameRules.length > 0) {
+                isForwardingRestricted = true;
+            }
+            if (userDoc?.customCaptionTemplate) {
+                isForwardingRestricted = true;
+            }
             try {
                 const chatEntity = await msg.getChat().catch(() => null);
                 if (chatEntity && chatEntity.noforwards) {
@@ -2883,14 +3309,16 @@ getConnectedUserbotClient = async (userId: number) => {
                             randomId: [helpers.generateRandomLong(true)]
                         }));
                         await safeEditMessage("🎯 **Success!**", { chat_id: chatId, message_id: statusMsgId });
+                        await recordSuccessfulMirror();
                         return true;
                     }
                 } catch (e) {}
             }
 
             if (!msg.media) {
-                await destClient.sendMessage(finalDestPeer || uploadTarget, { message: applyRenameRules(msg.message || ""), replyTo: threadId });
+                await destClient.sendMessage(finalDestPeer || uploadTarget, { message: applyRenameRules(msg.message || "", customRules), replyTo: threadId });
                 await safeEditMessage("🎯 **Success!**", { chat_id: chatId, message_id: statusMsgId });
+                await recordSuccessfulMirror();
                 return true;
             }
 
@@ -2903,7 +3331,7 @@ getConnectedUserbotClient = async (userId: number) => {
             } else if (msg.media instanceof Api.MessageMediaPhoto) {
                 filename = "photo.jpg";
             }
-            filename = applyRenameRules(filename);
+            filename = applyRenameRules(filename, customRules);
 
             const tempFilePath = path.join(os.tmpdir(), `dl_${Date.now()}_${filename}`);
             const thumbPath = path.join(os.tmpdir(), `thumb_${Date.now()}.jpg`);
@@ -2911,7 +3339,8 @@ getConnectedUserbotClient = async (userId: number) => {
             const downloadStartTime = Date.now();
 
             // Try custom thumbnail first
-            const userCustomThumbPath = path.join(os.tmpdir(), `custom_thumb_${userId}.jpg`);
+            const settingsUidForThumb = await resolveSettingsUserId(userId);
+            const userCustomThumbPath = path.join(os.tmpdir(), `custom_thumb_${settingsUidForThumb}.jpg`);
             if (userDoc?.customThumbnailFileId) {
                 try {
                     const downloaded = await bot?.downloadFile(userDoc.customThumbnailFileId, os.tmpdir());
@@ -2976,7 +3405,35 @@ getConnectedUserbotClient = async (userId: number) => {
 
             const attributes: any[] = [new Api.DocumentAttributeFilename({ fileName: filename })];
             
-            let caption = applyRenameRules(msg.message || "");
+            if (msg.media instanceof Api.MessageMediaDocument && msg.media.document instanceof Api.Document) {
+                const videoAttr = msg.media.document.attributes.find(a => a instanceof Api.DocumentAttributeVideo);
+                if (videoAttr) {
+                    const vAttr = videoAttr as any;
+                    attributes.push(new Api.DocumentAttributeVideo({
+                        duration: Number(vAttr.duration || 0),
+                        w: Number(vAttr.w || 0),
+                        h: Number(vAttr.h || 0),
+                        supportsStreaming: true,
+                        nosound: vAttr.nosound
+                    }));
+                } else if (filename.endsWith('.mp4') || filename.endsWith('.mkv') || filename.endsWith('.mov') || filename.endsWith('.avi') || filename.endsWith('.webm')) {
+                    attributes.push(new Api.DocumentAttributeVideo({
+                        duration: 0,
+                        w: 0,
+                        h: 0,
+                        supportsStreaming: true
+                    }));
+                }
+            } else if (filename.endsWith('.mp4') || filename.endsWith('.mkv') || filename.endsWith('.mov') || filename.endsWith('.avi') || filename.endsWith('.webm')) {
+                attributes.push(new Api.DocumentAttributeVideo({
+                    duration: 0,
+                    w: 0,
+                    h: 0,
+                    supportsStreaming: true
+                }));
+            }
+            
+            let caption = applyRenameRules(msg.message || "", customRules);
             if (userDoc?.customCaptionTemplate) {
                 const template = userDoc.customCaptionTemplate;
                 caption = template.includes("{original}") ? template.replace("{original}", caption) : `${caption}\n\n${template}`;
@@ -2995,6 +3452,7 @@ getConnectedUserbotClient = async (userId: number) => {
             if (hasThumb && fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath);
             
             await safeEditMessage("🎯 **Successfully mirrored!**", { chat_id: chatId, message_id: statusMsgId });
+            await recordSuccessfulMirror();
             return true;
         } catch (err: any) {
             console.error("Link Process Error:", err);
@@ -3061,14 +3519,15 @@ getConnectedUserbotClient = async (userId: number) => {
               if (msg.photo && msg.photo.length > 0) {
                   delete userActionStates[fromId];
                   const fileId = msg.photo[msg.photo.length - 1].file_id;
+                  const settingsUid = await resolveSettingsUserId(fromId);
                   if (approvedUsersCollection) {
                       await approvedUsersCollection.updateOne(
-                          { userId: fromId.toString() },
+                          { userId: settingsUid },
                           { $set: { customThumbnailFileId: fileId } }
                       );
                   }
                   // Download locally as well just in case
-                  const userCustomThumbPath = path.join(os.tmpdir(), `custom_thumb_${fromId}.jpg`);
+                  const userCustomThumbPath = path.join(os.tmpdir(), `custom_thumb_${settingsUid}.jpg`);
                   try {
                       const downloadedPath = await bot.downloadFile(fileId, os.tmpdir());
                       if (fs.existsSync(userCustomThumbPath)) fs.unlinkSync(userCustomThumbPath);
@@ -3087,10 +3546,11 @@ getConnectedUserbotClient = async (userId: number) => {
           if (state.type === 'set_cap') {
               const textInput = msg.text || '';
               delete userActionStates[fromId];
+              const settingsUid = await resolveSettingsUserId(fromId);
               if (textInput.toLowerCase() === 'clear' || textInput.toLowerCase() === 'reset') {
                   if (approvedUsersCollection) {
                       await approvedUsersCollection.updateOne(
-                          { userId: fromId.toString() },
+                          { userId: settingsUid },
                           { $unset: { customCaptionTemplate: "" } }
                       );
                   }
@@ -3098,7 +3558,7 @@ getConnectedUserbotClient = async (userId: number) => {
               } else {
                   if (approvedUsersCollection) {
                       await approvedUsersCollection.updateOne(
-                          { userId: fromId.toString() },
+                          { userId: settingsUid },
                           { $set: { customCaptionTemplate: textInput } }
                       );
                   }
@@ -3118,15 +3578,17 @@ getConnectedUserbotClient = async (userId: number) => {
                   const replaceWith = parts.slice(1).join('=').trim();
                   
                   if (keyword) {
-                      // Prevent duplicates
-                      globalRenameRules = globalRenameRules.filter(r => r.keyword.toLowerCase() !== keyword.toLowerCase());
-                      globalRenameRules.push({ keyword, replaceWith });
-                      
-                      if (settingsCollection) {
-                          await settingsCollection.updateOne(
-                              { type: 'global_config' }, 
-                              { $set: { renameRules: globalRenameRules } }, 
-                              { upsert: true }
+                      const settingsUid = await resolveSettingsUserId(fromId);
+                      if (approvedUsersCollection) {
+                          const userDoc = await approvedUsersCollection.findOne({ userId: settingsUid });
+                          let userRules = userDoc?.renameRules || [];
+                          // Prevent duplicates
+                          userRules = userRules.filter((r: any) => r.keyword.toLowerCase() !== keyword.toLowerCase());
+                          userRules.push({ keyword, replaceWith });
+                          
+                          await approvedUsersCollection.updateOne(
+                              { userId: settingsUid },
+                              { $set: { renameRules: userRules } }
                           );
                       }
                       
@@ -3136,6 +3598,43 @@ getConnectedUserbotClient = async (userId: number) => {
                   }
               } else {
                   safeSendMessage(chatId, "🛑 **Rename rule addition cancelled** (or format was invalid). Ensure you use \`=\` separator.");
+              }
+              handleSettings(chatId, fromId);
+              return;
+          }
+
+          if (state.type === 'set_cooldown_secs') {
+              const textInput = (msg.text || '').trim().toLowerCase();
+              delete userActionStates[fromId];
+              
+              let val = 5; // Default fallback to 5 seconds
+              let success = false;
+              if (textInput === 'off' || textInput === '0') {
+                  val = 0;
+                  success = true;
+              } else {
+                  const cleaned = parseInt(textInput);
+                  if (!isNaN(cleaned) && cleaned >= 0) {
+                      val = cleaned;
+                      success = true;
+                  }
+              }
+
+              if (success) {
+                  if (approvedUsersCollection) {
+                      const settingsUid = await resolveSettingsUserId(fromId);
+                      await approvedUsersCollection.updateOne(
+                          { userId: settingsUid },
+                          { $set: { cooldownSeconds: val } }
+                      );
+                  }
+                  if (val === 0) {
+                      safeSendMessage(chatId, `✅ **Cooldown Delay Disabled!** Tasks will now execute with no delay between them.`, { parse_mode: 'Markdown' });
+                  } else {
+                      safeSendMessage(chatId, `✅ **Cooldown Delay Saved!** Delay has been set to **${val} seconds** between tasks.`, { parse_mode: 'Markdown' });
+                  }
+              } else {
+                  safeSendMessage(chatId, `❌ **Invalid Input.** Cooldown must be a non-negative number of seconds or "off". Setting cancelled.`);
               }
               handleSettings(chatId, fromId);
               return;
@@ -3413,7 +3912,8 @@ getConnectedUserbotClient = async (userId: number) => {
                           chatId, 
                           link: virtualLink, 
                           userId: fromId,
-                          forceGeneralPath: true
+                          forceGeneralPath: true,
+                          isMirror: true
                       });
                       queuedCount++;
                   }
@@ -3467,7 +3967,8 @@ getConnectedUserbotClient = async (userId: number) => {
                               chatId, 
                               link: virtualLink, 
                               userId: fromId,
-                              overrideThreadId: mirrorPath?.destThreadId ? Number(mirrorPath.destThreadId) : undefined
+                              overrideThreadId: mirrorPath?.destThreadId ? Number(mirrorPath.destThreadId) : undefined,
+                              isMirror: true
                           });
                       }
                   }
@@ -3626,13 +4127,7 @@ getConnectedUserbotClient = async (userId: number) => {
                     requestRetries: 15,
                     ...getRandomDeviceProps(),
                     floodSleepThreshold: 300,
-                    proxy: globalProxy ? {
-                        ip: globalProxy.ip,
-                        port: globalProxy.port,
-                        username: globalProxy.user,
-                        password: globalProxy.pass,
-                        socksType: globalProxy.socksType || 5
-                    } : undefined
+                    proxy: undefined,
                 });
                 state.client = client;
                 state.phone = phone;
@@ -3713,6 +4208,13 @@ getConnectedUserbotClient = async (userId: number) => {
                         );
                     }
                     adminActiveSession.set(fromId, accountUserId);
+                    if (approvedUsersCollection) {
+                        await approvedUsersCollection.updateOne(
+                            { userId: fromId.toString() },
+                            { $set: { activeUserbotUserId: accountUserId } },
+                            { upsert: true }
+                        ).catch((e: any) => console.error("[Login DB Switched] Error:", e));
+                    }
 
                     safeSendMessage(chatId, `✅ **Successfully Logged In!**\n\n👤 Account: **${fullName}**\n📱 Phone: **${phoneNumber}**`);
                     // Warm up entity cache immediately after login
@@ -3823,7 +4325,7 @@ app.get('/api/status', (req, res) => {
     botInfo: botInfo,
     queueSize: taskQueue.length,
     nextTaskIn: nextTaskRunAt ? Math.max(0, Math.round((nextTaskRunAt - Date.now()) / 1000)) : 0,
-    proxy: globalProxy,
+    proxy: undefined,
     config: {
       hasToken: !!token,
       hasMongo: !!mongoUri,
@@ -3838,6 +4340,34 @@ app.get('/api/status', (req, res) => {
       renameRules: globalRenameRules
     }
   });
+});
+
+app.post('/api/setpath', async (req, res) => {
+    if (!approvedUsersCollection) return res.status(503).json({ error: 'Database not ready' });
+    const { chatId, topicId, groupTitle, topicName, userId } = req.body;
+    
+    try {
+        const adminIdStr = userId.toString();
+        const settingsUid = await resolveSettingsUserId(Number(userId));
+        
+        const update = { 
+            $set: { 
+                uploadPath: chatId.toString(),
+                uploadTopicId: topicId || null,
+                uploadGroupName: groupTitle,
+                uploadTopicName: topicName || ''
+            } 
+        };
+        
+        // Update both the admin's doc AND the session's doc to ensure settings persist
+        await approvedUsersCollection.updateOne({ userId: adminIdStr }, update);
+        if (settingsUid !== adminIdStr) {
+             await approvedUsersCollection.updateOne({ userId: settingsUid }, update);
+        }
+        res.json({ success: true });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.post('/api/settings', async (req, res) => {
@@ -3876,11 +4406,7 @@ app.post('/api/settings', async (req, res) => {
             updateData.renameRules = renameRules;
             globalRenameRules = renameRules;
         }
-        if (proxy) {
-            updateData.proxy = proxy;
-            globalProxy = proxy;
-        }
-        
+
         await settingsCollection.updateOne({ type: 'global_config' }, { $set: updateData }, { upsert: true });
         
         if (adminId) currentAdminId = adminId;
@@ -3893,16 +4419,21 @@ app.post('/api/settings', async (req, res) => {
 
 // Global error handlers to prevent unhandled rejections from crashing or being noisy
 process.on('unhandledRejection', (reason: any, promise) => {
-    const msg = reason?.message || String(reason);
-    if (msg.includes('429') || reason?.error_code === 429 || msg.includes('TOPIC_CLOSED') || msg.includes('message thread not found')) {
+    const msg = (reason?.message || String(reason)).toLowerCase();
+    if (msg.includes('429') || reason?.error_code === 429 || msg.includes('topic_closed') || msg.includes('message thread not found') || msg.includes('timeout') || msg.includes('etimedout') || msg.includes('socket hang up') || msg.includes('econnreset') || msg.includes('econnrefused')) {
         console.warn('Silent caught known Telegram Rejection:', msg);
     } else {
         console.error('Unhandled Rejection at:', promise, 'reason:', reason);
     }
 });
 
-process.on('uncaughtException', (err) => {
-    console.error('Uncaught Exception:', err);
+process.on('uncaughtException', (err: any) => {
+    const msg = (err?.message || String(err)).toLowerCase();
+    if (msg.includes('timeout') || msg.includes('etimedout') || msg.includes('socket hang up') || msg.includes('econnreset') || msg.includes('econnrefused')) {
+        console.warn('Silent caught known Telegram/Network Uncaught Exception:', msg);
+    } else {
+        console.error('Uncaught Exception:', err);
+    }
 });
 
 async function startServer() {
