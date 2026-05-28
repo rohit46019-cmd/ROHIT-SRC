@@ -10,6 +10,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>('dashboard');
+  const [isDarkMode, setIsDarkMode] = useState(true);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -113,7 +114,7 @@ export default function App() {
     <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
       {/* Bot Identity & Queue */}
       <div className="grid md:grid-cols-2 gap-6">
-        <div className="bg-slate-900/50 border border-slate-800 p-8 rounded-[2rem] relative overflow-hidden group shadow-2xl shadow-blue-500/5">
+        <div className="bg-white dark:bg-slate-900/50 border border-slate-200 dark:border-slate-800 p-8 rounded-[2rem] relative overflow-hidden group shadow-2xl shadow-blue-500/5">
           <div className="absolute top-0 right-0 p-4 opacity-5 group-hover:opacity-10 transition-opacity">
             <Bot size={120} />
           </div>
@@ -124,7 +125,7 @@ export default function App() {
                 {data.botInfo.first_name[0]}
               </div>
               <div>
-                <h3 className="text-white text-xl font-bold tracking-tight">{data.botInfo.first_name}</h3>
+                <h3 className="text-slate-900 dark:text-white text-lg font-bold tracking-tight">{data.botInfo.first_name}</h3>
                 <p className="text-blue-500 font-mono text-sm leading-none mt-2">
                   @{data.botInfo.username}
                 </p>
@@ -142,7 +143,7 @@ export default function App() {
           )}
         </div>
 
-        <div className="bg-slate-900/50 border border-slate-800 p-8 rounded-[2rem] shadow-2xl shadow-purple-500/5">
+        <div className="bg-white dark:bg-slate-900/50 border border-slate-200 dark:border-slate-800 p-8 rounded-[2rem] shadow-2xl shadow-purple-500/5">
           <h2 className="text-slate-500 text-[10px] font-bold uppercase tracking-[0.2em] mb-8">Active Workload</h2>
           <div className="grid grid-cols-2 gap-4">
             <div className="bg-slate-950 p-5 rounded-2xl border border-slate-800">
@@ -152,7 +153,7 @@ export default function App() {
                 <span className="text-xs text-slate-600 uppercase font-bold tracking-tight">tasks</span>
               </div>
             </div>
-            <div className={`bg-slate-950 p-5 rounded-2xl border transition-all ${data?.nextTaskIn ? 'border-orange-500/30 bg-orange-500/5' : 'border-slate-800'}`}>
+            <div className={`bg-slate-100 dark:bg-slate-950 p-5 rounded-2xl border transition-all ${data?.nextTaskIn ? 'border-orange-500/30 bg-orange-500/5' : 'border-slate-200 dark:border-slate-800'}`}>
               <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1 flex items-center gap-1.5">
                 <Clock size={10} className={data?.nextTaskIn ? 'text-orange-500' : ''} />
                 Next Delay
@@ -165,7 +166,7 @@ export default function App() {
               </div>
             </div>
           </div>
-          <div className="mt-6 flex items-center gap-4 p-4 bg-slate-950 rounded-2xl border border-slate-800">
+          <div className="mt-6 flex items-center gap-4 p-4 bg-slate-100 dark:bg-slate-950 rounded-2xl border border-slate-200 dark:border-slate-800">
             <Activity className="text-blue-500 shrink-0" size={18} />
             <div className="flex-1 min-w-0">
                <div className="flex justify-between mb-1 text-[10px] font-bold">
@@ -231,7 +232,7 @@ export default function App() {
              </div>
              <div className="flex-1 min-w-0">
                <div className="flex justify-between items-center mb-1">
-                 <span className="text-xs font-bold text-white tracking-tight">Database Connectivity</span>
+                 <span className="text-xs font-bold text-slate-900 dark:text-white tracking-tight">Database Connectivity</span>
                  <span className={`text-[9px] px-2 py-0.5 rounded-full font-bold uppercase ${data?.dbStatus === 'Connected' ? 'bg-emerald-500/10 text-emerald-500' : 'bg-rose-500/10 text-rose-500'}`}>
                    {data?.dbStatus || 'Searching...'}
                  </span>
@@ -247,7 +248,7 @@ export default function App() {
              </div>
              <div className="flex-1 min-w-0">
                <div className="flex justify-between items-center mb-1">
-                 <span className="text-xs font-bold text-white tracking-tight">Admin Firewall</span>
+                 <span className="text-xs font-bold text-slate-900 dark:text-white tracking-tight">Admin Firewall</span>
                  <span className={`text-[9px] px-2 py-0.5 rounded-full font-bold uppercase ${data?.adminConfigured ? 'bg-emerald-500/10 text-emerald-500' : 'bg-rose-500/10 text-rose-500'}`}>
                    {data?.adminConfigured ? 'Active' : 'Bypass'}
                  </span>
@@ -674,43 +675,48 @@ export default function App() {
   );
 
   return (
-    <div className="min-h-screen bg-[#08090d] text-slate-200 font-sans selection:bg-blue-500/30 pb-20">
-      <div className="max-w-4xl mx-auto px-6 py-10">
-        {/* Header */}
-        <header className="mb-10 flex items-center justify-between sticky top-0 bg-[#08090d]/80 backdrop-blur-xl z-10 py-4 -mx-6 px-6">
-          <motion.div initial={{ opacity: 0, x: -20 }} animate={{ opacity: 1, x: 0 }}>
-            <h1 className="text-2xl font-black text-white tracking-tighter flex items-center gap-2.5">
-              <div className="p-2 bg-blue-600 rounded-xl">
-                 <Bot className="text-white" size={20} />
-              </div>
-              STUDIO <span className="text-blue-600">V3</span>
-            </h1>
-          </motion.div>
-          <div className="flex gap-2">
-            <StatusBadge label={data?.status || 'Unknown'} active={data?.status === 'Running'} icon={Activity} />
-            <StatusBadge label="Atlas DB" active={data?.dbStatus === 'Connected'} icon={Database} />
-          </div>
-        </header>
+    <div className={isDarkMode ? 'dark' : ''}>
+      <div className="min-h-screen bg-slate-50 dark:bg-[#08090d] text-slate-800 dark:text-slate-200 font-sans selection:bg-blue-500/30 pb-20">
+        <div className="max-w-4xl mx-auto px-6 py-10">
+          {/* Header */}
+          <header className="mb-10 flex items-center justify-between sticky top-0 bg-slate-50/80 dark:bg-[#08090d]/80 backdrop-blur-xl z-10 py-4 -mx-6 px-6">
+            <motion.div initial={{ opacity: 0, x: -20 }} animate={{ opacity: 1, x: 0 }}>
+              <h1 className="text-xl font-black text-slate-900 dark:text-white tracking-tighter flex items-center gap-2.5">
+                <div className="p-2 bg-sky-500 rounded-lg">
+                   <Bot className="text-white" size={16} />
+                </div>
+                STUDIO <span className="text-sky-500">V3</span>
+              </h1>
+            </motion.div>
+            <div className="flex gap-2">
+              <button onClick={() => setIsDarkMode(!isDarkMode)} className="p-2 rounded-lg bg-slate-200 dark:bg-slate-800 text-slate-600 dark:text-slate-400">
+                {isDarkMode ? '🌙' : '☀️'}
+              </button>
+              <StatusBadge label={data?.status || 'Unknown'} active={data?.status === 'Running'} icon={Activity} />
+              <StatusBadge label="Atlas DB" active={data?.dbStatus === 'Connected'} icon={Database} />
+            </div>
+          </header>
 
-        <main>
-          {activeTab === 'dashboard' && renderDashboard()}
-          {activeTab === 'config' && renderConfig()}
-          {activeTab === 'rules' && renderRules()}
-          {activeTab === 'mirror' && renderMirror()}
-          {activeTab === 'system' && renderSystem()}
-        </main>
-      </div>
-
-      {/* Persistent Bottom Nav */}
-      <nav className="fixed bottom-0 inset-x-0 bg-[#0c0d12]/90 backdrop-blur-2xl border-t border-slate-800/80 px-6 py-1 z-50 shadow-[0_-10px_40px_rgba(0,0,0,0.5)]">
-        <div className="max-w-md mx-auto flex items-center justify-between">
-          <NavButton tab="dashboard" icon={Home} label="Status" />
-          <NavButton tab="config" icon={Settings} label="Config" />
-          <NavButton tab="rules" icon={FileEdit} label="Rules" />
-          <NavButton tab="mirror" icon={Layers} label="Mirror" />
-          <NavButton tab="system" icon={Bot} label="System" />
+          <main>
+            {activeTab === 'dashboard' && renderDashboard()}
+            {activeTab === 'config' && renderConfig()}
+            {activeTab === 'rules' && renderRules()}
+            {activeTab === 'mirror' && renderMirror()}
+            {activeTab === 'system' && renderSystem()}
+          </main>
         </div>
-      </nav>
+
+        {/* Persistent Bottom Nav */}
+        <nav className="fixed bottom-0 inset-x-0 bg-slate-200 dark:bg-[#0c0d12]/90 backdrop-blur-2xl border-t border-slate-300 dark:border-slate-800/80 px-6 py-1 z-50 shadow-[0_-10px_40px_rgba(0,0,0,0.5)]">
+          <div className="max-w-md mx-auto flex items-center justify-between">
+            <NavButton tab="dashboard" icon={Home} label="Status" />
+            <NavButton tab="config" icon={Settings} label="Config" />
+            <NavButton tab="rules" icon={FileEdit} label="Rules" />
+            <NavButton tab="mirror" icon={Layers} label="Mirror" />
+            <NavButton tab="system" icon={Bot} label="System" />
+          </div>
+        </nav>
+      </div>
     </div>
   );
 }

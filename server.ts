@@ -9,6 +9,11 @@ import { StringSession } from 'telegram/sessions';
 import bigInt from 'big-integer';
 import { NewMessage } from 'telegram/events';
 
+const MAX_CONCURRENT_TASKS = 1; 
+const MAX_TASKS_PER_USER = 1;
+let activeTasksCount = 0;
+const activeTasksPerUser = new Map<number, number>();
+
 const mirrorTopicCache = new Map<string, Map<string, number>>();
 const sourceTopicCache = new Map<string, Map<number, string>>();
 const activeWatchers = new Set<number>();
@@ -139,6 +144,12 @@ const getEffectiveEngine = () => {
 
 const getLoginErrorSolution = (error: string) => {
     if (error.includes('TIMEOUT')) return "Telegram servers are taking too long to respond. \n\n✅ **Solutions:** \n1. Check your **Proxy** settings in /settings.\n2. Try again in a few minutes.\n3. Make sure your account isn't restricted by Telegram.";
+    if (error.includes('429') || error.includes('Too Many Requests')) {
+        const match = error.match(/retry after (\d+)/);
+        const seconds = match ? parseInt(match[1]) : 3600;
+        const minutes = Math.ceil(seconds / 60);
+        return `Telegram ने सुरक्षा कारणों से बहुत अधिक requests के कारण ब्लॉक किया है। \n\n✅ **समाधान: कृपया ${minutes} मिनट तक प्रतीक्षा करें और फिर प्रयास करें।**`;
+    }
     if (error.includes('PHONE_CODE_EXPIRED')) return "Telegram ने सुरक्षा कारणों से इस प्रयास को रोक दिया है। \n\n✅ **समाधान:** \n1. अपना **Proxy** बदलें (Magic Auto-fill उपयोग करें)। \n2. 15-20 मिनट इंतज़ार करें, फिर /login करें। \n3. OTP आने के बाद तुरंत न भेजें, 3-5 सेकंड रुकें।";
     if (error.includes('AUTH_KEY_UNREGISTERED')) return "आपका Session String वैध नहीं है। कृपया नया String Session बनाएंगे।";
     if (error.includes('FLOOD_WAIT')) return "Telegram ने आपको ब्लॉक किया है। कृपया 24-48 घंटे इंतज़ार करें।";
@@ -465,7 +476,7 @@ async function safelyResolveEntity(client: TelegramClient, entity: any): Promise
                     id: [new Api.InputChannel({ channelId: bigInt(idStrClean), accessHash: bigInt(0) })]
                 })).catch(e => {
                     // If CHANNEL_INVALID, it might be private or deleted
-                    if (e.errorMessage === 'CHANNEL_INVALID' || (e.message && e.message.includes('CHANNEL_INVALID'))) return null;
+                    if (e.errorMessage === 'CHANNEL_INVALID' || e.errorMessage === 'CHANNEL_PRIVATE' || (e.message && (e.message.includes('CHANNEL_INVALID') || e.message.includes('CHANNEL_PRIVATE')))) return null;
                     throw e;
                 }) as any;
                 
@@ -547,8 +558,12 @@ async function safelyResolveFullEntity(client: TelegramClient, entity: any): Pro
     try {
         return await client.getEntity(peer);
     } catch (e: any) {
-        if (e.errorMessage === 'CHANNEL_INVALID' || (e.message && e.message.includes('CHANNEL_INVALID'))) {
-             throw new Error(`Cannot access chat/channel format for ${entity}. It may be private, invalid, or the Userbot is not a member.`);
+        if (e.errorMessage === 'CHANNEL_INVALID' || e.errorMessage === 'CHANNEL_PRIVATE' || (e.message && (e.message.includes('CHANNEL_INVALID') || e.message.includes('CHANNEL_PRIVATE')))) {
+            try {
+                return await client.getInputEntity(peer);
+            } catch (innerE) {
+                throw new Error(`Cannot access chat/channel format for ${entity}. It may be private, invalid, or the Userbot is not a member.`);
+            }
         }
         throw e;
     }
@@ -1212,6 +1227,77 @@ NextTaskRunAt: ${nextTaskRunAt}`;
           return;
       }
 
+  // Handle interactive mirror selection
+  if (query.data?.startsWith('mirrordest_')) {
+      if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+      const state = userActionStates[query.from.id];
+      if (!state || state.type !== 'mirror_target') {
+          return bot?.answerCallbackQuery(query.id, { text: '❌ Session expired.', show_alert: true });
+      }
+
+      const action = query.data.split('_')[1];
+      if (action === 'new') {
+          state.type = 'enter_topic_id';
+          safeEditMessage("🔗 **Please send the Destination Group ID or Link:**", { chat_id: chatId, message_id: query.message!.message_id });
+      } else {
+          // Direct selection: action is the ID
+          state.pendingMirrorDest = action;
+          
+          // Resolve group name
+          let groupName = action;
+          try {
+              const entity = await client.getEntity(action);
+              groupName = (entity as any).title || groupName;
+          } catch(e) { console.error("Error resolving group name", e); }
+          
+          // Update recent destinations
+          await approvedUsersCollection?.updateOne(
+              { userId: query.from.id },
+              { $addToSet: { recentDestinations: { destId: action, groupName: groupName } } }
+          );
+          
+          state.type = 'mirror_path_add_source';
+          safeEditMessage(chatId, `🔗 **Destination Selected: ${groupName}**\n\nNow send the **Source Group Link/ID** to mirror from:`, { reply_markup: { force_reply: true }});
+      }
+      bot?.answerCallbackQuery(query.id);
+      return;
+  }
+
+  // Handle interactive clone destination selection
+  if (query.data?.startsWith('clonedest_')) {
+      if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+      const state = userActionStates[query.from.id];
+      if (!state || state.type !== 'topic_clone_dest_select') {
+          return bot?.answerCallbackQuery(query.id, { text: '❌ Session expired.', show_alert: true });
+      }
+
+      const action = query.data.split('_')[1];
+      if (action === 'new') {
+          state.type = 'enter_clone_dest_id';
+          safeEditMessage("🔗 **Please send the Destination Group ID or Link:**", { chat_id: chatId, message_id: query.message!.message_id });
+      } else {
+          // Direct selection: action is the ID
+          state.pendingCloneDest = action;
+          
+          let groupName = action;
+          try {
+              const entity = await client.getEntity(action);
+              groupName = (entity as any).title || groupName;
+          } catch(e) { console.error("Error resolving group name", e); }
+          
+          await approvedUsersCollection?.updateOne(
+              { userId: query.from.id },
+              { $addToSet: { recentDestinations: { destId: action, groupName: groupName } } }
+          );
+          
+          state.type = 'topic_clone_group';
+          safeEditMessage(chatId, `🔗 **Destination Selected: ${groupName}**\n\n2. Now send the **Source Group Link/ID** to clone from:`, { reply_markup: { force_reply: true }});
+      }
+      bot?.answerCallbackQuery(query.id);
+      return;
+  }
+
+
       if (query.data === 'login_cmd') handleLogin(chatId, query.from?.id);
       if (query.data === 'batch_cmd') handleBatch(chatId, query.from?.id);
       if (query.data === 'mirror_cmd') handleMirror(chatId, query.from?.id, query.message);
@@ -1228,10 +1314,20 @@ NextTaskRunAt: ${nextTaskRunAt}`;
 
       if (query.data === 'topic_clone_start') {
           if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
-          userActionStates[query.from.id] = { type: 'topic_clone_group' };
-          safeSendMessage(chatId, "🎯 **Clone Specific Topic**\n\n1. Please send the **Source Group/Channel ID or Link** from which you want to clone the topic.", {
-              reply_markup: { force_reply: true }
+          
+          userActionStates[query.from.id] = { type: 'topic_clone_dest_select' };
+          
+          const settingsUid = await resolveSettingsUserId(query.from.id);
+          const userDoc = await approvedUsersCollection.findOne({ userId: settingsUid });
+          const recent = userDoc?.recentDestinations || [];
+          
+          let keyboard: any[] = [];
+          recent.forEach((r: any) => {
+              keyboard.push([{ text: `📂 ${r.groupName}`, callback_data: `clonedest_${r.destId}` }]);
           });
+          keyboard.push([{ text: `➕ Enter New Group ID`, callback_data: `clonedest_new` }]);
+          
+          safeEditMessage("🎯 **Clone Specific Topic**\n\n1. Select Destination Group:", { chat_id: chatId, message_id: query.message!.message_id, reply_markup: { inline_keyboard: keyboard } });
           bot?.answerCallbackQuery(query.id);
           return;
       }
@@ -2202,7 +2298,39 @@ NextTaskRunAt: ${nextTaskRunAt}`;
         }
     });
     bot.onText(/\/batch/, (msg) => handleBatch(msg.chat.id, msg.from?.id));
-    bot.onText(/\/mirror/, (msg) => handleMirror(msg.chat.id, msg.from?.id, msg));
+    bot.onText(/\/mirror/, (msg) => {
+        // Simple entry, interactive selection starts here
+        handleMirrorInteractive(msg.chat.id, msg.from?.id, msg);
+    });
+
+    const handleMirrorInteractive = async (chatId: number, fromId: number | undefined, msg: TelegramBot.Message) => {
+        try {
+            if (!isAdmin(fromId) || !fromId) throw new Error("Restricted: Admin access required.");
+            const settingsUid = await resolveSettingsUserId(fromId);
+            const userDoc = await approvedUsersCollection.findOne({ userId: settingsUid });
+            
+            // 1. Prompt for Destination Group Selection
+            const recent = userDoc?.recentDestinations || [];
+            let keyboard: any[] = [];
+            
+            if (recent.length > 0) {
+                recent.forEach((r: any) => {
+                    keyboard.push([{ text: `📂 ${r.groupName}`, callback_data: `mirrordest_${r.destId}` }]);
+                });
+                keyboard.push([{ text: `➕ Enter New Group ID`, callback_data: `mirrordest_new` }]);
+            } else {
+                keyboard.push([{ text: `➕ Enter New Group ID`, callback_data: `mirrordest_new` }]);
+            }
+            
+            userActionStates[fromId] = { type: 'mirror_target' };
+            safeSendMessage(chatId, "🎯 **Select Destination Group for Mirroring:**", {
+                reply_markup: { inline_keyboard: keyboard }
+            });
+        } catch (err: any) {
+            safeSendMessage(chatId, `❌ **Error:** ${err.message}`);
+        }
+    };
+
     bot.onText(/\/cancel/, (msg) => handleCancel(msg.chat.id, msg.from?.id));
     bot.onText(/\/logout/, (msg) => handleLogout(msg.chat.id, msg.from?.id));
     
@@ -2376,11 +2504,36 @@ NextTaskRunAt: ${nextTaskRunAt}`;
       }
     });
 
-    // Concurrency Control
-const MAX_CONCURRENT_TASKS = 30; // Global max concurrent tasks
-const MAX_TASKS_PER_USER = 1;
-let activeTasksCount = 0;
-const activeTasksPerUser = new Map<number, number>();
+    // Helper to get or create topic by name
+const getOrCreateTopic = async (client: TelegramClient, channelEntity: any, topicName: string) => {
+    try {
+        const destTopics: any = await client.invoke(new Api.channels.GetForumTopics({
+            channel: channelEntity,
+            limit: 500
+        }));
+        
+        const found = destTopics.topics?.find((t: any) => t.title?.trim().toLowerCase() === topicName.trim().toLowerCase());
+        if (found) {
+            console.log(`[TopicMgr] Found existing topic "${topicName}" -> ID: ${found.id}`);
+            return found.id;
+        }
+
+        console.log(`[TopicMgr] Creating new topic "${topicName}"...`);
+        const createResult: any = await client.invoke(new Api.channels.CreateForumTopic({
+            channel: channelEntity,
+            title: topicName
+        }));
+        const update = createResult.updates?.find((u: any) => u.className === 'UpdateNewForumTopic');
+        return update?.topicId;
+    } catch (err: any) {
+        console.error(`[TopicMgr] Error in getOrCreateTopic for ${topicName}: ${err.message}`);
+        // Retry scan
+        try {
+            const retryTopics: any = await client.invoke(new Api.channels.GetForumTopics({ channel: channelEntity, limit: 200 }));
+            return retryTopics.topics?.find((t: any) => t.title?.trim().toLowerCase() === topicName.trim().toLowerCase())?.id;
+        } catch { return undefined; }
+    }
+};
 const lastTaskTimePerUser = new Map<number, number>();
 
 interface BatchInfo {
@@ -2516,13 +2669,13 @@ const runNextTask = async () => {
             statusMsgId = sMsg?.message_id || 0;
         }
 
-        let cooldownSecs = 5; // Default to 5 seconds
+        let cooldownSecs = 15; // Increased to 15 seconds to avoid API limits
         if (approvedUsersCollection) {
             try {
                 const targetUidStr = await resolveSettingsUserId(fromId);
                 const userDoc = await approvedUsersCollection.findOne({ userId: targetUidStr });
                 if (userDoc && userDoc.cooldownSeconds !== undefined) {
-                    cooldownSecs = Number(userDoc.cooldownSeconds);
+                    cooldownSecs = Math.max(15, Number(userDoc.cooldownSeconds));
                 }
             } catch (dbErr) {
                 console.error("[Queue] Failed to fetch cooldownSeconds from DB:", dbErr);
@@ -2578,6 +2731,7 @@ const runNextTask = async () => {
         if (e.description?.includes("too many requests") || e.error_code === 429) {
             const retryAfter = (e.parameters?.retry_after || 60) + 5;
             console.warn(`[Queue] 429 Detected. Slot paused for ${retryAfter}s...`);
+            await safeEditMessage(`⚠️ **429 Too Many Requests:** Telegram limitation active. Retrying automatically in ${retryAfter} seconds...`, { chat_id: task.chatId, message_id: statusMsgId });
             // Put the task back at the front if it failed due to 429
             taskQueue.unshift(task);
             setTimeout(runNextTask, retryAfter * 1000);
@@ -3316,7 +3470,7 @@ getConnectedUserbotClient = async (userId: number) => {
             }
 
             if (!msg.media) {
-                await destClient.sendMessage(finalDestPeer || uploadTarget, { message: applyRenameRules(msg.message || "", customRules), replyTo: threadId });
+                await destClient.sendMessage(finalDestPeer, { message: applyRenameRules(msg.message || "", customRules), replyTo: threadId });
                 await safeEditMessage("🎯 **Success!**", { chat_id: chatId, message_id: statusMsgId });
                 await recordSuccessfulMirror();
                 return true;
@@ -3439,7 +3593,7 @@ getConnectedUserbotClient = async (userId: number) => {
                 caption = template.includes("{original}") ? template.replace("{original}", caption) : `${caption}\n\n${template}`;
             }
 
-            await destClient.sendFile(finalDestPeer || uploadTarget, {
+            await destClient.sendFile(finalDestPeer, {
                 file: uploadedFile,
                 caption: caption,
                 workers: 8,
@@ -3651,12 +3805,17 @@ getConnectedUserbotClient = async (userId: number) => {
           if (state.type === 'set_path') {
               const text = msg.text || '';
               let targetId = '';
+              let topicId: number | null = null;
 
               if (msg.forward_from_chat) {
                   targetId = msg.forward_from_chat.id.toString();
-              } else if (text.startsWith('https://t.me/')) {
+              } else if (text.startsWith('https://t.me/c/')) {
                   const parts = text.split('/');
-                  targetId = parts[parts.length - 1];
+                  targetId = '-100' + parts[4];
+                  topicId = parseInt(parts[5]) || null;
+              } else if (text.startsWith('https://t.me/')) {
+                  targetId = '@' + text.split('/').pop();
+                  topicId = null;
               } else if (text.startsWith('-100') || /^\d+$/.test(text)) {
                   targetId = text;
               }
@@ -3665,9 +3824,23 @@ getConnectedUserbotClient = async (userId: number) => {
                   delete userActionStates[fromId];
                   if (approvedUsersCollection) {
                       const settingsUid = await resolveSettingsUserId(fromId);
-                      await approvedUsersCollection.updateOne({ userId: settingsUid }, { $set: { uploadPath: targetId } });
+                      const adminIdStr = fromId.toString();
+                      const update = { $set: { uploadPath: targetId, uploadGroupName: targetId, uploadTopicId: topicId, uploadTopicName: '' } };
+                      await approvedUsersCollection.updateOne({ userId: adminIdStr }, update);
+                      if (settingsUid !== adminIdStr) {
+                          await approvedUsersCollection.updateOne({ userId: settingsUid }, update);
+                      }
                   }
                   safeSendMessage(chatId, `✅ **Path Saved!**\nFiles will now be uploaded to: \`${targetId}\`\n\n_Note: Ensure the Userbot is a member of that chat._`, { parse_mode: 'Markdown' });
+                  try {
+                      const sendMessageOptions: any = { parse_mode: 'Markdown' };
+                      if (topicId) {
+                          sendMessageOptions.message_thread_id = topicId;
+                      }
+                      await bot.sendMessage(targetId, "✅ **SetDone: Bot is ready to upload here.**", sendMessageOptions);
+                  } catch (e) {
+                      console.error("Failed to send SetDone to destination", e);
+                  }
                   handleSettings(chatId, fromId);
               } else {
                   safeSendMessage(chatId, "❌ **Invalid Input.**\nPlease forward a message or send a valid Group/Channel link.");
@@ -3870,9 +4043,10 @@ getConnectedUserbotClient = async (userId: number) => {
               }
               
               const sourceGroupId = state.cloneSourceGroupId!;
+              const destGroupId = state.pendingCloneDest!;
               delete userActionStates[fromId];
               
-              await safeSendMessage(chatId, `📂 **Starting Specific Topic Clone...**\nSource Group: \`${sourceGroupId}\`\nTopic ID: \`${topicId}\``);
+              await safeSendMessage(chatId, `📂 **Starting Specific Topic Clone...**\nSource: \`${sourceGroupId}\`\nTopic ID: \`${topicId}\`\nDest: \`${destGroupId}\``);
               
               try {
                   const targetUid = Number(await resolveSettingsUserId(fromId));
@@ -3880,31 +4054,34 @@ getConnectedUserbotClient = async (userId: number) => {
                   if (!client) throw new Error("Your Userbot session is not active. Please /login first.");
                   
                   const sourceEntity = await safelyResolveFullEntity(client, sourceGroupId);
-                  const settingsUid = await resolveSettingsUserId(fromId);
-                  const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
+                  const destEntity = await safelyResolveEntity(client, destGroupId);
                   
-                  const destPath = userDoc?.uploadPath || DEFAULT_LOG_GROUP;
+                  // Get topic title
+                  let topicTitle = "Mirrored Topic";
+                  try {
+                      const topicsResult: any = await client.invoke(new Api.channels.GetForumTopics({ channel: sourceEntity, limit: 100 }));
+                      const topic = topicsResult.topics?.find((t: any) => t.id === topicId);
+                      if (topic) topicTitle = topic.title;
+                  } catch(e) { console.error("Error getting topic title", e); }
+                  
+                  // Create or get topic in dest
+                  const destTopicId = await getOrCreateTopic(client, destEntity, topicTitle);
                   
                   const sourceIdRaw = (sourceEntity as any).id?.toString() || "";
                   const sourceIdClean = sourceIdRaw.replace('-100', '');
 
-                  // Fetch messages in this topic (up to 500)
-                  const messages: any = await client.getMessages(sourceEntity, {
-                      limit: 500,
-                      replyTo: topicId
-                  });
+                  const messages: any = await client.getMessages(sourceEntity, { limit: 500, replyTo: topicId });
 
                   if (!messages || messages.length === 0) {
                       throw new Error("No messages found inside this topic, or topic ID is invalid.");
                   }
 
-                  // Sort messages chronologically (oldest to newest)
                   messages.sort((a: any, b: any) => a.id - b.id);
 
                   let queuedCount = 0;
                   for (const m of messages) {
-                      if (m.action) continue; // Skip service messages
-                      if (!m.message && !m.media) continue; // Skip empty messages with no content and no media
+                      if (m.action) continue; 
+                      if (!m.message && !m.media) continue;
 
                       const virtualLink = `https://t.me/c/${sourceIdClean}/${m.id}`;
                       
@@ -3913,13 +4090,15 @@ getConnectedUserbotClient = async (userId: number) => {
                           link: virtualLink, 
                           userId: fromId,
                           forceGeneralPath: true,
+                          targetIdOverride: destGroupId, 
+                          threadIdOverride: destTopicId,
                           isMirror: true
                       });
                       queuedCount++;
                   }
 
                   runNextTask();
-                  safeSendMessage(chatId, `✅ Added **${queuedCount}** items from Topic ID \`${topicId}\` to copy queue for general destination path: \`${destPath}\`.`);
+                  safeSendMessage(chatId, `✅ Added **${queuedCount}** items from Topic ID \`${topicId}\` to copy queue for destination: \`${destGroupId}\` (Topic: \`${topicTitle}\`).`);
               } catch (err: any) {
                   safeSendMessage(chatId, `❌ **Clone Error:** ${err.message}`);
               }
@@ -4111,6 +4290,12 @@ getConnectedUserbotClient = async (userId: number) => {
                 let phone = val.replace(/\s+/g, '').replace(/[-()]/g, '');
                 if (!phone.startsWith('+') && /^\d+$/.test(phone)) {
                     phone = '+' + phone;
+                }
+                
+                if (phone.length < 10 || phone.length > 15) {
+                    safeSendMessage(chatId, "❌ **Invalid Phone Number Length.** Please enter a valid international phone number (e.g., +91xxxxxxxxxx).");
+                    delete loginStates[fromId];
+                    return;
                 }
                 
                 // Ensure API ID and Hash are set for this user context
