@@ -44,6 +44,7 @@ export default function App() {
   const [pathChatId, setPathChatId] = useState('');
   const [pathTopicId, setPathTopicId] = useState('');
   const [settingPath, setSettingPath] = useState(false);
+  const [cooldownInput, setCooldownInput] = useState('15');
 
   useEffect(() => {
     if (data?.settings) {
@@ -55,6 +56,7 @@ export default function App() {
       if (data.settings.renameRules) {
         setRenameRules(data.settings.renameRules);
       }
+      setCooldownInput(data.settings.cooldownSeconds?.toString() || '15');
     }
   }, [data?.settings]);
 
@@ -73,6 +75,7 @@ export default function App() {
           apiHash: apiHashInput,
           downloadLibrary: libSelection,
           renameRules: renameRules,
+          cooldownSeconds: cooldownInput,
           proxy: data?.proxy
         })
       });
@@ -300,6 +303,20 @@ export default function App() {
                     value={sessionInput}
                     onChange={(e) => setSessionInput(e.target.value)}
                     placeholder={data?.config.hasSession ? '••••••••••••••••••••' : 'Paste new TGTX/GramJS session string'}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-2xl pl-12 pr-4 py-3.5 text-sm focus:outline-none focus:border-blue-500/50 transition-all text-white placeholder:text-slate-700"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2">Cooldown (seconds)</label>
+                <div className="relative">
+                  <Clock className="absolute left-4 top-3.5 text-slate-600" size={16} />
+                  <input 
+                    type="number"
+                    value={cooldownInput}
+                    onChange={(e) => setCooldownInput(e.target.value)}
+                    placeholder="e.g., 15"
                     className="w-full bg-slate-950 border border-slate-800 rounded-2xl pl-12 pr-4 py-3.5 text-sm focus:outline-none focus:border-blue-500/50 transition-all text-white placeholder:text-slate-700"
                   />
                 </div>
