@@ -10,7 +10,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>('dashboard');
-  const [isDarkMode, setIsDarkMode] = useState(true);
+  const [isDarkMode, setIsDarkMode] = useState(false);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -693,10 +693,10 @@ export default function App() {
 
   return (
     <div className={isDarkMode ? 'dark' : ''}>
-      <div className="min-h-screen bg-slate-50 dark:bg-[#08090d] text-slate-800 dark:text-slate-200 font-sans selection:bg-blue-500/30 pb-20">
+      <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-200 font-sans selection:bg-blue-500/30 pb-20">
         <div className="max-w-4xl mx-auto px-6 py-10">
           {/* Header */}
-          <header className="mb-10 flex items-center justify-between sticky top-0 bg-slate-50/80 dark:bg-[#08090d]/80 backdrop-blur-xl z-10 py-4 -mx-6 px-6">
+          <header className="mb-10 flex items-center justify-between sticky top-0 bg-slate-50/80 dark:bg-slate-950/80 backdrop-blur-xl z-10 py-4 -mx-6 px-6">
             <motion.div initial={{ opacity: 0, x: -20 }} animate={{ opacity: 1, x: 0 }}>
               <h1 className="text-xl font-black text-slate-900 dark:text-white tracking-tighter flex items-center gap-2.5">
                 <div className="p-2 bg-sky-500 rounded-lg">
@@ -724,7 +724,7 @@ export default function App() {
         </div>
 
         {/* Persistent Bottom Nav */}
-        <nav className="fixed bottom-0 inset-x-0 bg-slate-200 dark:bg-[#0c0d12]/90 backdrop-blur-2xl border-t border-slate-300 dark:border-slate-800/80 px-6 py-1 z-50 shadow-[0_-10px_40px_rgba(0,0,0,0.5)]">
+        <nav className="fixed bottom-0 inset-x-0 bg-slate-200 dark:bg-slate-950/90 backdrop-blur-2xl border-t border-slate-300 dark:border-slate-800/80 px-6 py-1 z-50 shadow-[0_-10px_40px_rgba(0,0,0,0.5)]">
           <div className="max-w-md mx-auto flex items-center justify-between">
             <NavButton tab="dashboard" icon={Home} label="Status" />
             <NavButton tab="config" icon={Settings} label="Config" />

@@ -10,15 +10,15 @@ import { StringSession } from 'telegram/sessions';
 import bigInt from 'big-integer';
 import { NewMessage } from 'telegram/events';
 
-const MAX_CONCURRENT_TASKS = 1; 
-const MAX_TASKS_PER_USER = 1;
+let MAX_CONCURRENT_TASKS = 1; 
+let MAX_TASKS_PER_USER = 1;
 let activeTasksCount = 0;
 const activeTasksPerUser = new Map<number, number>();
 
 const mirrorTopicCache = new Map<string, Map<string, number>>();
 const sourceTopicCache = new Map<string, Map<number, string>>();
 const activeWatchers = new Set<number>();
-const mirrorTasks = new Map<string, cron.ScheduledTask[]>();
+const mirrorTasks = new Map<string, any[]>();
 let getConnectedUserbotClient: (userId: number) => Promise<any>;
 let startAutoMirrorWatcher: (userId: number, client: TelegramClient) => Promise<any>;
 import fs from 'fs';
@@ -81,6 +81,7 @@ let client: MongoClient | null = null;
 let settingsCollection: any = null;
 let approvedUsersCollection: any = null;
 let mirroredMessagesCollection: any = null;
+let queuedTasksCollection: any = null;
 
 // Global Settings State
 let currentAdminId = process.env.ADMIN_ID;
@@ -193,6 +194,7 @@ interface ProxyConfig {
 let globalProxy: ProxyConfig | null = null;
 
 interface Task {
+    id?: string;
     chatId: number;
     userId: number;
     link: string;
@@ -202,11 +204,45 @@ interface Task {
     forceGeneralPath?: boolean;
     overrideTargetId?: any;
     isMirror?: boolean;
+    retries?: number;
 }
 
 const MESSAGE_UPDATE_THROTTLE = 2000; // Reduced to 2s for better responsiveness
 const taskQueue: Task[] = [];
+const topicMappingCache = new Map<string, number>();
+const taskControlMap = new Map<string, { isPaused: boolean; shouldRetry: boolean }>();
+let isQueuePaused = false;
 let nextTaskRunAt: number | null = null;
+let runNextTask: () => Promise<void>;
+
+function getDestinationLink(): string {
+    const defaultLink = 'https://t.me/telegram';
+    if (!destinationChatId) return defaultLink;
+    let val = destinationChatId.toString().trim();
+    if (!val) return defaultLink;
+
+    if (val.startsWith('https://') || val.startsWith('http://')) {
+        return val;
+    }
+    if (val.startsWith('t.me/')) {
+        return 'https://' + val;
+    }
+    if (val.startsWith('@')) {
+        return 'https://t.me/' + val.substring(1);
+    }
+
+    if (/^-?\d+$/.test(val)) {
+        let cleanId = val;
+        if (cleanId.startsWith('-100')) {
+            cleanId = cleanId.substring(4);
+        } else if (cleanId.startsWith('-')) {
+            cleanId = cleanId.substring(1);
+        }
+        return `https://t.me/c/${cleanId}/999999`;
+    }
+
+    return `https://t.me/${val}`;
+}
 
 // Moved to top for hoisting safety
 const escapeMarkdown = (text: string) => {
@@ -223,9 +259,25 @@ const safeBotCall = async (method: string, ...args: any[]) => {
             const is429 = e.error_code === 429 || e.message?.includes('429');
             const isNetworkError = e.message?.includes('TIMEOUT') || e.message?.includes('ETIMEDOUT') || e.message?.includes('socket hang up') || e.message?.includes('ECONNRESET') || e.message?.includes('ECONNREFUSED');
             if ((is429 || isNetworkError) && retries < maxRetries - 1) {
-                const retryAfter = is429 ? ((e.parameters?.retry_after || 15) + 5) : 3;
-                console.log(`[Bot API] Temporary issue (${e.message}) on ${method}. Waiting ${retryAfter}s (Attempt ${retries + 1}/${maxRetries})...`);
-                await sleep(retryAfter * 1000);
+                let retryAfter = 15;
+                if (is429) {
+                    // Try to get from parameters
+                    if (e.parameters?.retry_after) {
+                        retryAfter = e.parameters.retry_after;
+                    } else {
+                        // Try to parse from message: "429 Too Many Requests: retry after 1357"
+                        const match = e.message.match(/retry after (\d+)/);
+                        if (match) {
+                            retryAfter = parseInt(match[1], 10);
+                        }
+                    }
+                }
+                
+                // Add a small buffer
+                const waitTime = (is429 ? (retryAfter + 5) : 3) * 1000;
+                
+                console.log(`[Bot API] Temporary issue (${e.message}) on ${method}. Waiting ${Math.round(waitTime / 1000)}s (Attempt ${retries + 1}/${maxRetries})...`);
+                await sleep(waitTime);
                 retries++;
                 continue;
             }
@@ -261,6 +313,10 @@ const safeBotCall = async (method: string, ...args: any[]) => {
 
             if (is429) throw e; // RETHROW if max retries reached
             
+            if (e.message?.includes('message is not modified')) {
+                return true;
+            }
+            
             // For other errors, log and potentially return null if it's an optional call
             const msgLower = (e.message || '').toLowerCase();
             const isExpectedSilent = msgLower.includes("message is not modified") || 
@@ -279,6 +335,9 @@ const safeBotCall = async (method: string, ...args: any[]) => {
 };
 
 const safeSendMessage = async (chatId: number, text: string, options: any = {}) => {
+    try {
+        await bot.sendChatAction(chatId, 'typing');
+    } catch(e) {}
     return await safeBotCall('sendMessage', chatId, text, options);
 };
 
@@ -579,14 +638,15 @@ async function safelyResolveFullEntity(client: TelegramClient, entity: any): Pro
 const adminActiveSession = new Map<number, number>(); // adminTelegramId -> activeUserbotUserId
 
 const userActionStates: Record<number, { 
-    type: 'batch_start' | 'batch_end' | 'mirror_target' | 'set_thumb' | 'set_cap' | 'set_path' | 'mirror_choice' | 'set_mirror_source' | 'enter_topic_id' | 'mirror_path_add_source' | 'mirror_path_await_dest' | 'topic_clone_group' | 'topic_clone_topic_id' | 'add_rename_rule' | 'set_api_id' | 'set_api_hash' | 'full_mirror_group' | 'full_mirror_dest_select' | 'live_mirror_dest_select' | 'set_cooldown_secs', 
+    type: 'batch_start' | 'batch_end' | 'mirror_target' | 'set_thumb' | 'set_cap' | 'set_path' | 'mirror_choice' | 'set_mirror_source' | 'enter_topic_id' | 'mirror_path_add_source' | 'mirror_path_await_dest' | 'topic_clone_group' | 'topic_clone_topic_id' | 'add_rename_rule' | 'set_api_id' | 'set_api_hash' | 'full_mirror_group' | 'full_mirror_dest_select' | 'live_mirror_dest_select' | 'set_cooldown_secs' | 'set_concurrency_val' | 'topic_clone_dest_select' | 'enter_clone_dest_id' | 'set_jump_to_path', 
     startLink?: string,
     mirrorTarget?: any,
     pendingMirrorDest?: string,
     pendingMirrorThread?: number,
     pendingSourceId?: string,
     pendingSourceName?: string,
-    cloneSourceGroupId?: string
+    cloneSourceGroupId?: string,
+    pendingCloneDest?: string
 }> = {};
 
 // User Sessions Management and watchdog
@@ -609,10 +669,27 @@ async function runActiveWatchdog() {
                     console.error(`[Watchdog] Failed to connect user ${userId} in watchdog: ${err.message}`);
                 });
             } else {
-                if (!existingClient.connected) {
-                    console.log(`[Watchdog] User ${userId} bot client disconnected. Cleaning and Re-connecting...`);
+                let healthy = false;
+                if (existingClient.connected) {
+                    try {
+                        // Heartbeat ping check (10s timeout)
+                        await Promise.race([
+                            existingClient.getMe(),
+                            new Promise((_, reject) => setTimeout(() => reject(new Error("Heartbeat Timeout")), 10000))
+                        ]);
+                        healthy = true;
+                    } catch (heartbeatErr: any) {
+                        console.warn(`[Watchdog] User ${userId} heartbeat check failed: ${heartbeatErr.message}`);
+                    }
+                }
+
+                if (!healthy) {
+                    console.log(`[Watchdog] User ${userId} bot client failed heartbeat or disconnected. Repairing & reconnecting...`);
                     activeWatchers.delete(userId);
                     userClients.delete(userId);
+                    try {
+                        await existingClient.disconnect().catch(() => {});
+                    } catch (e) {}
                     await getConnectedUserbotClient(userId).catch(err => {
                         console.error(`[Watchdog] Failed to cleanly reconnect user ${userId} in watchdog: ${err.message}`);
                     });
@@ -644,19 +721,56 @@ if (mongoUri) {
       settingsCollection = db.collection('settings');
       approvedUsersCollection = db.collection('approved_users');
       mirroredMessagesCollection = db.collection('mirrored_messages');
+      queuedTasksCollection = db.collection('queued_tasks');
 
       // Load approved users into cache
       const users = await approvedUsersCollection.find({}).toArray();
       users.forEach((u: any) => approvedUsersCache.add(u.userId.toString()));
 
+      // Load persistent queued tasks
+      try {
+          const dbTasks = await queuedTasksCollection.find({}).sort({ createdAt: 1 }).toArray();
+          if (dbTasks && dbTasks.length > 0) {
+              console.log(`[Init] Found ${dbTasks.length} queued tasks in DB. Restoring to task queue...`);
+              for (const dbTask of dbTasks) {
+                  const restored: Task = {
+                      id: dbTask.id || dbTask._id?.toString(),
+                      chatId: Number(dbTask.chatId),
+                      userId: Number(dbTask.userId),
+                      link: dbTask.link,
+                      statusMsgId: dbTask.statusMsgId,
+                      batchId: dbTask.batchId,
+                      overrideThreadId: dbTask.overrideThreadId,
+                      forceGeneralPath: dbTask.forceGeneralPath,
+                      overrideTargetId: dbTask.overrideTargetId,
+                      isMirror: dbTask.isMirror
+                  };
+                  taskQueue.push(restored);
+              }
+              console.log(`[Init] Loaded ${taskQueue.length} tasks from DB. Starting runNextTask in 5 seconds...`);
+              setTimeout(() => {
+                  runNextTask().catch(e => console.error("[Init Queue] runNextTask failed:", e));
+              }, 5000);
+          }
+      } catch (err: any) {
+          console.error("[Init Queue] Failed to load persistent tasks:", err);
+      }
+
       // Load persistent settings first
       const settings = await settingsCollection.findOne({ type: 'global_config' });
       if (settings) {
         if (settings.adminId) currentAdminId = settings.adminId;
+        if (settings.destinationChatId) destinationChatId = settings.destinationChatId;
         if (settings.apiId) apiIdValue = Number(settings.apiId);
         if (settings.apiHash) apiHashValue = settings.apiHash;
         if (settings.renameRules) globalRenameRules = settings.renameRules;
         if (settings.proxy) globalProxy = settings.proxy;
+        if (settings.maxConcurrentTasks !== undefined) {
+          MAX_CONCURRENT_TASKS = Number(settings.maxConcurrentTasks);
+        }
+        if (settings.maxTasksPerUser !== undefined) {
+          MAX_TASKS_PER_USER = Number(settings.maxTasksPerUser);
+        }
         
         if (settings.stringSession) {
             const adminToMigrate = currentAdminId || ALLOWED_ADMIN_IDS[0];
@@ -838,6 +952,7 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
         bot.setMyCommands([
           { command: 'start', description: 'Start the bot' },
           { command: 'ping', description: 'Check bot latency' },
+          { command: 'status', description: 'Show queue and database status' },
           { command: 'login', description: 'Log in with Telegram credentials' },
           { command: 'logout', description: 'Revoke session and clear data' },
           { command: 'batch', description: 'Download multiple links' },
@@ -847,8 +962,27 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
           { command: 'restart', description: 'Restart bot internal services' },
           { command: 'mirror', description: 'Clone group/topic content' },
           { command: 'setpath', description: 'Set upload destination Topic/Group' },
+          { command: 'jumptopath', description: 'Directly set upload destination ID/Username' },
           { command: 'setmirror', description: 'Configure a new auto-mirror path' },
           { command: 'clearmirrorhistory', description: 'Clear mirrored links history' },
+          { command: 'setcooldown', description: 'Set delay between mirror tasks' },
+          { command: 'dashboard', description: 'Show active progress & system dashboard' },
+          { command: 'speed', description: 'Configure concurrency & task speed' },
+          { command: 'queue', description: 'Display and manage pending queue tasks' },
+          { command: 'pausequeue', description: 'Pause execution of the task queue' },
+          { command: 'resumequeue', description: 'Resume execution of the task queue' },
+          { command: 'canceltask', description: 'Cancel task by index: /canceltask <idx>' },
+          { command: 'prioritizetask', description: 'Bring task to front: /prioritizetask <idx>' },
+          { command: 'clearqueue', description: 'Wipe all pending tasks in queue' },
+          { command: 'cleartopiccache', description: 'Clear topic ID cache' },
+          { command: 'help', description: 'Show help guide' },
+          { command: 'start', description: 'Start the bot' },
+          { command: 'ping', description: 'Check bot latency' },
+          { command: 'login', description: 'Login to Telegram' },
+          { command: 'cancel', description: 'Cancel current action' },
+          { command: 'logout', description: 'Logout from Telegram' },
+          { command: 'restart', description: 'Restart the bot process' },
+          { command: 'batch', description: 'Handle batch operations' },
         ]);
 
         const handleSetMirror = async (chatId: number, fromId: number | undefined, msg: TelegramBot.Message) => {
@@ -1002,6 +1136,7 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                      `• **Engine:** 🚀 ${currentUploadEngine}\n` +
                      `• **Destination:** 📍 \`${pathDisplay}\`\n` +
                      `• **Cooldown Between Tasks:** ${cooldownDisplay}\n` +
+                     `• **Max Concurrency:** \`${MAX_CONCURRENT_TASKS}\` workers (User limit: \`${MAX_TASKS_PER_USER}\`)\n` +
                      `• **API ID:** ${apiDisplayId}\n` +
                      `• **API Hash:** ${apiDisplayHash}\n\n` +
                      `${mirrorPathsText}\n` +
@@ -1029,14 +1164,15 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                 { text: 'Rename Rules', callback_data: 'toggle_rename' }
               ],
               [
-                { text: `⏱ Cooldown: ${cooldownSecs === 0 ? 'OFF (0s)' : `${cooldownSecs}s`}`, callback_data: 'change_cooldown_start' }
+                { text: `⏱ Cooldown: ${cooldownSecs === 0 ? 'OFF (0s)' : `${cooldownSecs}s`}`, callback_data: 'change_cooldown_start' },
+                { text: `⚡ Concurrency: ${MAX_CONCURRENT_TASKS}`, callback_data: 'change_concurrency_start' }
               ],
               [
                 { text: 'Force Sync', callback_data: 're_login' },
                 { text: 'Logs', callback_data: 'view_logs' },
                 { text: 'Audit', callback_data: 'check_perms' }
               ],
-              [{ text: '⬅️ Back to Menu', callback_data: 'start_back' }]
+              [{ text: '⬅️ Back to Menu', callback_data: 'menu_back' }]
             ]
         };
 
@@ -1065,6 +1201,7 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                     reply_markup: markup
                 });
             }
+            sendBackMenu(chatId);
         }
     };
 
@@ -1092,7 +1229,22 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
       // Global Cancel: Clear the entire task queue
       if (taskQueue.length > 0) {
           taskQueue.length = 0;
+          dbClearAllTasks().catch(e => console.error("[Queue DB] failed to clear on cancel:", e));
           cancelled = true;
+      }
+      
+      // Cancel active tasks, except live mirror tasks
+      for (const [key, job] of activeTaskJobs) {
+          if (job.isMirror && ['searching', 'downloading', 'uploading'].includes(job.phase)) {
+              continue;
+          }
+          activeTaskJobs.delete(key);
+          taskControlMap.delete(key);
+          cancelled = true;
+      }
+
+      if (cancelled) {
+          safeSendMessage(chatId, "✅ All non-essential/pending tasks have been cancelled.");
       }
 
       // Reset activity trackers
@@ -1107,15 +1259,76 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
     };
 
     // Developer debug command
+
     bot.onText(/\/status/, async (msg) => {
         if (!isAdmin(msg.from?.id)) return;
+        const totalUsers = approvedUsersCollection ? await approvedUsersCollection.countDocuments({}) : 0;
         const msgStr = `📊 System Status:
 Queue: ${taskQueue.length}
 Active: ${activeTasksCount}
 MaxConcurrent: ${MAX_CONCURRENT_TASKS}
+Total Users: ${totalUsers}
 NextTaskRunAt: ${nextTaskRunAt}`;
         safeSendMessage(msg.chat.id, msgStr);
     });
+
+    const sendMainMenu = (chatId: number) => {
+        const keyboard = {
+            keyboard: [
+                [{ text: '⚙️ Settings' }, { text: '📈 Dashboard' }],
+                [{ text: '📦 Batch' }, { text: '⚙️ Mirror Engine' }],
+                [{ text: '📍 Set Path' }, { text: '❌ Cancel' }],
+                [{ text: '🚀 Start' }]
+            ],
+            resize_keyboard: true,
+            one_time_keyboard: false
+        };
+        bot.sendMessage(chatId, "🛠 **Bot Main Menu**\n\nSelect a task:", {
+            reply_markup: keyboard
+        });
+    };
+
+    const sendBackMenu = (chatId: number) => {
+        const keyboard = {
+            keyboard: [
+                [{ text: '⬅️ Back' }]
+            ],
+            resize_keyboard: true,
+            one_time_keyboard: false
+        };
+        bot.sendMessage(chatId, "🛠 **Navigation:**", {
+            reply_markup: keyboard
+        });
+    };
+
+    const handleStartMessage = (msg: any) => {
+        const photoUrl = `https://picsum.photos/1000/600?random=${Date.now()}`;
+        
+        if (!isAuthorized(msg.from?.id)) {
+            const unauthorizedText = `🚫 **Access Denied**\n\nHello ${msg.from?.first_name}, you do not have permission to use this bot. Access is strictly limited to authorized administrators.`;
+            return safeBotCall('sendPhoto', msg.chat.id, photoUrl, {
+                caption: unauthorizedText,
+                parse_mode: 'Markdown'
+            });
+        }
+
+        const welcomeText = `👋 **Hello ${msg.from?.first_name}!**\n\nI am the **Restricted Content Saver** bot. I help you bypass download restrictions and mirror entire groups efficiently.\n\n✨ **Core Features:**\n• Download Restricted Media\n• Mirror Groups/Channels\n• Topic preservation support\n\n🛡 **Status:** Authorized User`;
+        
+        safeBotCall('sendPhoto', msg.chat.id, photoUrl, {
+         caption: welcomeText,
+         parse_mode: 'Markdown',
+         reply_markup: {
+           keyboard: [
+             [{ text: '⚙️ Settings' }, { text: '📈 Dashboard' }],
+             [{ text: '📦 Batch' }, { text: '⚙️ Mirror Engine' }],
+             [{ text: '📍 Set Path' }, { text: '❌ Cancel' }],
+             [{ text: '🚀 Start' }]
+           ],
+           resize_keyboard: true,
+           one_time_keyboard: false
+         }
+       });
+    };
 
     const handleBatch = async (chatId: number, fromId: number | undefined) => {
       try {
@@ -1129,6 +1342,7 @@ NextTaskRunAt: ${nextTaskRunAt}`;
         safeSendMessage(chatId, "📦 **Batch Process Started**\n\nSend the **Starting Link** now.", {
           reply_markup: { force_reply: true }
         });
+        sendBackMenu(chatId);
       } catch (err: any) {
         safeSendMessage(chatId, `❌ **Error:** ${err.message}`);
       }
@@ -1161,46 +1375,14 @@ NextTaskRunAt: ${nextTaskRunAt}`;
         if (msg?.message_thread_id) options.message_thread_id = msg.message_thread_id;
 
         safeSendMessage(chatId, "🪞 **Mirror Hub**\n\nChoose an action:", options);
+        sendBackMenu(chatId);
       } catch (err: any) {
         safeSendMessage(chatId, `❌ **Error:** ${err.message}`);
       }
     };
 
     bot.onText(/\/start/, (msg) => {
-       const photoUrl = `https://picsum.photos/1000/600?random=${Date.now()}`;
-       
-       if (!isAuthorized(msg.from?.id)) {
-           const unauthorizedText = `🚫 **Access Denied**\n\nHello ${msg.from?.first_name}, you do not have permission to use this bot. Access is strictly limited to authorized administrators.`;
-           return safeBotCall('sendPhoto', msg.chat.id, photoUrl, {
-               caption: unauthorizedText,
-               parse_mode: 'Markdown'
-           });
-       }
-
-       const welcomeText = `👋 **Hello ${msg.from?.first_name}!**\n\nI am the **Restricted Content Saver** bot. I help you bypass download restrictions and mirror entire groups efficiently.\n\n✨ **Core Features:**\n• Download Restricted Media\n• Mirror Groups/Channels\n• Topic preservation support\n\n🛡 **Status:** Authorized User`;
-       
-       safeBotCall('sendPhoto', msg.chat.id, photoUrl, {
-        caption: welcomeText,
-        parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: [
-            [
-              { text: 'Login', callback_data: 'login_cmd' },
-              { text: 'Batch', callback_data: 'batch_cmd' },
-              { text: 'Mirror', callback_data: 'mirror_cmd' }
-            ],
-            [
-              { text: 'Settings', callback_data: 'bot_settings' },
-              { text: 'Logout', callback_data: 'logout_cmd' },
-              { text: 'Cancel', callback_data: 'cancel_cmd' }
-            ],
-            [
-              { text: 'Official Channel', url: 'https://t.me/telegram' },
-              { text: 'Help', callback_data: 'help_cmds' }
-            ]
-          ]
-        }
-      });
+        handleStartMessage(msg);
     });
 
     bot.on('callback_query', async (query) => {
@@ -1234,6 +1416,33 @@ NextTaskRunAt: ${nextTaskRunAt}`;
           return;
       }
 
+      if (query.data === 'menu_back') {
+          const menuKeyboard = {
+            inline_keyboard: [
+                [
+                    { text: '⚙️ Settings', callback_data: 'bot_settings' },
+                    { text: '📦 Batch', callback_data: 'batch_cmd' }
+                ],
+                [
+                    { text: '📍 Set Path', callback_data: 'set_path_cmd' },
+                    { text: '⚙️ Mirror Engine', callback_data: 'mirror_cmd' }
+                ],
+                [
+                    { text: '🚀 Start', callback_data: 'start_cmd' },
+                    { text: '❌ Cancel', callback_data: 'cancel_cmd' }
+                ]
+            ]
+        };
+        await safeEditMessage("🛠 **Bot Main Menu**\n\nSelect a task:", {
+                chat_id: chatId,
+                message_id: query.message!.message_id,
+                reply_markup: menuKeyboard,
+                parse_mode: 'Markdown'
+            });
+            bot?.answerCallbackQuery(query.id);
+            return;
+      }
+
   // Handle interactive mirror selection
   if (query.data?.startsWith('mirrordest_')) {
       if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
@@ -1253,7 +1462,8 @@ NextTaskRunAt: ${nextTaskRunAt}`;
           // Resolve group name
           let groupName = action;
           try {
-              const entity = await client.getEntity(action);
+              const tgClient = await getConnectedUserbotClient(query.from.id);
+              const entity = await tgClient.getEntity(action);
               groupName = (entity as any).title || groupName;
           } catch(e) { console.error("Error resolving group name", e); }
           
@@ -1264,7 +1474,11 @@ NextTaskRunAt: ${nextTaskRunAt}`;
           );
           
           state.type = 'mirror_path_add_source';
-          safeEditMessage(chatId, `🔗 **Destination Selected: ${groupName}**\n\nNow send the **Source Group Link/ID** to mirror from:`, { reply_markup: { force_reply: true }});
+          await safeEditMessage(`🔗 **Destination Selected: ${groupName}**\n\nNow send the **Source Group Link/ID** to mirror from:`, {
+              chat_id: chatId,
+              message_id: query.message!.message_id,
+              reply_markup: { force_reply: true }
+          });
       }
       bot?.answerCallbackQuery(query.id);
       return;
@@ -1288,7 +1502,8 @@ NextTaskRunAt: ${nextTaskRunAt}`;
           
           let groupName = action;
           try {
-              const entity = await client.getEntity(action);
+              const tgClient = await getConnectedUserbotClient(query.from.id);
+              const entity = await tgClient.getEntity(action);
               groupName = (entity as any).title || groupName;
           } catch(e) { console.error("Error resolving group name", e); }
           
@@ -1298,7 +1513,11 @@ NextTaskRunAt: ${nextTaskRunAt}`;
           );
           
           state.type = 'topic_clone_group';
-          safeEditMessage(chatId, `🔗 **Destination Selected: ${groupName}**\n\n2. Now send the **Source Group Link/ID** to clone from:`, { reply_markup: { force_reply: true }});
+          await safeEditMessage(`🔗 **Destination Selected: ${groupName}**\n\n2. Now send the **Source Group Link/ID** to clone from:`, {
+              chat_id: chatId,
+              message_id: query.message!.message_id,
+              reply_markup: { force_reply: true }
+          });
       }
       bot?.answerCallbackQuery(query.id);
       return;
@@ -1566,6 +1785,7 @@ NextTaskRunAt: ${nextTaskRunAt}`;
               }
 
               taskQueue.push(...msgsToQueue);
+              dbEnqueueTasks(msgsToQueue).catch(e => console.error("[Queue DB] Bulk enqueue error:", e));
               runNextTask();
               if (statusMsg) {
                   await safeEditMessage(`✅ Added **${msgsToQueue.length}** items from Full Mirror to copy queue.\nDestination path: \`${destPath}\`.`, {
@@ -1721,7 +1941,9 @@ NextTaskRunAt: ${nextTaskRunAt}`;
               delete userActionStates[fromId];
               await safeSendMessage(chatId, "✅ **Starting Recent Content Mirror...**");
               const statusMsg = await safeSendMessage(chatId, "🔍 **Processing Latest...**", { parse_mode: 'Markdown' });
-              taskQueue.push({ chatId, link, statusMsgId: statusMsg?.message_id || 0, userId: fromId, isMirror: true });
+              const newTask = { chatId, link, statusMsgId: statusMsg?.message_id || 0, userId: fromId, isMirror: true, retries: 0 };
+              taskQueue.push(newTask);
+              dbEnqueueTask(newTask).catch(e => console.error("[Queue DB] enqueue error:", e));
               runNextTask();
           }
           bot?.answerCallbackQuery(query.id);
@@ -1819,13 +2041,14 @@ NextTaskRunAt: ${nextTaskRunAt}`;
                               replyTo: topic.id
                           });
 
+                          const cloneTasksToQueue: Task[] = [];
                           for (const m of messages) {
                               if (m.media) {
                                   const entityIdRaw = sourceEntity.id?.toString() || "";
                                   const entityId = entityIdRaw.replace('-100', '');
                                   const virtualLink = `https://t.me/c/${entityId}/${m.id}`;
                                   
-                                  taskQueue.push({ 
+                                  cloneTasksToQueue.push({ 
                                       chatId, 
                                       link: virtualLink, 
                                       userId: fromId,
@@ -1833,6 +2056,10 @@ NextTaskRunAt: ${nextTaskRunAt}`;
                                       isMirror: true
                                   });
                               }
+                          }
+                          if (cloneTasksToQueue.length > 0) {
+                              taskQueue.push(...cloneTasksToQueue);
+                              dbEnqueueTasks(cloneTasksToQueue).catch(e => console.error("[Queue DB] Bulk enqueue error:", e));
                           }
                       }
                   }
@@ -1847,15 +2074,39 @@ NextTaskRunAt: ${nextTaskRunAt}`;
       }
 
       if (query.data === 'help_cmds') {
-        const helpText = `📜 **Available Commands:**\n\n` +
-          `• /login - Start authentication\n` +
-          `• /batch - Process multiple links\n` +
-          `• /mirror - Copy entire group content\n` +
-          `• /cancel - Stop current process\n` +
-          `• /settings - Configure bot behavior\n` +
-          `• /clearmirrorhistory - Reset full mirror history\n\n` +
-          `**Note:** You must have a valid \`STRING_SESSION\` for restricted content access.`;
+        const helpText = `📖 *RESTRICTED MIRROR BOT - COMPLETE HELP GUIDE* 📖\n\n` +
+          `This guide provides a comprehensive overview of all command definitions, interactive buttons, and functional workflows for this bot.\n\n` +
+          `⚙️ **Command Reference Guide:**\n\n` +
+          `• \`/start\` 🚀 - Initializes the bot and presents the main action menu.\n` +
+          `• \`/login\` 👤 - Authenticates your Telegram account (Userbot). Required for restricted chats.\n` +
+          `• \`/settings\` ⚙️ - Accesses upload settings, custom thumbnail options, rename rules, and download engine modes.\n` +
+          `• \`/mirror\` 🔄 - Configures cloning, active live paths, or complete mirror/copy options.\n` +
+          `• \`/batch\` 📦 - Executes multi-link batch processing mode, allowing you to queue multiple links.\n` +
+          `• \`/status\` 📊 - Shows ongoing download/upload transfer progress and active mirror tasks.\n` +
+          `• \`/dashboard\` 📈 - Displays general transfer statistics: data volumes, success/failure counts.\n` +
+          `• \`/setmirror\` 📍 - Establishes a live mirroring channel or destination path directly inside a group/channel.\n` +
+          `• \`/setpath\` 🛣 - Sets the default global destination channel/group link or ID.\n` +
+          `• \`/clearmirrorhistory\` 🗑 - Clears the database of downloaded message histories so you can re-mirror identical posts.\n` +
+          `• \`/setcooldown\` ⏳ - Adjusts the delay interval between successive mirrored messages.\n` +
+          `• \`/speed\` ⚡ - Configures your userbot’s multi-thread capabilities and connection speeds.\n` +
+          `• \`/cancel\` 🛑 - Halts and aborts the currently running task (batch copy or mirror operations).\n` +
+          `• \`/logout\` 🚪 - Securely disconnects and removes your active userbot Telegram session.\n` +
+          `• \`/ping\` 🏓 - Verifies the latency and responds with active server connection status.\n` +
+          `• \`/restart\` 🔄 - Restarts the bot application instance (Admin restricted).\n` +
+          `• \`/sync\` 🔄 - Re-synchronizes any active mirror paths and session keys.\n\n` +
+          `--- \n\n` +
+          `🖱 **Interactive Touch Elements & Buttons:**\n\n` +
+          `• **Login / Authenticate** 🔑 - Prompts you to paste a standard \`STRING_SESSION\` to authenticate.\n` +
+          `• **Batch** 📦 - Starts input prompting to process a bulk queue of distinct message links.\n` +
+          `• **Mirror** 🔄 - Opens choices to initiate clones, specific topic clones, or setup live mirroring channels.\n` +
+          `• **Settings** ⚙️ - Interactively updates custom thumbnails, adds/removes filename rename rules, and toggles engines.\n` +
+          `• **Logout** 🚪 - Terminates and removes any saved userbot session.\n` +
+          `• **Cancel** 🛑 - Stops the active long-running mirroring or batch download gracefully.\n` +
+          `• **Official Channel** 📢 - Direct link to open the official destination channel.\n` +
+          `• **Help** ❓ - Re-displays this complete interactive help guide in English.`;
         bot?.sendMessage(chatId, helpText, { parse_mode: 'Markdown' });
+        bot?.answerCallbackQuery(query.id);
+        return;
       }
 
       if (query.data === 'bot_settings') {
@@ -2219,6 +2470,178 @@ NextTaskRunAt: ${nextTaskRunAt}`;
           return;
       }
 
+      if (query.data === 'change_concurrency_start') {
+          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+          userActionStates[query.from.id] = { type: 'set_concurrency_val' };
+          safeSendMessage(chatId, "⚡ **Set Concurrency Limit**\n\nPlease enter the maximum number of concurrent tasks (between 1 and 20).", {
+              parse_mode: 'Markdown',
+              reply_markup: { force_reply: true }
+          });
+          bot?.answerCallbackQuery(query.id);
+          return;
+      }
+
+      if (query.data === 'refresh_dashboard') {
+          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+          const text = await generateDashboardText();
+          await safeEditMessage(text, {
+              chat_id: chatId,
+              message_id: query.message!.message_id,
+              parse_mode: 'Markdown',
+              reply_markup: {
+                  inline_keyboard: [
+                      [
+                          { text: '🔄 Refresh Stats', callback_data: 'refresh_dashboard' },
+                          isQueuePaused ? { text: '▶️ Resume Queue', callback_data: 'resume_queue_cb' } : { text: '⏸️ Pause Queue', callback_data: 'pause_queue_cb' }
+                      ],
+                      [
+                          { text: '📋 View Queue', callback_data: 'view_queue_cb' },
+                          { text: '🗑️ Clear Queue', callback_data: 'clear_queue_cb' }
+                      ]
+                  ]
+              }
+          }).catch(() => {});
+          bot?.answerCallbackQuery(query.id, { text: '🔄 Dashboard Refreshed!' });
+          return;
+      }
+
+      if (query.data === 'resume_queue_cb') {
+          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+          isQueuePaused = false;
+          bot?.answerCallbackQuery(query.id, { text: '▶️ Task Queue Resumed!' });
+          const text = await generateDashboardText();
+          await safeEditMessage(text + `\n\n▶️ **System Resumed:** Continuing downloads...`, {
+              chat_id: chatId,
+              message_id: query.message!.message_id,
+              parse_mode: 'Markdown',
+              reply_markup: {
+                  inline_keyboard: [
+                      [
+                          { text: '🔄 Refresh Stats', callback_data: 'refresh_dashboard' },
+                          { text: '⏸️ Pause Queue', callback_data: 'pause_queue_cb' }
+                      ],
+                      [
+                          { text: '📋 View Queue', callback_data: 'view_queue_cb' },
+                          { text: '🗑️ Clear Queue', callback_data: 'clear_queue_cb' }
+                      ]
+                  ]
+              }
+          }).catch(() => {});
+          runNextTask();
+          return;
+      }
+
+      if (query.data === 'pause_queue_cb') {
+          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+          isQueuePaused = true;
+          bot?.answerCallbackQuery(query.id, { text: '⏸️ Task Queue Paused!' });
+          const text = await generateDashboardText();
+          await safeEditMessage(text + `\n\n⏸️ **System Paused:** Incoming files holding in queue.`, {
+              chat_id: chatId,
+              message_id: query.message!.message_id,
+              parse_mode: 'Markdown',
+              reply_markup: {
+                  inline_keyboard: [
+                      [
+                          { text: '🔄 Refresh Stats', callback_data: 'refresh_dashboard' },
+                          { text: '▶️ Resume Queue', callback_data: 'resume_queue_cb' }
+                      ],
+                      [
+                          { text: '📋 View Queue', callback_data: 'view_queue_cb' },
+                          { text: '🗑️ Clear Queue', callback_data: 'clear_queue_cb' }
+                      ]
+                  ]
+              }
+          }).catch(() => {});
+          return;
+      }
+
+      if (query.data === 'clear_queue_cb') {
+          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+          taskQueue.length = 0;
+          await dbClearAllTasks().catch(e => console.error("[Queue DB] Clear stats error:", e));
+          bot?.answerCallbackQuery(query.id, { text: '🧹 Pending Queue Cleared!' });
+          const text = await generateDashboardText();
+          await safeEditMessage(text + `\n\n🧹 **Queue Cleared:** All waiting items wiped clean.`, {
+              chat_id: chatId,
+              message_id: query.message!.message_id,
+              parse_mode: 'Markdown',
+              reply_markup: {
+                  inline_keyboard: [
+                      [
+                          { text: '🔄 Refresh Stats', callback_data: 'refresh_dashboard' },
+                          isQueuePaused ? { text: '▶️ Resume Queue', callback_data: 'resume_queue_cb' } : { text: '⏸️ Pause Queue', callback_data: 'pause_queue_cb' }
+                      ],
+                      [
+                          { text: '📋 View Queue', callback_data: 'view_queue_cb' },
+                          { text: '🗑️ Clear Queue', callback_data: 'clear_queue_cb' }
+                      ]
+                  ]
+              }
+          }).catch(() => {});
+          return;
+      }
+
+      if (query.data === 'view_queue_cb') {
+          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+          bot?.answerCallbackQuery(query.id, { text: '📋 Querying Queue Details...' });
+          
+          let qText = `📊 **Task Queue & Interactive Tracker**\n`;
+          qText += `===============================\n\n`;
+          qText += `• **Queue Status:** ${isQueuePaused ? '⏸️ PAUSED' : '🟢 RUNNING'}\n`;
+          qText += `• **Active Workers:** \`${activeTasksCount} / ${MAX_CONCURRENT_TASKS}\`\n`;
+          qText += `• **Pending Tasks in Queue:** \`${taskQueue.length} files\`\n\n`;
+
+          if (activeTaskJobs.size > 0) {
+              qText += `⚙️ **Currently Executing Jobs:**\n`;
+              for (const [key, job] of activeTaskJobs) {
+                  const parts = job.link.split('/');
+                  const msgId = parts[parts.length - 1] || 'Media';
+                  qText += `• **[Message ${msgId}](${job.link})** (${job.phase || 'processing'})\n`;
+                  if (job.progress) {
+                      const pct = (job.progress.percent || 0).toFixed(1);
+                      qText += `  └ \`[${pct}%]\` of \`${formatBytes(job.progress.total)}\` at \`${formatBytes(job.progress.speed)}/s\`\n`;
+                  }
+              }
+              qText += `\n`;
+          }
+
+          if (taskQueue.length === 0) {
+              qText += `📭 _No pending tasks in the queue._\n`;
+          } else {
+               qText += `⏳ **Pending Queue Tasks (First 10):**\n`;
+               for (let i = 0; i < Math.min(10, taskQueue.length); i++) {
+                   const t = taskQueue[i];
+                   const parts = t.link.split('/');
+                   const mId = parts[parts.length - 1] || 'Media';
+                   qText += `**${i + 1}.** [Msg ${mId}](${t.link}) ${t.isMirror ? '🔄' : ''}\n`;
+               }
+               if (taskQueue.length > 10) {
+                   qText += `_...and ${taskQueue.length - 10} more files wait in queue._\n`;
+               }
+               qText += `\n💡 Use \`/canceltask <index>\` to cancel or \`/prioritizetask <index>\` to prioritize.\n`;
+          }
+
+          const qKeyboard = [
+              [
+                  isQueuePaused ? { text: '▶️ Resume Queue', callback_data: 'resume_queue_cb' } : { text: '⏸️ Pause Queue', callback_data: 'pause_queue_cb' },
+                  { text: '🔄 Refresh Queue', callback_data: 'view_queue_cb' }
+              ],
+              [
+                  { text: '🔙 Back to Dashboard', callback_data: 'refresh_dashboard' }
+              ]
+          ];
+
+          await safeEditMessage(qText, {
+              chat_id: chatId,
+              message_id: query.message!.message_id,
+              parse_mode: 'Markdown',
+              disable_web_page_preview: true,
+              reply_markup: { inline_keyboard: qKeyboard }
+          }).catch(() => {});
+          return;
+      }
+
     });
 
     bot.onText(/\/ping/, (msg) => {
@@ -2324,6 +2747,30 @@ NextTaskRunAt: ${nextTaskRunAt}`;
             safeSendMessage(chatId!, `✅ Session for **${targetUid}** has been disconnected.`);
             // Refresh dashboard
             bot.processUpdate({ message: { ...query.message, text: '/login', from: query.from } } as any);
+        } else if (data.startsWith("pause_") || data.startsWith("resume_")) {
+            const jobKey = data.substring(data.indexOf('_') + 1);
+            const isPause = data.startsWith("pause_");
+            
+            const taskState = taskControlMap.get(jobKey) || { isPaused: false, shouldRetry: false };
+            taskState.isPaused = isPause;
+            taskControlMap.set(jobKey, taskState);
+            
+            await bot?.answerCallbackQuery(query.id, { text: isPause ? "⏸️ Download Paused!" : "▶️ Download Resumed!", show_alert: false });
+            
+            // Re-render buttons
+            if (query.message) {
+                const markup = createProgressMarkup(jobKey, isPause);
+                await safeBotCall('editMessageReplyMarkup', markup, {
+                    chat_id: query.message.chat.id,
+                    message_id: query.message.message_id
+                });
+            }
+        } else if (data.startsWith("retry_")) {
+            const jobKey = data.substring(data.indexOf('_') + 1);
+            const taskState = taskControlMap.get(jobKey) || { isPaused: false, shouldRetry: false };
+            taskState.shouldRetry = true;
+            taskControlMap.set(jobKey, taskState);
+            await bot?.answerCallbackQuery(query.id, { text: "🔁 Retrying download...", show_alert: false });
         }
     });
     bot.onText(/\/batch/, (msg) => handleBatch(msg.chat.id, msg.from?.id));
@@ -2373,6 +2820,7 @@ NextTaskRunAt: ${nextTaskRunAt}`;
         // 1. Stop Task Queue
         const tasksStopped = taskQueue.length;
         taskQueue.length = 0; // Clear array
+        dbClearAllTasks().catch(e => console.error("[Queue DB] failed to clear on restart:", e));
         nextTaskRunAt = null;
         report += `🛑 Tasks Stopped: \`${tasksStopped}\`\n`;
 
@@ -2502,6 +2950,75 @@ NextTaskRunAt: ${nextTaskRunAt}`;
         }
     });
 
+    bot.onText(/\/jumptopath(?:\s+(.+))?/, async (msg, match) => {
+        const fromId = msg.from?.id;
+        const chatId = msg.chat.id;
+        if (!fromId || !isAdmin(fromId)) return;
+
+        const args = match?.[1]?.trim();
+        if (!args) {
+            userActionStates[fromId] = { type: 'set_jump_to_path' };
+            return safeSendMessage(chatId, "📍 **Enter the Destination Group ID or Username:**\n\nYou can send:\n• Group/Channel ID (e.g., `-1001844729124`)\n• Channel/Group Username (e.g., `@MyOutputChannel`)\n• Access link with optional Thread/Topic ID (e.g., `https://t.me/c/1844729124 12`)\n\n_Send /cancel to cancel this prompt._", { parse_mode: 'Markdown' });
+        }
+
+        const parts = args.split(/\s+/);
+        let rawPath = parts[0];
+        let topicId: number | null = parts[1] ? parseInt(parts[1]) : null;
+
+        if (rawPath.startsWith('http://') || rawPath.startsWith('https://')) {
+            const urlParts = rawPath.split('/').filter(p => p.length > 0);
+            const domainIdx = urlParts.findIndex(p => p.includes('t.me') || p === 't.me');
+            if (domainIdx !== -1 && urlParts.length > domainIdx + 1) {
+                const nextPart = urlParts[domainIdx + 1];
+                if (nextPart === 'c' && urlParts.length > domainIdx + 2) {
+                    let channelId = urlParts[domainIdx + 2];
+                    if (!channelId.startsWith('-100') && /^\d+$/.test(channelId)) {
+                        channelId = "-100" + channelId;
+                    }
+                    rawPath = channelId;
+                    if (urlParts.length > domainIdx + 3) {
+                        const possibleMsgOrTopic = parseInt(urlParts[domainIdx + 3]);
+                        if (!isNaN(possibleMsgOrTopic) && topicId === null) {
+                            topicId = possibleMsgOrTopic;
+                        }
+                    }
+                } else {
+                    rawPath = "@" + nextPart;
+                }
+            }
+        }
+
+        if (!rawPath.startsWith('-') && !rawPath.startsWith('@') && /^[a-zA-Z]/.test(rawPath)) {
+            rawPath = "@" + rawPath;
+        }
+
+        if (approvedUsersCollection) {
+            const adminIdStr = fromId.toString();
+            const settingsUid = await resolveSettingsUserId(fromId);
+            
+            const update = { 
+                $set: { 
+                    uploadPath: rawPath,
+                    uploadTopicId: topicId || null,
+                    uploadGroupName: rawPath,
+                    uploadTopicName: topicId ? `Topic ${topicId}` : ''
+                } 
+            };
+            
+            await approvedUsersCollection.updateOne({ userId: adminIdStr }, update);
+            if (settingsUid !== adminIdStr) {
+                await approvedUsersCollection.updateOne({ userId: settingsUid }, update);
+            }
+            
+            const dest = topicId ? `${rawPath} (Topic ID: ${topicId})` : rawPath;
+            const confirmationText = `✅ **Upload Destination Saved via JumpToPath!**\n\nAll tasks will now be processed to:\n📍 \`${dest}\``;
+            
+            await safeSendMessage(chatId, confirmationText, { parse_mode: 'Markdown' });
+        } else {
+            safeSendMessage(chatId, "⚠️ **Database not ready.** Please try again.");
+        }
+    });
+
     bot.onText(/\/setcooldown(?:\s+(.+))?/, async (msg, match) => {
         const fromId = msg.from?.id;
         const chatId = msg.chat.id;
@@ -2518,6 +3035,236 @@ NextTaskRunAt: ${nextTaskRunAt}`;
     });
     bot.onText(/\/setmirror/, (msg) => handleSetMirror(msg.chat.id, msg.from?.id, msg));
     bot.onText(/\/sync/, (msg) => handleSync(msg.chat.id, msg.from?.id));
+    
+    bot.onText(/\/pausequeue/, async (msg) => {
+        const fromId = msg.from?.id;
+        const chatId = msg.chat.id;
+        if (!fromId || !isAdmin(fromId)) return;
+
+        isQueuePaused = true;
+        safeSendMessage(chatId, "⏸️ **Task Queue has been Paused!**\nNo new tasks will be processed until resumed via `/resumequeue`.", { parse_mode: 'Markdown' });
+    });
+
+    bot.onText(/\/resumequeue/, async (msg) => {
+        const fromId = msg.from?.id;
+        const chatId = msg.chat.id;
+        if (!fromId || !isAdmin(fromId)) return;
+
+        isQueuePaused = false;
+        safeSendMessage(chatId, "▶️ **Task Queue has been Resumed!**\nProcessing of queued tasks has recommenced.", { parse_mode: 'Markdown' });
+        runNextTask();
+    });
+
+    bot.onText(/\/queue/, async (msg) => {
+        const fromId = msg.from?.id;
+        const chatId = msg.chat.id;
+        if (!fromId || !isAdmin(fromId)) return;
+
+        let rText = `📊 **Task Queue & Tracker Dashboard**\n`;
+        rText += `===============================\n\n`;
+        rText += `• **Queue Status:** ${isQueuePaused ? '⏸️ PAUSED' : '🟢 RUNNING'}\n`;
+        rText += `• **Active Workers:** \`${activeTasksCount} / ${MAX_CONCURRENT_TASKS}\`\n`;
+        rText += `• **Pending Tasks in Queue:** \`${taskQueue.length} files\`\n\n`;
+
+        if (activeTaskJobs.size > 0) {
+            rText += `⚙️ **Currently Executing Jobs:**\n`;
+            for (const [key, job] of activeTaskJobs) {
+                const parts = job.link.split('/');
+                const msgId = parts[parts.length - 1] || 'Media';
+                rText += `• **[Message ${msgId}](${job.link})** (${job.phase || 'processing'})\n`;
+                if (job.progress) {
+                    const pct = (job.progress.percent || 0).toFixed(1);
+                    rText += `  └ \`[${pct}%]\` of \`${formatBytes(job.progress.total)}\` at \`${formatBytes(job.progress.speed)}/s\` (ETA: \`${job.progress.eta >= 0 ? job.progress.eta + 's' : 'N/A'}\`)\n`;
+                }
+            }
+            rText += `\n`;
+        }
+
+        if (taskQueue.length === 0) {
+            rText += `📭 _No pending tasks in the queue._\n`;
+        } else {
+            rText += `⏳ **Pending Queue Tasks (First 15):**\n`;
+            for (let i = 0; i < Math.min(15, taskQueue.length); i++) {
+                const t = taskQueue[i];
+                const parts = t.link.split('/');
+                const mId = parts[parts.length - 1] || 'Media';
+                rText += `**${i + 1}.** [Msg ${mId}](${t.link}) ${t.isMirror ? '🔄 [Mirror]' : ''}\n`;
+            }
+            if (taskQueue.length > 15) {
+                rText += `_...and ${taskQueue.length - 15} more files wait in queue._\n`;
+            }
+            rText += `\n💡 **Queue Control Actions:**\n`;
+            rText += `• Move task to front: \`/prioritizetask <index>\`\n`;
+            rText += `• Cancel task: \`/canceltask <index>\`\n`;
+            rText += `• Wipe pending: \`/clearqueue\`\n`;
+        }
+
+        const keyboard = [
+            [
+                isQueuePaused ? { text: '▶️ Resume Queue', callback_data: 'resume_queue_cb' } : { text: '⏸️ Pause Queue', callback_data: 'pause_queue_cb' },
+                { text: '🔄 Refresh Queue', callback_data: 'view_queue_cb' }
+            ],
+            [
+                { text: '🗑️ Clear Queue', callback_data: 'clear_queue_cb' }
+            ]
+        ];
+
+        safeSendMessage(chatId, rText, {
+            parse_mode: 'Markdown',
+            disable_web_page_preview: true,
+            reply_markup: { inline_keyboard: keyboard }
+        });
+    });
+
+    bot.onText(/\/canceltask(?:\s+(.+))?/, async (msg, match) => {
+        const fromId = msg.from?.id;
+        const chatId = msg.chat.id;
+        if (!fromId || !isAdmin(fromId)) return;
+
+        const argStr = match?.[1]?.trim().toLowerCase();
+        if (!argStr) {
+            return safeSendMessage(chatId, "❌ **Usage:** \`/canceltask <1-based index>\` or \`/canceltask all\`\nType \`/queue\` to view index numbers.", { parse_mode: 'Markdown' });
+        }
+
+        if (argStr === 'all') {
+            taskQueue.length = 0;
+            dbClearAllTasks().catch(e => console.error("[Queue DB] Clear cancel-all error:", e));
+            return safeSendMessage(chatId, "🗑️ **All pending tasks inside the queue have been cancelled!**", { parse_mode: 'Markdown' });
+        }
+
+        const idx = parseInt(argStr);
+        if (isNaN(idx) || idx < 1 || idx > taskQueue.length) {
+            return safeSendMessage(chatId, `❌ **Error:** Please enter a valid index number between 1 and ${taskQueue.length}.`, { parse_mode: 'Markdown' });
+        }
+
+        const removed = taskQueue.splice(idx - 1, 1)[0];
+        dbDequeueTask(removed).catch(e => console.error("[Queue DB] Dequeue cancelled task error:", e));
+
+        const parts = removed.link.split('/');
+        const msgId = parts[parts.length - 1] || 'Media';
+        safeSendMessage(chatId, `✅ **Cancelled Task #${idx}:** [Message ${msgId}](${removed.link}) has been removed from the queue.`, { parse_mode: 'Markdown', disable_web_page_preview: true });
+    });
+
+    bot.onText(/\/prioritizetask(?:\s+(.+))?/, async (msg, match) => {
+        const fromId = msg.from?.id;
+        const chatId = msg.chat.id;
+        if (!fromId || !isAdmin(fromId)) return;
+
+        const argStr = match?.[1]?.trim();
+        if (!argStr) {
+            return safeSendMessage(chatId, "❌ **Usage:** \`/prioritizetask <1-based index>\`\nThis moves a task to index 1 of the queue.", { parse_mode: 'Markdown' });
+        }
+
+        const idx = parseInt(argStr);
+        if (isNaN(idx) || idx < 1 || idx > taskQueue.length) {
+            return safeSendMessage(chatId, `❌ **Error:** Please enter a valid index number between 1 and ${taskQueue.length}.`, { parse_mode: 'Markdown' });
+        }
+
+        if (idx === 1) {
+            return safeSendMessage(chatId, "💡 **Task is already at the absolute front of the queue.**");
+        }
+
+        const chosen = taskQueue.splice(idx - 1, 1)[0];
+        taskQueue.unshift(chosen);
+        dbRequeueFrontTask(chosen).catch(e => console.error("[Queue DB] requeue front error:", e));
+
+        const parts = chosen.link.split('/');
+        const msgId = parts[parts.length - 1] || 'Media';
+        safeSendMessage(chatId, `⚡ **Task Prioritized:** [Message ${msgId}](${chosen.link}) has been elevated to index 1 and will run next!`, { parse_mode: 'Markdown', disable_web_page_preview: true });
+
+        if (!isQueuePaused) {
+            runNextTask();
+        }
+    });
+
+    bot.onText(/\/clearqueue/, async (msg) => {
+        const fromId = msg.from?.id;
+        const chatId = msg.chat.id;
+        if (!fromId || !isAdmin(fromId)) return;
+
+        taskQueue.length = 0;
+        dbClearAllTasks().catch(e => console.error("[Queue DB] clearqueue error:", e));
+        safeSendMessage(chatId, "🗑️ **Pending Queue Cleared successfully!**", { parse_mode: 'Markdown' });
+    });
+
+    bot.onText(/\/cleartopiccache/, async (msg) => {
+        const fromId = msg.from?.id;
+        const chatId = msg.chat.id;
+        if (!fromId || !isAdmin(fromId)) return;
+
+        topicMappingCache.clear();
+        safeSendMessage(chatId, "🔄 **Topic Mapping Cache Cleared!**\nAll topic IDs will be re-fetched from Telegram on the next request.", { parse_mode: 'Markdown' });
+    });
+
+    bot.onText(/\/dashboard/, async (msg) => {
+        if (!isAdmin(msg.from?.id)) return;
+        try {
+            const text = await generateDashboardText();
+            bot?.sendMessage(msg.chat.id, text, {
+                parse_mode: 'Markdown',
+                disable_web_page_preview: true,
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: '🔄 Refresh Stats', callback_data: 'refresh_dashboard' },
+                            isQueuePaused ? { text: '▶️ Resume Queue', callback_data: 'resume_queue_cb' } : { text: '⏸️ Pause Queue', callback_data: 'pause_queue_cb' }
+                        ],
+                        [
+                            { text: '📋 View Queue', callback_data: 'view_queue_cb' },
+                            { text: '🗑️ Clear Queue', callback_data: 'clear_queue_cb' }
+                        ]
+                    ]
+                }
+            });
+        } catch (err: any) {
+            safeSendMessage(msg.chat.id, `❌ **Dashboard Error:** ${err.message}`);
+        }
+    });
+
+    bot.onText(/\/speed(?:\s+(.+))?/, async (msg, match) => {
+        const fromId = msg.from?.id;
+        const chatId = msg.chat.id;
+        if (!fromId || !isAdmin(fromId)) return;
+
+        const valStr = match?.[1]?.trim();
+        if (!valStr) {
+            return safeSendMessage(chatId, 
+                `⚡ **Speed & Concurrency Configuration**\n\n` +
+                `• **Global Max Concurrent Tasks:** \`${MAX_CONCURRENT_TASKS}\`\n` +
+                `• **Max Tasks Per User:** \`${MAX_TASKS_PER_USER}\`\n\n` +
+                `To change settings, send: \`/speed <concurrency> [tasks_per_user]\`\n` +
+                `Example: \`/speed 3 3\` or \`/speed 5\``, 
+                { parse_mode: 'Markdown' }
+            );
+        }
+        
+        const args = valStr.split(/\s+/);
+        const limit = parseInt(args[0]);
+        if (isNaN(limit) || limit < 1 || limit > 20) {
+            return safeSendMessage(chatId, `❌ **Error:** Limit must be a number between 1 and 20.`);
+        }
+        
+        let perUserLimit = limit;
+        if (args[1]) {
+            const parsedPerUser = parseInt(args[1]);
+            if (!isNaN(parsedPerUser) && parsedPerUser >= 1) {
+                perUserLimit = parsedPerUser;
+            }
+        }
+        
+        MAX_CONCURRENT_TASKS = limit;
+        MAX_TASKS_PER_USER = perUserLimit;
+        
+        if (settingsCollection) {
+            await settingsCollection.updateOne(
+                { type: 'global_config' }, 
+                { $set: { maxConcurrentTasks: limit, maxTasksPerUser: perUserLimit } }, 
+                { upsert: true }
+            );
+        }
+        
+        safeSendMessage(chatId, `✅ **Speed configuration updated!**\n\n• **Global Concurrency:** \`${limit}\` concurrent tasks\n• **User Concurrency:** \`${perUserLimit}\` tasks per user`, { parse_mode: 'Markdown' });
+    });
     
     bot.onText(/\/settings/, async (msg) => {
       try {
@@ -2547,9 +3294,48 @@ NextTaskRunAt: ${nextTaskRunAt}`;
       }
     });
 
+    bot.onText(/\/help/, async (msg) => {
+        const helpText = `📖 *RESTRICTED MIRROR BOT - COMPLETE HELP GUIDE* 📖\n\n` +
+          `This guide provides a comprehensive overview of all command definitions, interactive buttons, and functional workflows for this bot.\n\n` +
+          `⚙️ **Command Reference Guide:**\n\n` +
+          `• \`/start\` 🚀 - Initializes the bot and presents the main action menu.\n` +
+          `• \`/login\` 👤 - Authenticates your Telegram account (Userbot). Required for restricted chats.\n` +
+          `• \`/settings\` ⚙️ - Accesses upload settings, custom thumbnail options, rename rules, and download engine modes.\n` +
+          `• \`/mirror\` 🔄 - Configures cloning, active live paths, or complete mirror/copy options.\n` +
+          `• \`/batch\` 📦 - Executes multi-link batch processing mode, allowing you to queue multiple links.\n` +
+          `• \`/status\` 📊 - Shows ongoing download/upload transfer progress and active mirror tasks.\n` +
+          `• \`/dashboard\` 📈 - Displays general transfer statistics: data volumes, success/failure counts.\n` +
+          `• \`/setmirror\` 📍 - Establishes a live mirroring channel or destination path directly inside a group/channel.\n` +
+          `• \`/setpath\` 🛣 - Sets the default global destination channel/group link or ID.\n` +
+          `• \`/clearmirrorhistory\` 🗑 - Clears the database of downloaded message histories so you can re-mirror identical posts.\n` +
+          `• \`/setcooldown\` ⏳ - Adjusts the delay interval between successive mirrored messages.\n` +
+          `• \`/speed\` ⚡ - Configures your userbot’s multi-thread capabilities and connection speeds.\n` +
+          `• \`/cancel\` 🛑 - Halts and aborts the currently running task (batch copy or mirror operations).\n` +
+          `• \`/logout\` 🚪 - Securely disconnects and removes your active userbot Telegram session.\n` +
+          `• \`/ping\` 🏓 - Verifies the latency and responds with active server connection status.\n` +
+          `• \`/restart\` 🔄 - Restarts the bot application instance (Admin restricted).\n` +
+          `• \`/sync\` 🔄 - Re-synchronizes any active mirror paths and session keys.\n\n` +
+          `--- \n\n` +
+          `🖱 **Interactive Touch Elements & Buttons:**\n\n` +
+          `• **Login / Authenticate** 🔑 - Prompts you to paste a standard \`STRING_SESSION\` to authenticate.\n` +
+          `• **Batch** 📦 - Starts input prompting to process a bulk queue of distinct message links.\n` +
+          `• **Mirror** 🔄 - Opens choices to initiate clones, specific topic clones, or setup live mirroring channels.\n` +
+          `• **Settings** ⚙️ - Interactively updates custom thumbnails, adds/removes filename rename rules, and toggles engines.\n` +
+          `• **Logout** 🚪 - Terminates and removes any saved userbot session.\n` +
+          `• **Cancel** 🛑 - Stops the active long-running mirroring or batch download gracefully.\n` +
+          `• **Official Channel** 📢 - Direct link to open the official destination channel.\n` +
+          `• **Help** ❓ - Re-displays this complete interactive help guide in English.`;
+        bot?.sendMessage(msg.chat.id, helpText, { parse_mode: 'Markdown' });
+    });
+
     // Helper to get or create topic by name
-const getOrCreateTopic = async (client: TelegramClient, channelEntity: any, topicName: string) => {
+const getOrCreateTopic = async (client: TelegramClient, channelEntity: any, topicName: string): Promise<{ topicId?: number; error?: string }> => {
     try {
+        const cacheKey = `${channelEntity.id}:${topicName.trim().toLowerCase()}`;
+        if (topicMappingCache.has(cacheKey)) {
+             return { topicId: topicMappingCache.get(cacheKey) };
+        }
+
         const destTopics: any = await client.invoke(new Api.channels.GetForumTopics({
             channel: channelEntity,
             limit: 500
@@ -2558,7 +3344,8 @@ const getOrCreateTopic = async (client: TelegramClient, channelEntity: any, topi
         const found = destTopics.topics?.find((t: any) => t.title?.trim().toLowerCase() === topicName.trim().toLowerCase());
         if (found) {
             console.log(`[TopicMgr] Found existing topic "${topicName}" -> ID: ${found.id}`);
-            return found.id;
+            topicMappingCache.set(cacheKey, found.id);
+            return { topicId: found.id };
         }
 
         console.log(`[TopicMgr] Creating new topic "${topicName}"...`);
@@ -2567,16 +3354,172 @@ const getOrCreateTopic = async (client: TelegramClient, channelEntity: any, topi
             title: topicName
         }));
         const update = createResult.updates?.find((u: any) => u.className === 'UpdateNewForumTopic');
-        return update?.topicId;
+        if (update?.topicId) {
+            topicMappingCache.set(cacheKey, update.topicId);
+            return { topicId: update.topicId };
+        }
+        // Fallback: Scan if not found in updates
+        const retryTopics: any = await client.invoke(new Api.channels.GetForumTopics({ channel: channelEntity, limit: 200 }));
+        const foundRetry = retryTopics.topics?.find((t: any) => t.title?.trim().toLowerCase() === topicName.trim().toLowerCase());
+        if (foundRetry) {
+            topicMappingCache.set(cacheKey, foundRetry.id);
+            return { topicId: foundRetry.id };
+        }
+        return { error: "Could not find UpdateNewForumTopic in creation updates nor in subsequent scan" };
     } catch (err: any) {
         console.error(`[TopicMgr] Error in getOrCreateTopic for ${topicName}: ${err.message}`);
         // Retry scan
         try {
             const retryTopics: any = await client.invoke(new Api.channels.GetForumTopics({ channel: channelEntity, limit: 200 }));
-            return retryTopics.topics?.find((t: any) => t.title?.trim().toLowerCase() === topicName.trim().toLowerCase())?.id;
-        } catch { return undefined; }
+            const retryFound = retryTopics.topics?.find((t: any) => t.title?.trim().toLowerCase() === topicName.trim().toLowerCase())?.id;
+            if (retryFound) {
+                topicMappingCache.set(`${channelEntity.id}:${topicName.trim().toLowerCase()}`, retryFound);
+                return { topicId: retryFound };
+            }
+            return { error: `${err.message} (Retry topic scan of existing topics also returned no match)` };
+        } catch (retryErr: any) { 
+            return { error: `${err.message} (Retry scan failed: ${retryErr.message})` }; 
+        }
     }
 };
+interface ActiveJob {
+    link: string;
+    chatId: number;
+    userId: number;
+    phase: 'searching' | 'downloading' | 'uploading' | 'cooldown';
+    isMirror?: boolean;
+    progress?: {
+        total: number;
+        current: number;
+        speed: number;
+        percent: number;
+        elapsed: number;
+        eta: number;
+    };
+    cooldownRemaining?: number;
+    startTime: number;
+}
+const activeTaskJobs = new Map<string, ActiveJob>();
+
+function formatBytes(bytes: number, decimals = 2) {
+    if (!bytes || isNaN(bytes) || bytes <= 0) return '0 Bytes';
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+}
+
+async function generateDashboardText() {
+    const activeTasks = activeTasksCount;
+    const queueLen = taskQueue.length;
+    const dbStatusText = dbStatus === 'Connected' ? '🟢 Connected' : '🔴 Disconnected';
+
+    const formatDashboardTime = (s: number) => {
+        if (s <= 0) return "0s";
+        if (s < 60) return `${Math.round(s)}s`;
+        const m = Math.floor(s / 60);
+        const sec = Math.round(s % 60);
+        return `${m}m ${sec}s`;
+    };
+
+    // 1. Batch Sync Status Summary
+    const totalBatches = batchStatusMap.size;
+    let activeBatchesText = '';
+    let activeBatchesCount = 0;
+    let completedBatchesCount = 0;
+
+    for (const [batchId, info] of batchStatusMap) {
+        const remaining = info.total - info.processed;
+        if (remaining > 0) {
+            activeBatchesCount++;
+            const progress = info.total > 0 ? Math.floor((info.processed / info.total) * 100) : 0;
+            const barLength = 10;
+            const filled = Math.round((progress / 100) * barLength);
+            const bar = '█'.repeat(filled) + '░'.repeat(barLength - filled);
+            const elapsed = (Date.now() - info.startTime) / 1000;
+            
+            activeBatchesText += `• **Batch:** \`${batchId.substring(0, 8)}\`\n`;
+            activeBatchesText += `  ├─ **Progress:** \`[${bar}]\` **${progress}%**\n`;
+            activeBatchesText += `  ├─ **Processed:** \`${info.processed} / ${info.total}\` (Success: \`${info.success}\` | Failed: \`${info.failed}\`)\n`;
+            activeBatchesText += `  ├─ **Current:** \`${info.currentLink ? info.currentLink.split('/').pop() : 'Idle'}\`\n`;
+            activeBatchesText += `  └─ **Running:** \`${formatDashboardTime(elapsed)}\`\n`;
+        } else {
+            completedBatchesCount++;
+        }
+    }
+
+    if (activeBatchesCount === 0) {
+        activeBatchesText = `_No active batch synchronizations running._`;
+    }
+
+    // 2. Active Mirror Jobs & Standalone Jobs
+    let activeMirrorText = '';
+    let activeTaskText = '';
+    let activeMirrorCount = 0;
+    let activeTaskCount = 0;
+
+    for (const [key, job] of activeTaskJobs) {
+        const linkParts = job.link.split('/');
+        const msgId = linkParts[linkParts.length - 1] || 'Media';
+        
+        let jobText = `• **Task:** [Message ${msgId}](${job.link})\n`;
+        jobText += `  ├─ **Phase:** `;
+        if (job.phase === 'searching') jobText += `🔍 Searching/Resolving source\n`;
+        else if (job.phase === 'cooldown') jobText += `⏳ In Cooldown (${job.cooldownRemaining || 0}s remaining)\n`;
+        else if (job.phase === 'downloading') jobText += `📥 Downloading from Telegram\n`;
+        else if (job.phase === 'uploading') jobText += `📤 Uploading to Destination\n`;
+        
+        if (job.progress) {
+            const progress = job.progress;
+            const barLength = 10;
+            const percentVal = Math.min(100, Math.max(0, progress.percent || 0));
+            const filledLength = Math.round((percentVal / 100) * barLength);
+            const emptyLength = barLength - filledLength;
+            const bar = '█'.repeat(filledLength) + '░'.repeat(emptyLength);
+            
+            jobText += `  ├─ **Progress:** \`[${bar}]\` **${percentVal.toFixed(1)}%**\n`;
+            jobText += `  ├─ **Size:** \`${formatBytes(progress.current)} / ${formatBytes(progress.total)}\`\n`;
+            jobText += `  ├─ **Speed:** \`${formatBytes(progress.speed)}/s\`\n`;
+            jobText += `  └─ **Time:** Elapsed \`${progress.elapsed}s\` | ETA \`${progress.eta >= 0 ? progress.eta + 's' : 'N/A'}\`\n`;
+        }
+        jobText += `  -----------------------------\n`;
+
+        if (job.isMirror) {
+            activeMirrorText += jobText;
+            activeMirrorCount++;
+        } else {
+            activeTaskText += jobText;
+            activeTaskCount++;
+        }
+    }
+
+    if (activeMirrorCount === 0) {
+        activeMirrorText = `_No active mirror tasks running._`;
+    }
+    if (activeTaskCount === 0) {
+        activeTaskText = `_No active standalone downloads running._`;
+    }
+
+    return `📊 **Mirror Control Center & Dynamic Dashboard**\n` +
+           `===============================\n\n` +
+           `🖥 **System Health:**\n` +
+           `• **Database:** ${dbStatusText}\n` +
+           `• **Task Scheduler:** \`${activeTasks} active / ${MAX_CONCURRENT_TASKS} max concurrent\`\n` +
+           `• **Pending Queue:** \`${queueLen} files waiting\`\n\n` +
+           `⚡ **Dynamic Speed Settings:**\n` +
+           `• **Concurrency limit:** \`${MAX_CONCURRENT_TASKS} concurrent tasks\`\n` +
+           `• **Max Tasks Per User:** \`${MAX_TASKS_PER_USER} tasks/user\`\n\n` +
+           `📦 **Batch Sync Status Summary:**\n` +
+           `• **Total Batches:** \`${totalBatches}\` | **Active:** \`${activeBatchesCount}\` | **Completed:** \`${completedBatchesCount}\`\n` +
+           `${activeBatchesText}\n\n` +
+           `🔄 **Mirror Active Jobs:**\n` +
+           `${activeMirrorText}\n\n` +
+           `📥 **Standalone Active Jobs:**\n` +
+           `${activeTaskText}\n\n` +
+           `🕒 _Last updated: ${new Date().toISOString().replace('T', ' ').substring(0, 19)} UTC_`;
+}
+
 const lastTaskTimePerUser = new Map<number, number>();
 
 interface BatchInfo {
@@ -2646,8 +3589,108 @@ const refreshBatchSummary = async (batchId: string, force = false) => {
     });
 };
 
-const runNextTask = async () => {
+async function dbEnqueueTask(task: Task) {
+    if (!task.id) {
+        task.id = Date.now().toString(36) + Math.random().toString(36).substring(2, 8);
+    }
+    if (queuedTasksCollection) {
+        try {
+            await queuedTasksCollection.insertOne({
+                id: task.id,
+                chatId: task.chatId,
+                userId: task.userId,
+                link: task.link,
+                statusMsgId: task.statusMsgId,
+                batchId: task.batchId,
+                overrideThreadId: task.overrideThreadId,
+                forceGeneralPath: task.forceGeneralPath,
+                overrideTargetId: task.overrideTargetId,
+                isMirror: task.isMirror,
+                createdAt: new Date()
+            });
+        } catch (err) {
+            console.error('[DB Queue] Error inserting task:', err);
+        }
+    }
+}
+
+async function dbEnqueueTasks(tasks: Task[]) {
+    if (tasks.length === 0) return;
+    for (const t of tasks) {
+        if (!t.id) {
+            t.id = Date.now().toString(36) + Math.random().toString(36).substring(2, 8);
+        }
+    }
+    if (queuedTasksCollection) {
+        try {
+            const docs = tasks.map(t => ({
+                id: t.id,
+                chatId: t.chatId,
+                userId: t.userId,
+                link: t.link,
+                statusMsgId: t.statusMsgId,
+                batchId: t.batchId,
+                overrideThreadId: t.overrideThreadId,
+                forceGeneralPath: t.forceGeneralPath,
+                overrideTargetId: t.overrideTargetId,
+                isMirror: t.isMirror,
+                createdAt: new Date()
+            }));
+            await queuedTasksCollection.insertMany(docs);
+        } catch (err) {
+            console.error('[DB Queue] Error inserting bulk tasks:', err);
+        }
+    }
+}
+
+async function dbDequeueTask(task: Task) {
+    if (queuedTasksCollection && task.id) {
+        try {
+            await queuedTasksCollection.deleteOne({ id: task.id });
+        } catch (err) {
+            console.error('[DB Queue] Error deleting task:', err);
+        }
+    }
+}
+
+async function dbRequeueFrontTask(task: Task) {
+    if (queuedTasksCollection && task.id) {
+        try {
+            await queuedTasksCollection.insertOne({
+                id: task.id,
+                chatId: task.chatId,
+                userId: task.userId,
+                link: task.link,
+                statusMsgId: task.statusMsgId,
+                batchId: task.batchId,
+                overrideThreadId: task.overrideThreadId,
+                forceGeneralPath: task.forceGeneralPath,
+                overrideTargetId: task.overrideTargetId,
+                isMirror: task.isMirror,
+                createdAt: new Date(Date.now() - 3600000)
+            });
+        } catch (err) {
+            console.error('[DB Queue] Error requeuing front task:', err);
+        }
+    }
+}
+
+async function dbClearAllTasks() {
+    if (queuedTasksCollection) {
+        try {
+            await queuedTasksCollection.deleteMany({});
+        } catch (err) {
+            console.error('[DB Queue] Error clearing tasks:', err);
+        }
+    }
+}
+
+runNextTask = async () => {
     console.log(`[Queue] runNextTask started. activeTasksCount: ${activeTasksCount}, queueLength: ${taskQueue.length}`);
+    if (isQueuePaused) {
+        console.log(`[Queue] Queue is currently PAUSED. Aborting execution.`);
+        return;
+    }
     if (activeTasksCount >= MAX_CONCURRENT_TASKS || taskQueue.length === 0) {
         console.log(`[Queue] Hit limit or empty queue. Aborting runNextTask.`);
         return;
@@ -2675,14 +3718,41 @@ const runNextTask = async () => {
         return;
     }
 
+    // Force sequential: if any task is already active globally, do not start
+    if (activeTasksCount > 0) {
+        console.log(`[Queue] Another task is already active. Sequential mode enforced.`);
+        return;
+    }
+
+    // Check if the task is stuck (if it takes too long or failed before)
+    // Here we can just ensure that if the queue runner is called, 
+    // it will always pick the oldest (or next) task sequentially.
+    // The current implementation of taskQueue.splice(taskIndex, 1)[0] 
+    // and the check `if (activeTasksCount > 0) return;` 
+    // already enforces sequential execution (MaxActive=1).
+    // The user also mentioned "stuck files" or "failed files" 
+    // need to be retried automatically. 
+    // The retry logic is already in place.
+    
     // Capture the task and check if we can immediately trigger another worker for the next slot
     const task = taskQueue.splice(taskIndex, 1)[0];
+    dbDequeueTask(task).catch(e => console.error("[Queue DB] dequeue error:", e));
     const fromId = task.userId;
     const fromIdKey = getTaskUserKey(fromId);
 
     activeTasksCount++;
     const currentActiveForUser = (activeTasksPerUser.get(fromIdKey) || 0) + 1;
     activeTasksPerUser.set(fromIdKey, currentActiveForUser);
+
+    const jobKey = `${task.userId}-${task.link}`;
+    activeTaskJobs.set(jobKey, {
+        link: task.link,
+        chatId: task.chatId,
+        userId: task.userId,
+        phase: 'searching',
+        startTime: Date.now(),
+        isMirror: task.isMirror
+    });
     
     console.log(`[Queue] Task assigned. activeTasksCount: ${activeTasksCount}, User ${fromIdKey} active: ${currentActiveForUser}`);
     
@@ -2692,6 +3762,7 @@ const runNextTask = async () => {
         setImmediate(runNextTask);
     }
 
+    let statusMsgId = task.statusMsgId || 0;
     try {
         // Update batch info if applicable
         if (task.batchId) {
@@ -2704,7 +3775,6 @@ const runNextTask = async () => {
         }
 
         // Send individual status message one-by-one if not exists
-        let statusMsgId = task.statusMsgId;
         if (!statusMsgId) {
             console.log(`[Queue] Sending initial searching message...`);
             const msgId = task.link.split('/').pop() || 'media';
@@ -2734,8 +3804,17 @@ const runNextTask = async () => {
             const timeDiff = taskNow - userLastTaskTime;
             if (timeDiff < cooldownMs) {
                 const waitSecs = Math.ceil((cooldownMs - timeDiff) / 1000);
+                const jobKey = `${task.userId}-${task.link}`;
+                const job = activeTaskJobs.get(jobKey);
+                if (job) {
+                    job.phase = 'cooldown';
+                    job.cooldownRemaining = waitSecs;
+                }
                 console.log(`[Queue] Throttling for ${waitSecs}s due to ${cooldownSecs}s cooldown.`);
                 for (let i = waitSecs; i > 0; i--) {
+                    if (job) {
+                        job.cooldownRemaining = i;
+                    }
                     await safeEditMessage(`⏳ **Cooldown:** Waiting ${i} seconds to avoid Telegram API limit before downloading next file...`, { chat_id: task.chatId, message_id: statusMsgId });
                     await sleep(1000);
                 }
@@ -2746,14 +3825,21 @@ const runNextTask = async () => {
         console.log(`[Queue] Starting processTask for link ${task.link}`);
         let success = false;
         try {
-            const timeoutPromise = new Promise<boolean>((_, reject) => setTimeout(() => reject(new Error("Global Task Timeout (15 minutes)")), 15 * 60 * 1000));
+            const timeoutPromise = new Promise<boolean>((_, reject) => setTimeout(() => reject(new Error("Global Task Timeout (90 minutes)")), 90 * 60 * 1000));
             success = await Promise.race([
                 processTask(task.chatId, task.link, statusMsgId, fromId, task.overrideThreadId, task.forceGeneralPath, task.overrideTargetId, task.isMirror),
                 timeoutPromise
             ]);
         } catch (taskErr: any) {
             console.error(`[Queue] processTask timed out or threw natively:`, taskErr);
-            await safeEditMessage(`❌ **Task Timeout/Error:** ${taskErr.message}`, { chat_id: task.chatId, message_id: statusMsgId });
+            task.retries = (task.retries || 0) + 1;
+            if (task.retries <= 3) {
+                console.log(`[Queue] Retrying task (Retry ${task.retries}/3)`);
+                taskQueue.unshift(task); // Re-queue at the front
+                await safeEditMessage(`⚠️ **Task Error:** ${taskErr.message}\nRetrying (${task.retries}/3)...`, { chat_id: task.chatId, message_id: statusMsgId });
+            } else {
+                await safeEditMessage(`❌ **Task Failed:** ${taskErr.message} (Max retries reached)`, { chat_id: task.chatId, message_id: statusMsgId });
+            }
             success = false;
         }
         console.log(`[Queue] processTask finished with success=${success}`);
@@ -2777,12 +3863,15 @@ const runNextTask = async () => {
             await safeEditMessage(`⚠️ **429 Too Many Requests:** Telegram limitation active. Retrying automatically in ${retryAfter} seconds...`, { chat_id: task.chatId, message_id: statusMsgId });
             // Put the task back at the front if it failed due to 429
             taskQueue.unshift(task);
+            dbRequeueFrontTask(task).catch(e => console.error("[Queue DB] requeue front error:", e));
             setTimeout(runNextTask, retryAfter * 1000);
             // activeTasksCount-- needs to be removed from here because it's handled in finally
             activeTasksPerUser.set(fromIdKey, Math.max(0, (activeTasksPerUser.get(fromIdKey) || 1) - 1));
             return;
         }
     } finally {
+        const jobKey = `${task.userId}-${task.link}`;
+        activeTaskJobs.delete(jobKey);
         activeTasksCount--;
         activeTasksPerUser.set(fromIdKey, Math.max(0, (activeTasksPerUser.get(fromIdKey) || 1) - 1));
         console.log(`[Queue] Finally block hit. activeTasksCount is now ${activeTasksCount}, User ${fromIdKey} active: ${activeTasksPerUser.get(fromIdKey)}`);
@@ -2922,14 +4011,17 @@ async function catchUpLiveMirrors(userId: number, client: TelegramClient) {
                         // Notify user about start
                         bot?.sendMessage(userId, `🚀 **Live Mirror Detected New Content!**\n\nStarting download for: ${virtualLink}`, { parse_mode: 'Markdown' }).catch(() => {});
 
-                        taskQueue.push({
+                        const newTask = {
                             chatId: userId,
                             link: virtualLink,
                             userId: userId,
                             overrideThreadId: destTopicId,
                             overrideTargetId: destId,
-                            isMirror: true
-                        });
+                            isMirror: true,
+                            retries: 0
+                        };
+                        taskQueue.push(newTask);
+                        dbEnqueueTask(newTask).catch(e => console.error("[Queue DB] enqueue error:", e));
 
                         pathObj.lastProcessedMsgId = m.id;
                     }
@@ -3117,14 +4209,29 @@ startAutoMirrorWatcher = async (userId: number, client: TelegramClient) => {
 
                 console.log(`[Watcher] Queuing mirror task: ${virtualLink} -> Topic ${destTopicId || 'General'}`);
                 
-                taskQueue.push({
+                // --- INCREMENTAL MIRRORING CHECK ---
+                if (mirroredMessagesCollection) {
+                    const alreadyMirrored = await mirroredMessagesCollection.findOne({ link: virtualLink, destId: match.destId });
+                    if (alreadyMirrored) {
+                        console.log(`[Watcher] Message already mirrored, skipping: ${virtualLink}`);
+                        return;
+                    }
+                }
+                
+                // Notify user about start
+                bot?.sendMessage(userId, `🚀 **Live Mirror Detected New Content!**\n\nStarting download for: ${virtualLink}`, { parse_mode: 'Markdown' }).catch(() => {});
+
+                const newTask = {
                     chatId: userId, 
                     link: virtualLink,
                     userId: userId,
                     overrideThreadId: destTopicId,
                     overrideTargetId: match.destId,
-                    isMirror: true
-                });
+                    isMirror: true,
+                    retries: 0
+                };
+                taskQueue.push(newTask);
+                dbEnqueueTask(newTask).catch(e => console.error("[Queue DB] enqueue error:", e));
                 
                 runNextTask();
                 
@@ -3255,12 +4362,18 @@ getConnectedUserbotClient = async (userId: number) => {
     }
 };
 
-    const createProgressBar = (total: number, current: number, label: string, startTime: number) => {
+    const createProgressBar = (total: number, current: number, label: string, startTime: number, pathStr?: string) => {
         const percentage = Math.min(100, Math.max(0, Math.floor((current / total) * 100)));
-        const size = 18;
+        const size = 12;
         const filled = Math.floor((size * current) / total);
         const empty = size - filled;
-        const progressBar = "█".repeat(filled) + "░".repeat(empty);
+        
+        const colors = ["🟥", "🟧", "🟨", "🟩", "🟦", "🟪"];
+        let progressBar = "";
+        for(let i = 0; i < filled; i++) {
+            progressBar += colors[Math.floor((i / size) * colors.length)];
+        }
+        progressBar += "⬜".repeat(empty);
         
         const now = Date.now();
         const elapsed = (now - startTime) / 1000;
@@ -3289,23 +4402,30 @@ getConnectedUserbotClient = async (userId: number) => {
             return `${hours}h ${mins}m`;
         };
 
-        const icon = label === "Downloading" ? "DOWNLOAD" : "UPLOAD";
+        const icon = label === "Downloading" ? "⬇️" : "⬆️";
         const meta = label === "Downloading" ? "Server ⟿ Bot" : "Bot ⟿ Your Chat";
 
-        // Slower updates for human-like profile (every 5 seconds)
-        const text = `╔═ ${icon} STATUS ═╗\n` +
-               `${percentage}% ${progressBar}\n\n` +
-               `📦 Size:  ${formatBytes(current)} / ${formatBytes(total)}\n` +
-               `⚡Speed: ${formatBytes(speed)}/s\n` +
-               `⏳EST: ${formatTime(eta)}\n` +
-               `╚══════════════════╝\n\n` +
-               `🛡 Mode: VPS-Turbo (${currentUploadEngine})\n` +
-               `🛰 Route: ${meta}`;
+        // Enhanced progress tracker
+        const text = `╔═══ ${icon} ${label.toUpperCase()} ═══╗\n` +
+               `║ ${progressBar} ${percentage}%\n` +
+               `╠══════════════════════╣\n` +
+               `║ 📦 𝗦𝗶𝘇𝗲   : ${formatBytes(current)} / ${formatBytes(total)}\n` +
+               `║ ⚡ 𝗦𝗽𝗲𝗲𝗱  : ${formatBytes(speed)}/s\n` +
+               `║ ⏳ 𝗘𝗧𝗔    : ${formatTime(eta)}\n` +
+               `╠══════════════════════╣\n` +
+               `║ 🚀 𝗠𝗼𝗱𝗲   : ${currentUploadEngine}\n` +
+               `║ 🛰 𝗥𝗼𝘂𝘁𝗲  : ${meta}\n` +
+               `║ 👣 𝗣𝗮𝘁𝗵    : ${pathStr || 'N/A'}\n` +
+               `╚══════════════════════╝`;
         return text;
     };
 
-    // Access memory: Stores which account worked for which channel (channelId -> userId)
-    const chatAccessCache = new Map<string, number>();
+    const createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
+        inline_keyboard: [[
+            { text: isPaused ? '▶️ Resume' : '⏸️ Pause', callback_data: `${isPaused ? 'resume' : 'pause'}_${jobKey}` },
+            { text: '🔁 Retry', callback_data: `retry_${jobKey}` }
+        ]]
+    });
 
     const getBestClientForLinkData = async (linkData: any, preferredUserIdParam: number, statusMsgId?: number, chatId?: number) => {
         const preferredUserId = Number(await resolveSettingsUserId(preferredUserIdParam)) || preferredUserIdParam;
@@ -3314,11 +4434,39 @@ getConnectedUserbotClient = async (userId: number) => {
         const client = await getConnectedUserbotClient(preferredUserId);
         if (client) {
             try {
-                const entity = await safelyResolveEntity(client, linkData.channelId).catch(() => null);
+                let entity = await safelyResolveEntity(client, linkData.channelId).catch(() => null);
+                if (!entity && !linkData.isRestricted && typeof linkData.channelId === 'string' && !linkData.channelId.startsWith('-')) {
+                    try {
+                        await client.invoke(new Api.channels.JoinChannel({ channel: linkData.channelId }));
+                        entity = await safelyResolveEntity(client, linkData.channelId).catch(() => null);
+                    } catch (joinErr) {}
+                }
                 if (entity) {
                     const msgs = await client.getMessages(entity, { ids: [linkData.msgId] });
                     if (msgs && msgs.length > 0 && !(msgs[0] instanceof Api.MessageEmpty)) {
                         return { client, userId: preferredUserId, peer: entity };
+                    }
+                }
+            } catch (e) {}
+        }
+
+        // --- SMART ROUTING CRITICAL FALLBACK ---
+        // Try other active connected clients to see if they can access the channel/message
+        for (const [vId, otherClient] of userClients.entries()) {
+            if (vId === preferredUserId) continue;
+            try {
+                let entity = await safelyResolveEntity(otherClient, linkData.channelId).catch(() => null);
+                if (!entity && !linkData.isRestricted && typeof linkData.channelId === 'string' && !linkData.channelId.startsWith('-')) {
+                    try {
+                        await otherClient.invoke(new Api.channels.JoinChannel({ channel: linkData.channelId }));
+                        entity = await safelyResolveEntity(otherClient, linkData.channelId).catch(() => null);
+                    } catch (joinErr) {}
+                }
+                if (entity) {
+                    const msgs = await otherClient.getMessages(entity, { ids: [linkData.msgId] });
+                    if (msgs && msgs.length > 0 && !(msgs[0] instanceof Api.MessageEmpty)) {
+                        console.log(`[Smart Route] Routed fetch of msg ${linkData.msgId} from preferred user ${preferredUserId} to active user ${vId}`);
+                        return { client: otherClient, userId: vId, peer: entity };
                     }
                 }
             } catch (e) {}
@@ -3334,8 +4482,33 @@ getConnectedUserbotClient = async (userId: number) => {
         const prefClient = await getConnectedUserbotClient(preferredUserId);
         if (prefClient) {
             try {
-                const entity = await safelyResolveEntity(prefClient, targetId).catch(() => null);
+                let entity = await safelyResolveEntity(prefClient, targetId).catch(() => null);
+                if (!entity && typeof targetId === 'string' && !targetId.startsWith('-') && !targetId.startsWith('{')) {
+                    try {
+                        await prefClient.invoke(new Api.channels.JoinChannel({ channel: targetId }));
+                        entity = await safelyResolveEntity(prefClient, targetId).catch(() => null);
+                    } catch (joinErr) {}
+                }
                 if (entity) return { client: prefClient, userId: preferredUserId, peer: entity };
+            } catch (e) {}
+        }
+
+        // --- SMART ROUTING CRITICAL FALLBACK ---
+        // Try other active connected clients to see if they can access the destination target
+        for (const [vId, otherClient] of userClients.entries()) {
+            if (vId === preferredUserId) continue;
+            try {
+                let entity = await safelyResolveEntity(otherClient, targetId).catch(() => null);
+                if (!entity && typeof targetId === 'string' && !targetId.startsWith('-') && !targetId.startsWith('{')) {
+                    try {
+                        await otherClient.invoke(new Api.channels.JoinChannel({ channel: targetId }));
+                        entity = await safelyResolveEntity(otherClient, targetId).catch(() => null);
+                    } catch (joinErr) {}
+                }
+                if (entity) {
+                    console.log(`[Smart Route] Routed destination ${targetId} from preferred user ${preferredUserId} to active user ${vId}`);
+                    return { client: otherClient, userId: vId, peer: entity };
+                }
             } catch (e) {}
         }
         
@@ -3395,9 +4568,10 @@ getConnectedUserbotClient = async (userId: number) => {
             let threadId: number | undefined = threadIdOverride;
             console.log(`[Debug ProcessTask] targetIdOverride: ${targetIdOverride}, threadIdOverride: ${threadIdOverride}, uploadTarget: ${uploadTarget}, threadId: ${threadId}`);
 
+            let mirrorPath: any = undefined;
             if (targetIdOverride === undefined) {
                 const sourceId = linkData.channelId;
-                const mirrorPath = (isMirror || !forceGeneralPath) ? userDoc?.mirrorPaths?.find((p: any) => 
+                mirrorPath = (isMirror || !forceGeneralPath) ? userDoc?.mirrorPaths?.find((p: any) => 
                      p.sourceId === sourceId || p.sourceId === `-100${sourceId}` || sourceId === p.sourceId.replace('-100', '')
                 ) : undefined;
 
@@ -3416,6 +4590,19 @@ getConnectedUserbotClient = async (userId: number) => {
             const { client: destClient, peer: destPeer } = await getBestClientForTarget(uploadTarget, userId, statusMsgId, chatId);
             
             let finalDestPeer = destPeer;
+            
+            // Construct path display
+            let destName = "Target";
+            let destTopic = "";
+            if (isMirror && mirrorPath) {
+                destName = mirrorPath.destGroupName || "Mirror Target";
+                destTopic = mirrorPath.destTopicName || "";
+            } else {
+                destName = userDoc?.uploadGroupName || "Group";
+                destTopic = userDoc?.uploadTopicName || "";
+            }
+            const pathDisplay = `${destName}${destTopic ? ' > ' + destTopic : ''}`;
+
             if (!finalDestPeer || (finalDestPeer.className === 'InputPeerChannel' && finalDestPeer.accessHash?.toString() === '0')) {
                 try {
                     // Pre-flight check to fail early before downloading/uploading
@@ -3463,9 +4650,12 @@ getConnectedUserbotClient = async (userId: number) => {
                     if (msg && !(msg instanceof Api.MessageEmpty)) break;
                     
                     console.log(`[Debug] sourceClient returned empty, trying destClient.`);
-                    const destMessages = await destClient.getMessages(sourcePeer, { ids: [linkData.msgId] });
-                    msg = destMessages?.[0];
-                    if (msg && !(msg instanceof Api.MessageEmpty)) break;
+                    const destSourcePeer = (destClient === sourceClient) ? sourcePeer : await safelyResolveEntity(destClient, linkData.channelId).catch(() => null);
+                    if (destSourcePeer) {
+                        const destMessages = await destClient.getMessages(destSourcePeer, { ids: [linkData.msgId] });
+                        msg = destMessages?.[0];
+                        if (msg && !(msg instanceof Api.MessageEmpty)) break;
+                    }
 
                     throw new Error("ENTITY_ACCESS_STALE");
                 } catch (err: any) {
@@ -3547,6 +4737,7 @@ getConnectedUserbotClient = async (userId: number) => {
 
             await safeEditMessage(`📥 **Downloading via Source Account...**`, { chat_id: chatId, message_id: statusMsgId });
             
+            console.log(`[Debug] Downloading message. msg: ${JSON.stringify(msg, (key, value) => (typeof value === 'bigint' ? value.toString() : value), 2)}`);                
             let filename = "file";
             if (msg.media instanceof Api.MessageMediaDocument && msg.media.document instanceof Api.Document) {
                 const attr = msg.media.document.attributes.find(a => a instanceof Api.DocumentAttributeFilename);
@@ -3590,18 +4781,106 @@ getConnectedUserbotClient = async (userId: number) => {
             }
             
             let lastDownloadUpdate = 0;
-            await sourceClient.downloadMedia(msg, {
-                outputFile: tempFilePath,
-                progressCallback: (c, t) => {
-                    const now = Date.now();
-                    if (now - lastDownloadUpdate > 2000 || Number(c) === Number(t)) {
-                        lastDownloadUpdate = now;
-                        safeEditMessage(createProgressBar(Number(t || 0), Number(c), "Downloading", downloadStartTime), { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown' }).catch(() => {});
+            const jobKey = `${userId}-${link}`;
+            const tryDownload = async () => {
+                await sourceClient.downloadMedia(msg, {
+                    outputFile: tempFilePath,
+                    progressCallback: async (c, t) => {
+                        // Pause check
+                        while (true) {
+                             const taskState = taskControlMap.get(jobKey);
+                             if (taskState && taskState.isPaused) {
+                                 await new Promise(resolve => setTimeout(resolve, 1000));
+                             } else {
+                                 break;
+                             }
+                        }
+
+                        const now = Date.now();
+                        const totalBytes = Number(t || 0);
+                        const currentBytes = Number(c);
+                        const elapsed = (now - downloadStartTime) / 1000;
+                        const speed = elapsed > 0 ? (currentBytes / elapsed) : 0;
+                        const percent = totalBytes > 0 ? ((currentBytes / totalBytes) * 100) : 0;
+                        const eta = speed > 0 && totalBytes > 0 ? Math.max(0, (totalBytes - currentBytes) / speed) : -1;
+
+                        const job = activeTaskJobs.get(jobKey);
+                        if (job) {
+                            job.phase = 'downloading';
+                            job.progress = {
+                                total: totalBytes,
+                                current: currentBytes,
+                                speed: speed,
+                                percent: percent,
+                                elapsed: Math.floor(elapsed),
+                                eta: Math.round(eta)
+                            };
+                        }
+
+                        if (now - lastDownloadUpdate > 2000 || currentBytes === totalBytes) {
+                            lastDownloadUpdate = now;
+                            const isPaused = taskControlMap.get(jobKey)?.isPaused || false;
+                            safeEditMessage(createProgressBar(totalBytes, currentBytes, "Downloading", downloadStartTime, pathDisplay), { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown', reply_markup: createProgressMarkup(jobKey, isPaused) }).catch(() => {});
+                        }
                     }
+                });
+            };
+
+            let downloadDone = false;
+            while (!downloadDone) {
+                try {
+                    await tryDownload();
+                    downloadDone = true;
+                } catch (err: any) {
+                    const taskState = taskControlMap.get(jobKey);
+                    if (taskState && taskState.shouldRetry) {
+                        taskState.shouldRetry = false;
+                        taskControlMap.set(jobKey, taskState);
+                        console.log(`[Download] Retrying task ${jobKey}...`);
+                        continue;
+                    }
+
+                    const errStr = (err.message || "").toUpperCase();
+                    const isTimeout = errStr.includes("TIMEOUT") || errStr.includes("ETIMEDOUT") || errStr.includes("SOCKET HANG UP");
+                    const isFileRef = errStr.includes("FILE_REFERENCE_EXPIRED") || errStr.includes("FILE_REFERENCE") || errStr.includes("REFERENCE_EXPIRED") || errStr.includes("FILE_REFERENCE_INVALID");
+                    
+                    if (isTimeout || isFileRef) {
+                        console.log(`[Download] Download failed (timeout/file ref). Retrying... Error: ${errStr}`);
+                        try {
+                            const targetSourcePeer = resolvedSourcePeer || await safelyResolveEntity(sourceClient, linkData.channelId).catch(() => null);
+                            if (targetSourcePeer) {
+                                const refetchedMsgs = await sourceClient.getMessages(targetSourcePeer, { ids: [linkData.msgId] });
+                                if (refetchedMsgs && refetchedMsgs.length > 0 && !(refetchedMsgs[0] instanceof Api.MessageEmpty)) {
+                                    msg = refetchedMsgs[0];
+                                    // Redownload custom/automatic thumbnail now that reference is updated
+                                    if (!hasThumb && !fs.existsSync(userCustomThumbPath) && msg.media instanceof Api.MessageMediaDocument && msg.media.document instanceof Api.Document) {
+                                        const doc = msg.media.document;
+                                        if (doc.thumbs && doc.thumbs.length > 0) {
+                                            try {
+                                                const largestThumb = doc.thumbs[doc.thumbs.length - 1]; 
+                                                await sourceClient.downloadMedia(msg, { thumb: largestThumb, outputFile: thumbPath });
+                                                hasThumb = fs.existsSync(thumbPath);
+                                            } catch (e) {}
+                                        }
+                                    }
+                                    continue; // Retry the while loop
+                                }
+                            }
+                        } catch (e) {}
+                    }
+                    throw err;
                 }
-            });
+            }
 
             if (!fs.existsSync(tempFilePath) || fs.statSync(tempFilePath).size === 0) throw new Error("Download failed.");
+
+            // Reset job phase to uploading
+            const prepKey = `${userId}-${link}`;
+            const prepJob = activeTaskJobs.get(prepKey);
+            if (prepJob) {
+                prepJob.phase = 'uploading';
+                delete prepJob.progress;
+            }
 
             await safeEditMessage(`📤 **Uploading via Destination Account...**`, { chat_id: chatId, message_id: statusMsgId });
             
@@ -3618,9 +4897,28 @@ getConnectedUserbotClient = async (userId: number) => {
                         currentBytes = Math.floor(currentBytes * totalSize);
                     }
                     const now = Date.now();
+                    const elapsed = (now - uploadStartTime) / 1000;
+                    const speed = elapsed > 0 ? (currentBytes / elapsed) : 0;
+                    const percent = totalSize > 0 ? ((currentBytes / totalSize) * 100) : 0;
+                    const eta = speed > 0 && totalSize > 0 ? Math.max(0, (totalSize - currentBytes) / speed) : -1;
+
+                    const jobKey = `${userId}-${link}`;
+                    const job = activeTaskJobs.get(jobKey);
+                    if (job) {
+                        job.phase = 'uploading';
+                        job.progress = {
+                            total: totalSize,
+                            current: currentBytes,
+                            speed: speed,
+                            percent: percent,
+                            elapsed: Math.floor(elapsed),
+                            eta: Math.round(eta)
+                        };
+                    }
+
                     if (now - lastUploadUpdate > 2000 || currentBytes === totalSize) {
                         lastUploadUpdate = now;
-                        const text = createProgressBar(Number(totalSize), currentBytes, "Uploading", uploadStartTime);
+                        const text = createProgressBar(Number(totalSize), currentBytes, "Uploading", uploadStartTime, pathDisplay);
                         safeEditMessage(text, { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown' }).catch(() => {});
                     }
                 }
@@ -3679,8 +4977,11 @@ getConnectedUserbotClient = async (userId: number) => {
             return true;
         } catch (err: any) {
             console.error("Link Process Error:", err);
-            let errMsg = err.message;
-            if (err.errorMessage === 'CHANNEL_INVALID' || (errMsg && errMsg.includes("CHANNEL_INVALID"))) errMsg = "Channel not found. Ensure Userbot is a member of BOTH chats.";
+            let errMsg = err.message || "";
+            if (err.errorMessage === 'CHANNEL_INVALID' || errMsg.includes("CHANNEL_INVALID")) errMsg = "Channel not found. Ensure Userbot is a member of BOTH chats.";
+            else if (errMsg.includes("Content not found") || errMsg.includes("PEER_ID_INVALID") || errMsg.includes("USER_NOT_PARTICIPANT")) {
+                errMsg = "❌ **Content inaccessible:** The Userbot session does not have access to this link. Please ensure the Userbot account joined the source channel/group, and verify the link is not restricted or private.";
+            }
             if (!errMsg && err.errorMessage) errMsg = err.errorMessage;
             await safeEditMessage(`❌ **Failed:** ${errMsg || "Unknown Error"}`, { chat_id: chatId, message_id: statusMsgId });
             return false;
@@ -3692,6 +4993,53 @@ getConnectedUserbotClient = async (userId: number) => {
       const chatId = msg.chat.id;
       const fromId = msg.from?.id;
       const text = msg.text;
+
+      if (text === '⚙️ Settings') { handleSettings(chatId, fromId); return; }
+      if (text === '📈 Dashboard') {
+          if (!fromId || !isAdmin(fromId)) return;
+          try {
+              const textStr = await generateDashboardText();
+              bot?.sendMessage(chatId, textStr, {
+                  parse_mode: 'Markdown',
+                  disable_web_page_preview: true,
+                  reply_markup: {
+                      inline_keyboard: [
+                          [
+                              { text: '🔄 Refresh Stats', callback_data: 'refresh_dashboard' },
+                              isQueuePaused ? { text: '▶️ Resume Queue', callback_data: 'resume_queue_cb' } : { text: '⏸️ Pause Queue', callback_data: 'pause_queue_cb' }
+                          ],
+                          [
+                              { text: '📋 View Queue', callback_data: 'view_queue_cb' },
+                              { text: '🗑️ Clear Queue', callback_data: 'clear_queue_cb' }
+                          ]
+                      ]
+                  }
+              });
+          } catch (err: any) {
+              safeSendMessage(chatId, `❌ **Dashboard Error:** ${err.message}`);
+          }
+          return;
+      }
+      if (text === '⬅️ Back') { sendMainMenu(chatId); return; }
+      if (text === '📦 Batch') { handleBatch(chatId, fromId); return; }
+      if (text === '📍 Set Path') { 
+          if (!fromId || !isAdmin(fromId)) {
+             bot.sendMessage(chatId, "❌ Restricted to Admin");
+             return;
+          }
+          userActionStates[fromId] = { type: 'set_path' };
+          bot.sendMessage(chatId, "📍 **Set Custom Destination**\n\nPlease forward any message from target **Group/Channel** here, or send its **Public Link**.\n\n_Bot will upload files to this location instead of your private DM._", { 
+              parse_mode: 'Markdown',
+              reply_markup: { force_reply: true }
+          });
+          return; 
+      }
+      if (text === '⚙️ Mirror Engine') { handleMirror(chatId, fromId, msg); return; }
+      if (text === '❌ Cancel') { handleCancel(chatId, fromId); return; }
+      if (text === '🚀 Start') { 
+          handleStartMessage(msg);
+          return; 
+      }
 
       // Intercept states early to allow non-text actions (like setting custom thumbnail image)
       if (fromId && userActionStates[fromId]) {
@@ -3864,6 +5212,29 @@ getConnectedUserbotClient = async (userId: number) => {
               handleSettings(chatId, fromId);
               return;
           }
+
+          if (state.type === 'set_concurrency_val') {
+              const textInput = (msg.text || '').trim();
+              delete userActionStates[fromId];
+              
+              const cleaned = parseInt(textInput);
+              if (!isNaN(cleaned) && cleaned >= 1 && cleaned <= 20) {
+                  MAX_CONCURRENT_TASKS = cleaned;
+                  MAX_TASKS_PER_USER = cleaned; // Sync user tasks limit with concurrency limit for ease of use
+                  if (settingsCollection) {
+                      await settingsCollection.updateOne(
+                          { type: 'global_config' },
+                          { $set: { maxConcurrentTasks: cleaned, maxTasksPerUser: cleaned } },
+                          { upsert: true }
+                      );
+                  }
+                  safeSendMessage(chatId, `✅ **Concurrency Limit Saved!** The bot is now limited to **${cleaned} parallel tasks** globally.`, { parse_mode: 'Markdown' });
+              } else {
+                  safeSendMessage(chatId, `❌ **Invalid Input.** Concurrency must be a number between 1 and 20. Setting cancelled.`);
+              }
+              handleSettings(chatId, fromId);
+              return;
+          }
       }
 
       if (!text) return;
@@ -3873,6 +5244,69 @@ getConnectedUserbotClient = async (userId: number) => {
       if (fromId && userActionStates[fromId]) {
           const state = userActionStates[fromId];
           
+          if (state.type === 'set_jump_to_path') {
+              const textInput = (msg.text || '').trim();
+              delete userActionStates[fromId];
+
+              const parts = textInput.split(/\s+/);
+              let rawPath = parts[0];
+              let topicId: number | null = parts[1] ? parseInt(parts[1]) : null;
+
+              if (rawPath.startsWith('http://') || rawPath.startsWith('https://')) {
+                  const urlParts = rawPath.split('/').filter(p => p.length > 0);
+                  const domainIdx = urlParts.findIndex(p => p.includes('t.me') || p === 't.me');
+                  if (domainIdx !== -1 && urlParts.length > domainIdx + 1) {
+                      const nextPart = urlParts[domainIdx + 1];
+                      if (nextPart === 'c' && urlParts.length > domainIdx + 2) {
+                          let channelId = urlParts[domainIdx + 2];
+                          if (!channelId.startsWith('-100') && /^\d+$/.test(channelId)) {
+                              channelId = "-100" + channelId;
+                          }
+                          rawPath = channelId;
+                          if (urlParts.length > domainIdx + 3) {
+                              const possibleMsgOrTopic = parseInt(urlParts[domainIdx + 3]);
+                              if (!isNaN(possibleMsgOrTopic) && topicId === null) {
+                                  topicId = possibleMsgOrTopic;
+                              }
+                          }
+                      } else {
+                          rawPath = "@" + nextPart;
+                      }
+                  }
+              }
+
+              if (!rawPath.startsWith('-') && !rawPath.startsWith('@') && /^[a-zA-Z]/.test(rawPath)) {
+                  rawPath = "@" + rawPath;
+              }
+
+              if (approvedUsersCollection) {
+                  const adminIdStr = fromId.toString();
+                  const settingsUid = await resolveSettingsUserId(fromId);
+                  
+                  const update = { 
+                      $set: { 
+                          uploadPath: rawPath,
+                          uploadTopicId: topicId || null,
+                          uploadGroupName: rawPath,
+                          uploadTopicName: topicId ? `Topic ${topicId}` : ''
+                      } 
+                  };
+                  
+                  await approvedUsersCollection.updateOne({ userId: adminIdStr }, update);
+                  if (settingsUid !== adminIdStr) {
+                      await approvedUsersCollection.updateOne({ userId: settingsUid }, update);
+                  }
+                  
+                  const dest = topicId ? `${rawPath} (Topic ID: ${topicId})` : rawPath;
+                  const confirmationText = `✅ **Upload Destination Saved via JumpToPath!**\n\nAll tasks will now be processed to:\n📍 \`${dest}\``;
+                  
+                  await safeSendMessage(chatId, confirmationText, { parse_mode: 'Markdown' });
+              } else {
+                  safeSendMessage(chatId, "⚠️ **Database not ready.** Please try again.");
+              }
+              return;
+          }
+
           if (state.type === 'set_path') {
               const text = msg.text || '';
               let targetId = '';
@@ -4172,10 +5606,14 @@ getConnectedUserbotClient = async (userId: number) => {
                   
                   // Create or get topic in dest
                   console.log(`[Debug] Topic Clone: destEntity: ${destEntity.id}, topicTitle: ${topicTitle}`);
-                  const destTopicId = await getOrCreateTopic(client, destEntity, topicTitle);
-                  console.log(`[Debug] Topic Clone: destTopicId: ${destTopicId}`);                
+                  const topicResult = await getOrCreateTopic(client, destEntity, topicTitle);
+                  console.log(`[Debug] Topic Clone result:`, topicResult);                
                   
-                  if (!destTopicId) throw new Error("Could not create or find the topic. Please ensure the destination is a Forum group.");
+                  if (topicResult.error) {
+                      throw new Error(`Could not create or find the topic.\n\n⚠️ **Telegram Error:** \`${topicResult.error}\`\n\n💡 **Troubleshooting Tips:**\n1. Ensure the destination is indeed a **Forum Group** (Forum must be turned on in settings).\n2. Make sure the Userbot account has **Admin / Create Topics** permission inside that group.\n3. Make sure the destination link or ID is fully correct and the userbot has successfully joined.`);
+                  }
+                  
+                  const destTopicId = topicResult.topicId;
                   
                   // Confirmation in topic
                   try {
@@ -4194,22 +5632,28 @@ getConnectedUserbotClient = async (userId: number) => {
                   messages.sort((a: any, b: any) => a.id - b.id);
 
                   let queuedCount = 0;
+                  const topicTasksToQueue: Task[] = [];
                   for (const m of messages) {
                       if (m.action) continue; 
                       if (!m.message && !m.media) continue;
 
                       const virtualLink = `https://t.me/c/${sourceIdClean}/${m.id}`;
                       
-                      taskQueue.push({ 
+                      topicTasksToQueue.push({ 
                           chatId, 
                           link: virtualLink, 
                           userId: fromId,
                           forceGeneralPath: false,
                           overrideTargetId: destGroupId, 
-                          threadIdOverride: destTopicId,
+                          overrideThreadId: destTopicId,
                           isMirror: true
                       });
                       queuedCount++;
+                  }
+
+                  if (topicTasksToQueue.length > 0) {
+                      taskQueue.push(...topicTasksToQueue);
+                      dbEnqueueTasks(topicTasksToQueue).catch(e => console.error("[Queue DB] Bulk enqueue error:", e));
                   }
 
                   runNextTask();
@@ -4253,11 +5697,12 @@ getConnectedUserbotClient = async (userId: number) => {
                       replyTo: topicId
                   });
 
+                  const groupTasksToQueue: Task[] = [];
                   for (const m of messages) {
                       if (m.media) {
                           const entityId = sourceIdClean;
                           const virtualLink = `https://t.me/c/${entityId}/${m.id}`;
-                          taskQueue.push({ 
+                          groupTasksToQueue.push({ 
                               chatId, 
                               link: virtualLink, 
                               userId: fromId,
@@ -4265,6 +5710,10 @@ getConnectedUserbotClient = async (userId: number) => {
                               isMirror: true
                           });
                       }
+                  }
+                  if (groupTasksToQueue.length > 0) {
+                      taskQueue.push(...groupTasksToQueue);
+                      dbEnqueueTasks(groupTasksToQueue).catch(e => console.error("[Queue DB] Bulk enqueue error:", e));
                   }
                   runNextTask();
                   safeSendMessage(chatId, `✅ Added **${messages.length}** content items to queue.`);
@@ -4325,9 +5774,14 @@ getConnectedUserbotClient = async (userId: number) => {
                       console.log(`[Batch] Sending Batch Accepted...`);
                       await safeSendMessage(chatId, `✅ **Batch Accepted!**\nProcessing \`${count}\` links. The summary has been pinned above.`);
                       
+                      const batchTasksToQueue: Task[] = [];
                       for (let i = startId; i <= endId; i++) {
                           const link = `${baseUrl}${i}`;
-                          taskQueue.push({ chatId, link, batchId, userId: fromId });
+                          batchTasksToQueue.push({ chatId, link, batchId, userId: fromId });
+                      }
+                      if (batchTasksToQueue.length > 0) {
+                          taskQueue.push(...batchTasksToQueue);
+                          dbEnqueueTasks(batchTasksToQueue).catch(e => console.error("[Queue DB] Bulk enqueue error:", e));
                       }
                       
                       console.log(`[Batch] Queue loaded. Calling runNextTask. TaskQueue size: ${taskQueue.length}, Active: ${activeTasksCount}`);
@@ -4547,24 +6001,62 @@ getConnectedUserbotClient = async (userId: number) => {
         }
       }
 
+      // Invite link autodetection & join (Resolves t.me/joinchat/... and t.me/+...)
+      const inviteHashMatch = text.match(/(?:https?:\/\/)?t\.me\/(?:joinchat\/|\+)([a-zA-Z0-9_\-]+)/);
+      if (inviteHashMatch) {
+          if (!fromId) return;
+          if (!isAuthorized(fromId)) return safeSendMessage(chatId, "❌ **Access Restricted**\n\nYou are not authorized to use this bot.");
+          const inviteHash = inviteHashMatch[1];
+          const statusMsg = await safeSendMessage(chatId, `🔄 **Private channel/group invite link detected.**\nAttempting to join using your active Userbot session...`);
+          try {
+              const targetUid = Number(await resolveSettingsUserId(fromId));
+              const client = await getConnectedUserbotClient(targetUid);
+              if (!client) throw new Error("No active Userbot session found. Please login first via /login.");
+              
+              const res = await client.invoke(new Api.messages.ImportChatInvite({ hash: inviteHash }));
+              let chatTitle = "Private Chat";
+              if (res && res.chats && res.chats.length > 0) {
+                  chatTitle = res.chats[0].title || chatTitle;
+              }
+              await safeEditMessage(`✅ **Successfully Joined Private Channel/Group!**\n\n📌 Title: **${chatTitle}**\n👤 Userbot ID: **${targetUid}**\n\nYou can now copy links from this channel and paste them here to download/mirror.`, { chat_id: chatId, message_id: statusMsg?.message_id || 0 });
+          } catch (e: any) {
+              let errMsg = e.message || "Unknown error";
+              if (errMsg.includes("USER_ALREADY_PARTICIPANT")) {
+                  await safeEditMessage(`ℹ️ **Already a member!** Your active Userbot is already a participant of this channel/group.`, { chat_id: chatId, message_id: statusMsg?.message_id || 0 });
+              } else if (errMsg.includes("INVITE_HASH_EXPIRED")) {
+                  await safeEditMessage(`❌ **Failed to join:** The invite link has expired or is invalid.`, { chat_id: chatId, message_id: statusMsg?.message_id || 0 });
+              } else if (errMsg.includes("INVITE_HASH_INVALID")) {
+                  await safeEditMessage(`❌ **Failed to join:** The invite link contains an invalid hash.`, { chat_id: chatId, message_id: statusMsg?.message_id || 0 });
+              } else {
+                  await safeEditMessage(`❌ **Failed to join:** ${errMsg}`, { chat_id: chatId, message_id: statusMsg?.message_id || 0 });
+              }
+          }
+          return;
+      }
+
       // Link detection (Supports Topics and multiple segments)
       const links = text.match(/(?:https?:\/\/)?t\.me\/(?:c\/)?[\w.-]+(?:\/[\d]+)+/g);
       if (links && links.length > 0) {
         if (!isAuthorized(fromId)) return safeSendMessage(chatId, "❌ **Access Restricted**\n\nYou are not authorized to process links. Please use /start to request access.");
         if (!isAdmin(fromId) && links.length > 1) return safeSendMessage(chatId, "❌ Only authorized admins can process multiple links at once.");
 
+        const linkTasksToQueue: Task[] = [];
         for (const link of links) {
             const options: any = { parse_mode: 'Markdown' };
             if (msg.message_thread_id) options.message_thread_id = msg.message_thread_id;
             
             const statusMsg = await safeSendMessage(chatId, `🔍 **Analyzing link:** \`${link.split('/').pop()}\`...`, options);
-            taskQueue.push({ 
+            linkTasksToQueue.push({ 
                 chatId: chatId, 
                 link: link, 
                 statusMsgId: statusMsg?.message_id || 0, 
                 userId: fromId!,
                 overrideThreadId: msg.message_thread_id
             });
+        }
+        if (linkTasksToQueue.length > 0) {
+            taskQueue.push(...linkTasksToQueue);
+            dbEnqueueTasks(linkTasksToQueue).catch(e => console.error("[Queue DB] Bulk enqueue error:", e));
         }
 
         runNextTask();
