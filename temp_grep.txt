@@ -1,0 +1,59 @@
+const safeEditMessage = async (text: string, options: { chat_id: number, message_id: number, parse_mode?: any, disable_web_page_preview?: boolean, reply_markup?: any }) => {
+        await safeEditMessage(text, {
+    await safeEditMessage(text, { 
+                await safeEditMessage(text, { 
+              safeEditMessage(`✅ User \`${userId}\` has been **Approved**.`, { chat_id: chatId, message_id: query.message!.message_id, parse_mode: 'Markdown' });
+          safeEditMessage(`❌ Request from \`${userId}\` was **Declined**.`, { chat_id: chatId, message_id: query.message!.message_id, parse_mode: 'Markdown' });
+        await safeEditMessage("🛠 **Bot Main Menu**\n\nSelect a task:", {
+          safeEditMessage("🔗 **Please send the Destination Group ID or Link:**", { chat_id: chatId, message_id: query.message!.message_id });
+          await safeEditMessage(`🔗 **Destination Selected: ${groupName}**\n\nNow send the **Source Group Link/ID** to mirror from:`, {
+          safeEditMessage("🔗 **Please send the Destination Group ID or Link:**", { chat_id: chatId, message_id: query.message!.message_id });
+          await safeEditMessage(`🔗 **Destination Selected: ${groupName}**\n\n2. Now send the **Source Group Link/ID** to clone from:`, {
+                      await safeEditMessage("📭 **No active full mirror sessions currently in progress.**\n\nAll tasks have concluded or no session is active.", {
+                      await safeEditMessage(text, {
+              await safeEditMessage(`✅ **Session [${sessId}] Resumed Successfully!**\nEnqueued **${queuedCount}** remaining tasks to the download queue.`, {
+              await safeEditMessage(`❌ **Resume Failed:** ${err.message}`, {
+                  await safeEditMessage("📭 **No active full mirror sessions currently in progress.**\n\nAll tasks have concluded or no session is active.", {
+                  await safeEditMessage(text, {
+          safeEditMessage("🎯 **Clone Specific Topic**\n\n1. Select Destination Group:", { chat_id: chatId, message_id: query.message!.message_id, reply_markup: { inline_keyboard: keyboard } });
+          await safeEditMessage(`🔄 **Full Mirror Options**\n\nWould you like to also auto-enable **Live Mirroring** for this setup once started?\n\n**Source:** \`${sourceId}\`\n**Destination:** ${destDisplay}\n\n*If you choose YES, we will queue the full history copy and also automatically register this channel/group to mirror future new posts in real-time!*`, {
+                  await safeEditMessage(`✅ Added **${orderedTasks.length}** items from Full Mirror to copy queue.${skipText}\nDestination path: \`${destPath}\`.${liveMirrorSuccessInfo}`, {
+                  await safeEditMessage(`❌ **Mirror Error:** ${err.message}`, {
+                  await safeEditMessage(`📍 **Mirroring ${topicsResult.topics.length} Topics.**\nCloning started...`, { chat_id: chatId, message_id: loadingMsg!.message_id });
+          await safeEditMessage(renameText, {
+          await safeEditMessage(renameText, {
+          await safeEditMessage(text, { chat_id: chatId, message_id: query.message!.message_id, parse_mode: 'Markdown', reply_markup: markup });
+              await safeEditMessage(text, { chat_id: chatId, message_id: query.message!.message_id, parse_mode: 'Markdown', reply_markup: markup });
+          await safeEditMessage(text, {
+          await safeEditMessage(text + `\n\n▶️ **System Resumed:** Continuing downloads...`, {
+          await safeEditMessage(text + `\n\n⏸️ **System Paused:** Incoming files holding in queue.`, {
+          await safeEditMessage(text + `\n\n🧹 **Queue Cleared:** All waiting items wiped clean.`, {
+          await safeEditMessage(`✅ **Failed Tasks Replaced!**\n\nRequeued ${count} tasks back into the active mirror queue successfully.`, {
+          await safeEditMessage(`🧹 **Failure Logs Cleared!**\n\nAll historical mirror failures have been erased from the system database.`, {
+          await safeEditMessage(qText, {
+    await safeEditMessage(text, {
+                    await safeEditMessage(cooldownText, { chat_id: task.chatId, message_id: statusMsgId, parse_mode: 'Markdown' }).catch(() => {});
+                await safeEditMessage(`🚫 **Skipped task (Blocked Topic):**\n└ Link: ${task.link}`, { chat_id: task.chatId, message_id: statusMsgId });
+                await safeEditMessage(`⚠️ **Task Error:** ${taskErr.message}\nRetrying (${task.retries}/3)...\n\n🔗 **Link:** ${task.link}`, { chat_id: task.chatId, message_id: statusMsgId });
+                await safeEditMessage(`❌ **Task Failed:** ${taskErr.message} (Max retries reached)\n\n🔗 **Link:** ${task.link}`, { chat_id: task.chatId, message_id: statusMsgId });
+            await safeEditMessage(`⚠️ **429 Too Many Requests:** Telegram limitation active. Retrying automatically in ${retryAfter} seconds...`, { chat_id: task.chatId, message_id: statusMsgId });
+                    await safeEditMessage(`⚡ **Skipped:** Already mirrored to destination.\n\n🔗 **Link:** ${link}`, { chat_id: chatId, message_id: statusMsgId });
+            await safeEditMessage("🔍 **Locating content...**", { chat_id: chatId, message_id: statusMsgId });
+            await safeEditMessage("📥 **Retrieving content...**", { chat_id: chatId, message_id: statusMsgId });
+                        await safeEditMessage(`🔄 **Retrying content access (${retryCount}/${maxRetries})...**`, { chat_id: chatId, message_id: statusMsgId });
+                        await safeEditMessage(`🚫 **Skipped task (Blocked Topic):**\n└ Link: ${link}`, { chat_id: chatId, message_id: statusMsgId });
+                await safeEditMessage("🚀 **Mirroring...**", { chat_id: chatId, message_id: statusMsgId });
+                            await safeEditMessage(`🎯 **Success!**\n\n🔗 **Link:** ${link}`, { chat_id: chatId, message_id: statusMsgId });
+                await safeEditMessage(`🎯 **Success!**\n\n🔗 **Link:** ${link}`, { chat_id: chatId, message_id: statusMsgId });
+            await safeEditMessage(`📥 **Downloading via Source Account...**`, { chat_id: chatId, message_id: statusMsgId });
+                        safeEditMessage(createProgressBar(totalBytes, currentBytes, "Downloading", downloadStartTime, pathDisplay), { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown', reply_markup: createProgressMarkup(jobKey, isPaused) }).catch(() => {});
+                        safeEditMessage(createProgressBar(totalBytes || 100, currentBytes || 0, "Downloading (Paused)", downloadStartTime, pathDisplay), { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown', reply_markup: createProgressMarkup(jobKey, true) }).catch(() => {});
+                        safeEditMessage(createProgressBar(totalBytes || 100, currentBytes || 0, "Downloading (Resuming...)", downloadStartTime, pathDisplay), { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown', reply_markup: createProgressMarkup(jobKey, false) }).catch(() => {});
+            await safeEditMessage(`📤 **Uploading via ${agentLabel}...**`, { chat_id: chatId, message_id: statusMsgId });
+                        safeEditMessage(text, { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown' }).catch(() => {});
+            await safeEditMessage(`🎯 **Successfully mirrored!**\n\n🔗 **Link:** ${link}`, { chat_id: chatId, message_id: statusMsgId });
+              await safeEditMessage(`✅ **Successfully Joined Private Channel/Group!**\n\n📌 Title: **${chatTitle}**\n👤 Userbot ID: **${targetUid}**\n\nYou can now copy links from this channel and paste them here to download/mirror.`, { chat_id: chatId, message_id: statusMsg?.message_id || 0 });
+                  await safeEditMessage(`ℹ️ **Already a member!** Your active Userbot is already a participant of this channel/group.`, { chat_id: chatId, message_id: statusMsg?.message_id || 0 });
+                  await safeEditMessage(`❌ **Failed to join:** The invite link has expired or is invalid.`, { chat_id: chatId, message_id: statusMsg?.message_id || 0 });
+                  await safeEditMessage(`❌ **Failed to join:** The invite link contains an invalid hash.`, { chat_id: chatId, message_id: statusMsg?.message_id || 0 });
+                  await safeEditMessage(`❌ **Failed to join:** ${errMsg}`, { chat_id: chatId, message_id: statusMsg?.message_id || 0 });

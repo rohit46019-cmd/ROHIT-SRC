@@ -1,0 +1,232 @@
+174:function applyRenameRules(text: string, customRules?: Array<{ keyword: string; replaceWith: string }>): string {
+407:const escapeMarkdown = (text: string) => {
+496:const ensureSafeMessageLength = (text: string): string => {
+507:const safeSendMessage = async (chatId: number, text: string, options: any = {}) => {
+515:const safeEditMessage = async (text: string, options: { chat_id: number, message_id: number, parse_mode?: any, disable_web_page_preview?: boolean, reply_markup?: any }) => {
+817:                { text: '➕ Add Topic', callback_data: 'add_blocked_topic_start' },
+818:                { text: '🗑 Clear All', callback_data: 'clear_blocked_topics_action' }
+820:            [{ text: '⬅️ Back to Settings', callback_data: 'bot_settings' }]
+894:                [{ text: '🚫 Block This or Any Topic', callback_data: `add_blocked_topic_start` }]
+1710:                { text: 'Set Thumb', callback_data: 'set_thumb' },
+1711:                { text: 'Clr Thumb', callback_data: 'clr_thumb' },
+1712:                { text: 'Caption', callback_data: 'set_cap' }
+1715:                { text: '📁 Set Path', callback_data: 'set_path_cmd' },
+1716:                { text: '🗑 Reset Path', callback_data: 'clr_path_cmd' },
+1717:                { text: '📂 Manage Mirror', callback_data: 'manage_mirror_paths' }
+1720:                { text: '🔑 Set API ID', callback_data: 'set_api_id' },
+1721:                { text: '🔑 Set API Hash', callback_data: 'set_api_hash' }
+1724:                { text: `Engine: ${currentUploadEngine}`, callback_data: 'toggle_engine' },
+1725:                { text: userDoc?.uploadMode === 'document' ? '📁 Mode: File' : '📹 Mode: Video', callback_data: 'toggle_mode' },
+1726:                { text: `Agent: ${userDoc?.uploadAgent === 'bot' ? '🤖 Bot' : '👤 User'}`, callback_data: 'toggle_agent' }
+1729:                { text: 'Rename Rules', callback_data: 'toggle_rename' },
+1730:                { text: `⏱ Cooldown: ${cooldownSecs === 0 ? 'OFF (0s)' : `${cooldownSecs}s`}`, callback_data: 'change_cooldown_start' },
+1731:                { text: `⚡ Concurrency: ${MAX_CONCURRENT_TASKS}`, callback_data: 'change_concurrency_start' }
+1734:                { text: 'Force Sync', callback_data: 're_login' },
+1735:                { text: 'Logs', callback_data: 'view_logs' },
+1736:                { text: 'Audit', callback_data: 'check_perms' }
+1739:                { text: '🚫 Blocked Topics', callback_data: 'blocked_topics_panel' }
+1741:              [{ text: '⬅️ Back to Menu', callback_data: 'menu_back' }]
+1844:                [{ text: '⚙️ Settings' }, { text: '📈 Dashboard' }],
+1845:                [{ text: '📦 Batch' }, { text: '⚙️ Mirror Engine' }],
+1846:                [{ text: '📍 Set Path' }, { text: '❌ Cancel' }],
+1847:                [{ text: '🚀 Start' }]
+1860:                [{ text: '⬅️ Back' }]
+1888:             [{ text: '⚙️ Settings' }, { text: '📈 Dashboard' }],
+1889:             [{ text: '📦 Batch' }, { text: '⚙️ Mirror Engine' }],
+1890:             [{ text: '📍 Set Path' }, { text: '❌ Cancel' }],
+1891:             [{ text: '🚀 Start' }]
+1930:                        { text: '📁 Mirror List', callback_data: 'mirror_list' },
+1931:                        { text: '➕ Add New Mirror', callback_data: 'mirror_add_start' }
+1934:                        { text: '🎯 Clone Specific Topic', callback_data: 'topic_clone_start' },
+1935:                        { text: '🔄 Full Mirror Group', callback_data: 'full_mirror_start' }
+1938:                        { text: '📊 Full Mirror Progress', callback_data: 'full_mirror_progress_list' }
+1940:                    [ { text: '❌ Close', callback_data: 'start_back' } ]
+1977:          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+1983:              bot?.answerCallbackQuery(query.id, { text: 'User Approved!' });
+1991:          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+2002:                    { text: '⚙️ Settings', callback_data: 'bot_settings' },
+2003:                    { text: '📦 Batch', callback_data: 'batch_cmd' }
+2006:                    { text: '📍 Set Path', callback_data: 'set_path_cmd' },
+2007:                    { text: '⚙️ Mirror Engine', callback_data: 'mirror_cmd' }
+2010:                    { text: '🚀 Start', callback_data: 'start_cmd' },
+2011:                    { text: '❌ Cancel', callback_data: 'cancel_cmd' }
+2027:      if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+2030:          return bot?.answerCallbackQuery(query.id, { text: '❌ Session expired.', show_alert: true });
+2068:      if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+2071:          return bot?.answerCallbackQuery(query.id, { text: '❌ Session expired.', show_alert: true });
+2128:          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+2137:                                  { text: '🔄 Refresh', callback_data: 'full_mirror_progress_list' },
+2138:                                  { text: '⬅️ Back', callback_data: 'mirror_cmd' }
+2164:                          { text: `🔄 Resume #${idx}`, callback_data: `fm_resume_${id}` },
+2165:                          { text: `🗑 Del #${idx}`, callback_data: `fm_deltrack_${id}` }
+2171:                      { text: '🔄 Refresh List', callback_data: 'full_mirror_progress_list' },
+2172:                      { text: '⬅️ Back', callback_data: 'mirror_cmd' }
+2197:          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+2199:          bot?.answerCallbackQuery(query.id, { text: '🔄 Resuming mirror session...' });
+2218:          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+2232:          await bot?.answerCallbackQuery(query.id, { text: '🗑 Track deleted successfully!', show_alert: true });
+2241:                                  { text: '🔄 Refresh', callback_data: 'full_mirror_progress_list' },
+2242:                                  { text: '⬅️ Back', callback_data: 'mirror_cmd' }
+2264:                          { text: `🔄 Resume #${idx}`, callback_data: `fm_resume_${id}` },
+2265:                          { text: `🗑 Del #${idx}`, callback_data: `fm_deltrack_${id}` }
+2270:                      { text: '🔄 Refresh List', callback_data: 'full_mirror_progress_list' },
+2271:                      { text: '⬅️ Back', callback_data: 'mirror_cmd' }
+2288:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+2295:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+2306:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+2311:          await bot?.answerCallbackQuery(query.id, { text: '✅ All Blocked Topics Cleared!', show_alert: true });
+2317:          if (!isAdmin(query.from.id)) return safeBotCall('answerCallbackQuery', query.id, { text: '❌ Admin only', show_alert: true });
+2327:          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+2337:              keyboard.push([{ text: `📂 ${r.groupName}`, callback_data: `clonedest_${r.destId}` }]);
+2339:          keyboard.push([{ text: `➕ Enter New Group ID`, callback_data: `clonedest_new` }]);
+2347:          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+2357:          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+2360:              return bot?.answerCallbackQuery(query.id, { text: '❌ Session expired.', show_alert: true });
+2368:              return bot?.answerCallbackQuery(query.id, { text: '❌ Destination not found.', show_alert: true });
+2426:          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+2429:              return bot?.answerCallbackQuery(query.id, { text: '❌ Session expired.', show_alert: true });
+2437:              return bot?.answerCallbackQuery(query.id, { text: '❌ Destination not found.', show_alert: true });
+2445:                  { text: '🔄 Full + ⚡ Live Mirror', callback_data: `fmlive_yes_${idx}` },
+2446:                  { text: '📥 History Copy Only', callback_data: `fmlive_no_${idx}` }
+2449:                  { text: '❌ Cancel', callback_data: 'mirror_cmd' }
+2464:          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+2467:              return bot?.answerCallbackQuery(query.id, { text: '❌ Session expired.', show_alert: true });
+2476:              return bot?.answerCallbackQuery(query.id, { text: '❌ Destination not found.', show_alert: true });
+2773:          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+2796:                          { text: liveStatus, callback_data: `mirrortoggle_${i}` },
+2797:                          { text: '🔄 Scan', callback_data: `mirrorscan_${i}` },
+2798:                          { text: '🗑 Delete', callback_data: `mirrordel_${i}` }
+2802:                  keyboard.push([{ text: '⬅️ Back', callback_data: 'mirror_cmd' }]);
+2817:          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+2830:                  bot?.answerCallbackQuery(query.id, { text: `✅ Removed mirror from ${removed[0].sourceId}` });
+2836:              bot?.answerCallbackQuery(query.id, { text: '❌ Deletion failed' });
+2842:          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+2849:                  bot?.answerCallbackQuery(query.id, { text: `🔄 Starting scan for ${paths[index].sourceId}...` });
+2858:          } catch (err) { bot?.answerCallbackQuery(query.id, { text: '❌ Error' }); }
+2863:          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+2878:                  bot?.answerCallbackQuery(query.id, { text: `✅ ${status} for ${paths[index].sourceId}` });
+2889:              bot?.answerCallbackQuery(query.id, { text: '❌ Toggle failed' });
+3082:        if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3089:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3100:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3104:              bot?.answerCallbackQuery(query.id, { text: '✅ Destination Reset to Default', show_alert: true });
+3111:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3116:          bot?.answerCallbackQuery(query.id, { text: `✅ Upload Engine set to ${currentUploadEngine}` });
+3127:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3138:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3149:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3160:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3174:          bot?.answerCallbackQuery(query.id, { text: '✅ Custom Thumbnail Cleared!', show_alert: true });
+3180:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3191:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3200:              bot?.answerCallbackQuery(query.id, { text: `✅ Upload Mode set to ${currentMode === 'document' ? 'Document/File' : 'Video'}` });
+3207:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3216:              bot?.answerCallbackQuery(query.id, { text: `✅ Upload Agent set to ${currentAgent === 'bot' ? 'Bot itself' : 'User Account'}` });
+3223:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3241:                      { text: '➕ Add Rule', callback_data: 'add_rename_rule_start' },
+3242:                      { text: '🗑 Clear All', callback_data: 'clear_rename_rules_action' }
+3244:                  [{ text: '⬅️ Back to Settings', callback_data: 'bot_settings' }]
+3259:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3270:          if (!isAdmin(query.from?.id)) return safeBotCall('answerCallbackQuery', query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3275:          safeBotCall('answerCallbackQuery', query.id, { text: '✅ All Rename Rules Cleared for this Session!', show_alert: true });
+3281:                      { text: '➕ Add Rule', callback_data: 'add_rename_rule_start' },
+3282:                      { text: '🗑 Clear All', callback_data: 'clear_rename_rules_action' }
+3284:                  [{ text: '⬅️ Back to Settings', callback_data: 'bot_settings' }]
+3297:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3308:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3309:          bot?.answerCallbackQuery(query.id, { text: '🔍 Auditing System Permissions...' });
+3368:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3369:          bot?.answerCallbackQuery(query.id, { text: '🔄 Forcing Sync...' });
+3375:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3376:          bot?.answerCallbackQuery(query.id, { text: '⚡ Fetching Server Logs...' });
+3386:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3399:                  markup.inline_keyboard.push([{ text: `🗑 Delete ${i + 1}`, callback_data: `del_mirror_path:${i}` }]);
+3402:          markup.inline_keyboard.push([{ text: '⬅️ Back to Settings', callback_data: 'bot_settings' }]);
+3410:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3419:              bot?.answerCallbackQuery(query.id, { text: '✅ Path Deleted', show_alert: true });
+3431:                      markup.inline_keyboard.push([{ text: `🗑 Delete ${i + 1}`, callback_data: `del_mirror_path:${i}` }]);
+3434:              markup.inline_keyboard.push([{ text: '⬅️ Back to Settings', callback_data: 'bot_settings' }]);
+3437:              bot?.answerCallbackQuery(query.id, { text: '❌ Path not found', show_alert: true });
+3451:              bot?.answerCallbackQuery(query.id, { text: '✅ Destination Deleted', show_alert: true });
+3455:              bot?.answerCallbackQuery(query.id, { text: '❌ Destination not found', show_alert: true });
+3461:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3472:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3481:                          { text: '🔄 Refresh Stats', callback_data: 'refresh_dashboard' },
+3482:                          isQueuePaused ? { text: '▶️ Resume Queue', callback_data: 'resume_queue_cb' } : { text: '⏸️ Pause Queue', callback_data: 'pause_queue_cb' }
+3485:                          { text: '📋 View Queue', callback_data: 'view_queue_cb' },
+3486:                          { text: '🗑️ Clear Queue', callback_data: 'clear_queue_cb' }
+3491:          bot?.answerCallbackQuery(query.id, { text: '🔄 Dashboard Refreshed!' });
+3496:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3498:          bot?.answerCallbackQuery(query.id, { text: '▶️ Task Queue Resumed!' });
+3507:                          { text: '🔄 Refresh Stats', callback_data: 'refresh_dashboard' },
+3508:                          { text: '⏸️ Pause Queue', callback_data: 'pause_queue_cb' }
+3511:                          { text: '📋 View Queue', callback_data: 'view_queue_cb' },
+3512:                          { text: '🗑️ Clear Queue', callback_data: 'clear_queue_cb' }
+3522:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3524:          bot?.answerCallbackQuery(query.id, { text: '⏸️ Task Queue Paused!' });
+3533:                          { text: '🔄 Refresh Stats', callback_data: 'refresh_dashboard' },
+3534:                          { text: '▶️ Resume Queue', callback_data: 'resume_queue_cb' }
+3537:                          { text: '📋 View Queue', callback_data: 'view_queue_cb' },
+3538:                          { text: '🗑️ Clear Queue', callback_data: 'clear_queue_cb' }
+3547:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3550:          bot?.answerCallbackQuery(query.id, { text: '🧹 Pending Queue Cleared!' });
+3559:                          { text: '🔄 Refresh Stats', callback_data: 'refresh_dashboard' },
+3560:                          isQueuePaused ? { text: '▶️ Resume Queue', callback_data: 'resume_queue_cb' } : { text: '⏸️ Pause Queue', callback_data: 'pause_queue_cb' }
+3563:                          { text: '📋 View Queue', callback_data: 'view_queue_cb' },
+3564:                          { text: '🗑️ Clear Queue', callback_data: 'clear_queue_cb' }
+3573:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3575:          bot?.answerCallbackQuery(query.id, { text: `🔄 Requeued ${count} failed tasks!` });
+3581:                  inline_keyboard: [[{ text: '⬅️ Back to Menu', callback_data: 'menu_back' }]]
+3588:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3590:          bot?.answerCallbackQuery(query.id, { text: '🧹 Cleared failed logs!' });
+3596:                  inline_keyboard: [[{ text: '⬅️ Back to Menu', callback_data: 'menu_back' }]]
+3603:          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+3604:          bot?.answerCallbackQuery(query.id, { text: '📋 Querying Queue Details...' });
+3644:                  isQueuePaused ? { text: '▶️ Resume Queue', callback_data: 'resume_queue_cb' } : { text: '⏸️ Pause Queue', callback_data: 'pause_queue_cb' },
+3645:                  { text: '🔄 Refresh Queue', callback_data: 'view_queue_cb' }
+3648:                  { text: '🔙 Back to Dashboard', callback_data: 'refresh_dashboard' }
+3667:          if (!isAdmin(fromId)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+3674:          if (!isAdmin(fromId)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+3684:          await bot?.answerCallbackQuery(query.id, { text: "✅ Active session switched!" });
+3685:          bot.processUpdate({ message: { ...query.message, text: '/login', from: query.from } } as any);
+3690:          if (!isAdmin(fromId)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+3692:          await bot?.answerCallbackQuery(query.id, { text: "Logging out..." });
+3712:          bot.processUpdate({ message: { ...query.message, text: '/login', from: query.from } } as any);
+3717:          if (!isAdmin(fromId)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+3725:          await bot?.answerCallbackQuery(query.id, { text: isPause ? "⏸️ Download Paused!" : "▶️ Download Resumed!", show_alert: false });
+3739:          if (!isAdmin(fromId)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+3744:          await bot?.answerCallbackQuery(query.id, { text: "🔁 Retrying download...", show_alert: false });
+3791:                    { text: isActive ? `✅ Active: ${phone}` : `🔄 Switch to ${phone}`, callback_data: `switch_session:${u.userId}` },
+3792:                    { text: `❌ Logout`, callback_data: `logout_session:${u.userId}` }
+3796:            keyboard.push([{ text: "➕ Login New Account", callback_data: "start_login" }]);
+3826:                    keyboard.push([{ text: `📂 ${r.groupName}`, callback_data: `mirrordest_${r.destId}` }]);
+3828:                keyboard.push([{ text: `➕ Enter New Group ID`, callback_data: `mirrordest_new` }]);
+3830:                keyboard.push([{ text: `➕ Enter New Group ID`, callback_data: `mirrordest_new` }]);
+4136:                isQueuePaused ? { text: '▶️ Resume Queue', callback_data: 'resume_queue_cb' } : { text: '⏸️ Pause Queue', callback_data: 'pause_queue_cb' },
+4137:                { text: '🔄 Refresh Queue', callback_data: 'view_queue_cb' }
+4140:                { text: '🗑️ Clear Queue', callback_data: 'clear_queue_cb' }
+4241:                            { text: '🔄 Refresh Stats', callback_data: 'refresh_dashboard' },
+4242:                            isQueuePaused ? { text: '▶️ Resume Queue', callback_data: 'resume_queue_cb' } : { text: '⏸️ Pause Queue', callback_data: 'pause_queue_cb' }
+4245:                            { text: '📋 View Queue', callback_data: 'view_queue_cb' },
+4246:                            { text: '🗑️ Clear Queue', callback_data: 'clear_queue_cb' }
+4337:                            { text: '🔄 Retry All Failed', callback_data: 'retry_all_failed_cb' },
+4338:                            { text: '🗑️ Clear Failed Logs', callback_data: 'clear_failed_cb' }
+4341:                            { text: '⬅️ Back to Menu', callback_data: 'menu_back' }
+4368:                { text: 'Settings Menu', callback_data: 'bot_settings' },
+4369:                { text: 'Logout Session', callback_data: 'logout_cmd' }
+5713:        { text: isPaused ? '▶️ Resume' : '⏸️ Pause', callback_data: `${isPaused ? 'resume' : 'pause'}_${jobKey}` },
+5714:        { text: '🔁 Retry', callback_data: `retry_${jobKey}` }
+6429:                              { text: '🔄 Refresh Stats', callback_data: 'refresh_dashboard' },
+6430:                              isQueuePaused ? { text: '▶️ Resume Queue', callback_data: 'resume_queue_cb' } : { text: '⏸️ Pause Queue', callback_data: 'pause_queue_cb' }
+6433:                              { text: '📋 View Queue', callback_data: 'view_queue_cb' },
+6434:                              { text: '🗑️ Clear Queue', callback_data: 'clear_queue_cb' }
+6931:                           { text: d.groupName + (d.destThreadId ? ` (Topic ${d.destThreadId})` : ''), callback_data: `lm_dest_${idx}` },
+6932:                           { text: '🗑', callback_data: `del_saved_dest:${idx}` }
+6935:                  kb.push([{ text: '❌ Cancel', callback_data: 'start_back' }]);
+7015:                      { text: d.groupName + (d.destThreadId ? ` (Topic ${d.destThreadId})` : ''), callback_data: `fm_dest_${idx}` },
+7016:                      { text: '🗑', callback_data: `del_saved_dest:${idx}` }
+7019:              kb.push([{ text: '❌ Cancel', callback_data: 'start_back' }]);
+7277:                                  { text: 'Full Clone (Recent)', callback_data: 'mode_recent' },
+7278:                                  { text: 'Copy with Topics 📂', callback_data: 'mode_topics' }
+7281:                                  { text: 'Copy One Topic 🎯', callback_data: 'mode_single_topic' }
+7283:                              [ { text: '❌ Cancel', callback_data: 'cancel_cmd' } ]

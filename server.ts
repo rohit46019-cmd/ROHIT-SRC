@@ -18,9 +18,12 @@ const activeTasksPerUser = new Map<number, number>();
 const mirrorTopicCache = new Map<string, Map<string, number>>();
 const sourceTopicCache = new Map<string, Map<number, string>>();
 const activeWatchers = new Set<number>();
+let botFloodWaitEnd = 0;
 const mirrorTasks = new Map<string, any[]>();
 let getConnectedUserbotClient: (userId: number) => Promise<any>;
 let startAutoMirrorWatcher: (userId: number, client: TelegramClient) => Promise<any>;
+let createProgressMarkup: (jobKey: string, isPaused: boolean) => any;
+let createProgressBar: (total: number, current: number, label: string, startTime: number, pathStr?: string) => string;
 import fs from 'fs';
 import os from 'os';
 import { CustomFile } from 'telegram/client/uploads';
@@ -82,15 +85,97 @@ let settingsCollection: any = null;
 let approvedUsersCollection: any = null;
 let mirroredMessagesCollection: any = null;
 let queuedTasksCollection: any = null;
+let failedTasksCollection: any = null;
+let fullMirrorSessionsCollection: any = null;
 
 // Global Settings State
 let currentAdminId = process.env.ADMIN_ID;
 let destinationChatId = process.env.DESTINATION_CHAT_ID;
 let currentDownloadLibrary = 'GramJS';
 let currentUploadEngine = 'GramJS';
+let globalCooldownSeconds = 5;
 const uploadEngines = ['GramJS', 'Telethon', 'Pyrogram', 'Hydrogram'];
 const approvedUsersCache = new Set<string>();
 let globalRenameRules: Array<{ keyword: string; replaceWith: string }> = [];
+const processedMessageKeys = new Set<string>();
+const processedCallbackQueryIds = new Set<string>();
+let downloadCounter = 0;
+
+let activeTaskJobs = new Map<string, any>();
+let batchStatusMap = new Map<string, any>();
+let inMemoryMirrorLogs: Array<{ link: string; destId: string; mirroredAt: string; status: string; info?: string }> = [];
+let dbEnqueueTasks: (tasks: Task[]) => Promise<void> = async () => {};
+let dbClearAllTasks: () => Promise<void> = async () => {};
+let dbDequeueTask: (task: Task) => Promise<void> = async () => {};
+let retryAllFailedTasks: () => Promise<number> = async () => 0;
+let retryFailedTask: (id: string) => Promise<boolean> = async () => false;
+let clearAllFailedTasks: () => Promise<boolean> = async () => false;
+let connectedBotClient: TelegramClient | null = null;
+async function getConnectedBotClient(): Promise<TelegramClient | null> {
+    if (botFloodWaitEnd > Date.now()) {
+        console.warn(`[Bot GramJS Client] Skipping connection, still in flood wait until ${new Date(botFloodWaitEnd).toISOString()}`);
+        return null;
+    }
+    if (!token) return null;
+    if (!apiIdValue || !apiHashValue) {
+        console.warn("[getConnectedBotClient] apiIdValue or apiHashValue is missing");
+        return null;
+    }
+    if (connectedBotClient && connectedBotClient.connected) {
+        return connectedBotClient;
+    }
+    let client: TelegramClient | null = null;
+    try {
+        console.log("[Bot GramJS Client] Connecting...");
+        client = new TelegramClient(
+            new StringSession(""),
+            apiIdValue,
+            apiHashValue,
+            {
+                connectionRetries: 10,
+                timeout: 120000,
+                requestRetries: 5,
+                ...getRandomDeviceProps(),
+                useWSS: false,
+                autoReconnect: true,
+            }
+        );
+        // Connect with a fast timeout wrapper to avoid hangs
+        const startPromise = client.start({
+            botAuthToken: token
+        });
+        let timeoutId: any;
+        const timeoutPromise = new Promise((_, reject) => {
+            timeoutId = setTimeout(() => reject(new Error("GramJS bot start timeout after 60000ms")), 60000);
+        });
+        await Promise.race([startPromise, timeoutPromise]);
+        clearTimeout(timeoutId);
+        (client as any)._isBotInApp = true;
+        connectedBotClient = client;
+        console.log("[Bot GramJS Client] Successfully connected!");
+        return connectedBotClient;
+    } catch (err: any) {
+        if (client) {
+            await client.disconnect().catch(() => {});
+        }
+        if (err.name === 'FloodWaitError' || (err.message && err.message.includes('FloodWaitError'))) {
+            const seconds = err.seconds || 1500;
+            botFloodWaitEnd = Date.now() + (seconds * 1000);
+            console.error(`[Bot GramJS Client] FloodWaitError, waiting ${seconds} seconds until ${new Date(botFloodWaitEnd).toISOString()}`);
+        } else {
+            console.error("[Bot GramJS Client] Failed to connect:", err);
+        }
+        connectedBotClient = null; // Ensure we try afresh next time
+        return null;
+    }
+}
+
+function getMsgId(url: string): number {
+    if (!url) return 0;
+    const parts = url.trim().split('/');
+    const last = parts[parts.length - 1];
+    return parseInt(last || '0');
+}
 
 function applyRenameRules(text: string, customRules?: Array<{ keyword: string; replaceWith: string }>): string {
     if (!text) return "";
@@ -205,6 +290,7 @@ interface Task {
     overrideTargetId?: any;
     isMirror?: boolean;
     retries?: number;
+    fullMirrorSessionId?: string;
 }
 
 const MESSAGE_UPDATE_THROTTLE = 2000; // Reduced to 2s for better responsiveness
@@ -214,6 +300,85 @@ const taskControlMap = new Map<string, { isPaused: boolean; shouldRetry: boolean
 let isQueuePaused = false;
 let nextTaskRunAt: number | null = null;
 let runNextTask: () => Promise<void>;
+
+async function resumeDownloadFile(
+    client: any,
+    msg: any,
+    tempFilePath: string,
+    jobKey: string,
+    onProgress: (chunkLength: number, totalSize: number) => Promise<void>
+): Promise<void> {
+    const media = msg.media;
+    if (!media) throw new Error("No media in message");
+
+    let totalSize = 0;
+    if (media instanceof Api.MessageMediaDocument && media.document instanceof Api.Document) {
+        totalSize = Number(media.document.size || 0);
+    } else if (media instanceof Api.MessageMediaPhoto && media.photo instanceof Api.Photo) {
+        const largest = media.photo.sizes.reduce((prev: any, current: any) => {
+            const prevSize = prev.size || (prev.sizes && prev.sizes[0]) || 0;
+            const curSize = current.size || (current.sizes && current.sizes[0]) || 0;
+            return (curSize > prevSize) ? current : prev;
+        });
+        if (largest && (largest as any).size) totalSize = (largest as any).size;
+    }
+
+    // Since we don't do complex byte-level resumption (which causes corruption and GramJS internal socket conflicts),
+    // we delete any partially downloaded file and start fresh.
+    if (fs.existsSync(tempFilePath)) {
+        try {
+            fs.unlinkSync(tempFilePath);
+        } catch (e) {}
+    }
+
+    const customWriter = {
+        stream: fs.createWriteStream(tempFilePath),
+        size: 0,
+        async write(chunk: Buffer) {
+            if (!this.stream.writable) return;
+            this.size += chunk.length;
+            if (!this.stream.write(chunk)) {
+                await new Promise(r => this.stream.once('drain', r));
+            }
+        },
+        close() {
+            this.stream.end();
+        }
+    };
+
+    let lastProgressTime = Date.now();
+    const DOWNLOAD_STALL_TIMEOUT = 60000;
+
+    try {
+        await client.downloadMedia(msg, {
+            outputFile: customWriter,
+            progressCallback: async (downloaded: any, total: any) => {
+                const taskState = taskControlMap.get(jobKey);
+                if (taskState && taskState.isPaused) {
+                    throw new Error("DOWNLOAD_PAUSED");
+                }
+                
+                const now = Date.now();
+                if (now - lastProgressTime > DOWNLOAD_STALL_TIMEOUT) {
+                    throw new Error("DOWNLOAD_TIMEOUT_STALLED");
+                }
+                lastProgressTime = now;
+                
+                await onProgress(Number(downloaded), Number(total || totalSize || 0));
+            }
+        });
+    } finally {
+        if (!customWriter.stream.writableFinished) {
+            customWriter.close();
+        }
+    }
+
+    await new Promise<void>((resolve) => {
+        if (customWriter.stream.writableFinished) return resolve();
+        customWriter.stream.once('finish', () => resolve());
+        customWriter.stream.once('error', () => resolve());
+    });
+}
 
 function getDestinationLink(): string {
     const defaultLink = 'https://t.me/telegram';
@@ -334,22 +499,35 @@ const safeBotCall = async (method: string, ...args: any[]) => {
     return null;
 };
 
+const ensureSafeMessageLength = (text: string): string => {
+    if (!text || text.length <= 4000) return text;
+    let truncated = text.substring(0, 3950);
+    truncated += "\n...(truncated due to length limit)";
+    const tripleBacktickCount = (truncated.match(/```/g) || []).length;
+    if (tripleBacktickCount % 2 === 1) {
+        truncated += "\n```";
+    }
+    return truncated;
+};
+
 const safeSendMessage = async (chatId: number, text: string, options: any = {}) => {
+    const safeText = ensureSafeMessageLength(text);
     try {
         await bot.sendChatAction(chatId, 'typing');
     } catch(e) {}
-    return await safeBotCall('sendMessage', chatId, text, options);
+    return await safeBotCall('sendMessage', chatId, safeText, options);
 };
 
 const safeEditMessage = async (text: string, options: { chat_id: number, message_id: number, parse_mode?: any, disable_web_page_preview?: boolean, reply_markup?: any }) => {
     if (!options.message_id || options.message_id === 0) return;
+    const safeText = ensureSafeMessageLength(text);
     
     // 1. Attempt editMessageText
-    const res = await safeBotCall('editMessageText', text, options);
+    const res = await safeBotCall('editMessageText', safeText, options);
     if (res) return res;
 
     // 2. Fallback: Attempt editMessageCaption
-    const resCaption = await safeBotCall('editMessageCaption', text, {
+    const resCaption = await safeBotCall('editMessageCaption', safeText, {
         chat_id: options.chat_id,
         message_id: options.message_id,
         parse_mode: options.parse_mode,
@@ -360,7 +538,7 @@ const safeEditMessage = async (text: string, options: { chat_id: number, message
     // 3. Ultimate Fallback: Delete and send new text message
     try {
         await safeBotCall('deleteMessage', options.chat_id, options.message_id).catch(() => {});
-        return await safeSendMessage(options.chat_id, text, {
+        return await safeSendMessage(options.chat_id, safeText, {
             parse_mode: options.parse_mode,
             disable_web_page_preview: options.disable_web_page_preview,
             reply_markup: options.reply_markup
@@ -369,6 +547,374 @@ const safeEditMessage = async (text: string, options: { chat_id: number, message
         return null;
     }
 };
+
+const activeFullMirrorSessions = new Map<string, any>();
+
+async function resumeFullMirrorSession(chatId: number, sessionId: string, triggerQuery: any) {
+    if (!fullMirrorSessionsCollection) {
+        throw new Error("Database not ready.");
+    }
+    const session = await fullMirrorSessionsCollection.findOne({ sessionId });
+    if (!session) {
+        throw new Error("Session tracker not found in database.");
+    }
+
+    const { sourceId, dest, isLiveOption, userId } = session;
+    if (!sourceId || !dest) {
+        throw new Error("Invalid session backup data.");
+    }
+
+    // Clean up any pending tasks for this session from database and in-memory queue to start fresh
+    for (let i = taskQueue.length - 1; i >= 0; i--) {
+        if (taskQueue[i].fullMirrorSessionId === sessionId) {
+            taskQueue.splice(i, 1);
+        }
+    }
+    if (queuedTasksCollection) {
+        await queuedTasksCollection.deleteMany({ fullMirrorSessionId: sessionId }).catch(() => {});
+    }
+
+    const targetUid = Number(userId || await resolveSettingsUserId(triggerQuery.from.id));
+    const client = await getConnectedUserbotClient(targetUid);
+    if (!client) throw new Error("Your Userbot session is not active. Please reconnect first.");
+
+    let sourceEntity: any;
+    try {
+        sourceEntity = await safelyResolveFullEntity(client, sourceId);
+    } catch (e: any) {
+        if (!sourceId.startsWith('-100') && !isNaN(Number(sourceId))) {
+            sourceEntity = await safelyResolveFullEntity(client, "-100" + sourceId);
+        } else {
+            throw e;
+        }
+    }
+    
+    const destPath = dest.destId;
+    let destEntity: any = null;
+    try {
+        destEntity = await safelyResolveFullEntity(client, destPath);
+    } catch (e: any) {
+        if (!destPath.startsWith('-100') && !isNaN(Number(destPath))) {
+            destEntity = await safelyResolveFullEntity(client, "-100" + destPath).catch(() => null);
+        }
+    }
+    if (!destEntity) {
+        throw new Error("Could not access destination group.");
+    }
+
+    let sourceTopics: Record<number, string> = {};
+    let destTopics: Record<string, number> = {};
+    const destTopicsTitleMap: Record<number, string> = {};
+    const isSourceForum = (sourceEntity as any).forum;
+    const isDestForum = (destEntity as any).forum;
+
+    if (isSourceForum) {
+        try {
+            const res: any = await client.invoke(new Api.channels.GetForumTopics({ channel: sourceEntity, offsetDate: 0, offsetId: 0, offsetTopic: 0, limit: 100 }));
+            res.topics?.forEach((t: any) => {
+                if (t.title) sourceTopics[t.id] = t.title;
+            });
+        } catch (e) {
+            console.warn("Failed to fetch source topics:", e);
+        }
+    }
+
+    if (isDestForum) {
+        try {
+            const res: any = await client.invoke(new Api.channels.GetForumTopics({ channel: destEntity, offsetDate: 0, offsetId: 0, offsetTopic: 0, limit: 100 }));
+            res.topics?.forEach((t: any) => {
+                if (t.title) {
+                    destTopics[t.title.trim().toLowerCase()] = t.id;
+                    destTopicsTitleMap[t.id] = t.title;
+                }
+            });
+        } catch (e) {
+            console.warn("Failed to fetch destination topics:", e);
+        }
+    }
+
+    const sourceIdRaw = (sourceEntity as any).id?.toString() || "";
+    const sourceIdClean = sourceIdRaw.replace('-100', '');
+
+    const alreadyMirroredDocs = mirroredMessagesCollection ? 
+          await mirroredMessagesCollection.find({ destId: destPath }).toArray() : [];
+    const alreadyMirroredLinks = new Set(alreadyMirroredDocs.map((doc: any) => doc.link));
+
+    // Load blocked topics to skip
+    const userDoc = await approvedUsersCollection?.findOne({ userId: targetUid.toString() });
+    const blockedTopics = (userDoc?.blockedTopics || []).map((t: string) => t.trim().toLowerCase());
+
+    const msgsToQueue = [];
+    const topicMap: Record<number, number | undefined> = {};
+    let latestMsgId = 0;
+    let skippedCount = 0;
+
+    for await (const m of client.iterMessages(sourceEntity, { reverse: true, limit: undefined })) {
+        if (m.action) continue; 
+        if (!m.message && !m.media) continue;
+
+        if (m.id > latestMsgId) {
+            latestMsgId = m.id;
+        }
+
+        const virtualLink = `https://t.me/c/${sourceIdClean}/${m.id}`;
+        if (alreadyMirroredLinks.has(virtualLink)) {
+            skippedCount++;
+            continue;
+        }
+
+        let overrideThreadId: number | undefined = dest.destThreadId; // Base thread ID
+        let sourceTopicId: number | undefined;
+
+        if (isSourceForum && isDestForum && (m as any).replyTo) {
+            const replyTo = (m as any).replyTo;
+            sourceTopicId = replyTo.replyToTopId || replyTo.replyToMsgId;
+            
+            if (sourceTopicId) {
+                const topicTitle = sourceTopics[sourceTopicId];
+                if (topicTitle) {
+                    const normTitle = topicTitle.trim().toLowerCase();
+                    // Skip if blocked
+                    if (blockedTopics.some((bt: string) => bt === normTitle || bt === sourceTopicId!.toString())) {
+                        skippedCount++;
+                        continue;
+                    }
+
+                    if (topicMap[sourceTopicId] !== undefined) {
+                        overrideThreadId = topicMap[sourceTopicId] ?? dest.destThreadId;
+                    } else {
+                        const normalizedTitle = topicTitle.trim().toLowerCase();
+                        if (destTopics[normalizedTitle]) {
+                            topicMap[sourceTopicId] = destTopics[normalizedTitle];
+                            overrideThreadId = destTopics[normalizedTitle];
+                        } else {
+                            try {
+                                const createResult: any = await client.invoke(new Api.channels.CreateForumTopic({
+                                    channel: destEntity,
+                                    title: topicTitle
+                                }));
+                                const update = createResult.updates?.find((u: any) => u.className === 'UpdateNewForumTopic');
+                                let newDestTopicId = update?.topicId;
+                                
+                                if (!newDestTopicId) {
+                                    const retryTopics: any = await client.invoke(new Api.channels.GetForumTopics({ channel: destEntity, limit: 100 }));
+                                    newDestTopicId = retryTopics.topics?.find((t: any) => t.title?.trim().toLowerCase() === normalizedTitle)?.id;
+                                }
+                                
+                                if (newDestTopicId) {
+                                    destTopics[normalizedTitle] = newDestTopicId;
+                                    destTopicsTitleMap[newDestTopicId] = topicTitle;
+                                    topicMap[sourceTopicId] = newDestTopicId;
+                                    overrideThreadId = newDestTopicId;
+                                }
+                            } catch (e) {
+                                console.warn(`Failed to create topic ${topicTitle}:`, e);
+                                topicMap[sourceTopicId] = undefined;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        msgsToQueue.push({ 
+            chatId, 
+            link: virtualLink, 
+            userId: triggerQuery.from.id,
+            forceGeneralPath: true,
+            overrideThreadId,
+            overrideTargetId: destPath,
+            isMirror: true
+         });
+    }
+
+    if (msgsToQueue.length === 0) {
+        throw new Error(`All remaining messages are already successfully mirrored or skipped.`);
+    }
+
+    // Sort by topic
+    const tasksByTopic = new Map<string | number, any[]>();
+    const generalTasks: any[] = [];
+
+    for (const task of msgsToQueue) {
+        if (task.overrideThreadId !== undefined && task.overrideThreadId !== null) {
+            if (!tasksByTopic.has(task.overrideThreadId)) {
+                tasksByTopic.set(task.overrideThreadId, []);
+            }
+            tasksByTopic.get(task.overrideThreadId)!.push(task);
+        } else {
+            generalTasks.push(task);
+        }
+    }
+
+    const orderedTasks: any[] = [];
+    if (generalTasks.length > 0) {
+        orderedTasks.push(...generalTasks);
+    }
+    for (const [topicId, tasks] of tasksByTopic.entries()) {
+        orderedTasks.push(...tasks);
+    }
+
+    // Re-create new topic stats and session object
+    const topicStats: Record<string | number, { total: number; processed: number; isMarkedCompleted: boolean; title: string }> = {};
+
+    for (const task of orderedTasks) {
+        task.fullMirrorSessionId = sessionId;
+
+        const threadId = task.overrideThreadId !== undefined && task.overrideThreadId !== null ? task.overrideThreadId : 'general';
+        const topicTitle = task.overrideThreadId !== undefined && task.overrideThreadId !== null ? (destTopicsTitleMap[task.overrideThreadId] || `Topic #${task.overrideThreadId}`) : 'General Discussion';
+
+        if (!topicStats[threadId]) {
+            topicStats[threadId] = {
+                total: 0,
+                processed: 0,
+                isMarkedCompleted: false,
+                title: topicTitle
+            };
+        }
+        topicStats[threadId].total++;
+    }
+
+    // Update session tracker in mongoDB and memory
+    const updatedSession = {
+        ...session,
+        totalFiles: orderedTasks.length,
+        processedFiles: 0,
+        successCount: 0,
+        failedCount: 0,
+        topicStats
+    };
+
+    activeFullMirrorSessions.set(sessionId, updatedSession);
+    await fullMirrorSessionsCollection.updateOne({ sessionId }, { $set: updatedSession });
+
+    // Trigger initial progress bar write/re-write
+    await updateGlobalMirrorProgress(sessionId).catch(pErr => console.error("[Resume Progress Update Failed]", pErr));
+
+    // Enqueue
+    taskQueue.push(...orderedTasks);
+    dbEnqueueTasks(orderedTasks).catch(e => console.error("[Queue DB] Bulk enqueue error during resume:", e));
+    runNextTask();
+
+    return orderedTasks.length;
+}
+
+const showBlockedTopicsPanel = async (chatId: number, fromId: number, editMessageId?: number) => {
+    if (!fromId) return;
+    const settingsUid = await resolveSettingsUserId(fromId);
+    const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
+    const blockedTopics = userDoc?.blockedTopics || [];
+
+    let text = `🚫 **Blocked Topics Manager**\n\n` +
+               `Configure topic names or IDs to skip downloading during the full mirror process. If a topic matches, the bot will skip its files completely.\n\n` +
+               `**Current Blocked Topics (${blockedTopics.length}):**\n`;
+               
+    if (blockedTopics.length > 0) {
+        blockedTopics.forEach((t: string, idx: number) => {
+            text += `${idx + 1}. \`${t}\`\n`;
+        });
+    } else {
+        text += `_No topics are currently blocked._\n`;
+    }
+
+    const markup = {
+        inline_keyboard: [
+            [
+                { text: '➕ Add Topic', callback_data: 'add_blocked_topic_start' },
+                { text: '🗑 Clear All', callback_data: 'clear_blocked_topics_action' }
+            ],
+            [{ text: '⬅️ Back to Settings', callback_data: 'bot_settings' }]
+        ]
+    };
+
+    if (editMessageId) {
+        await safeEditMessage(text, {
+            chat_id: chatId,
+            message_id: editMessageId,
+            parse_mode: 'Markdown',
+            reply_markup: markup
+        });
+    } else {
+        await safeSendMessage(chatId, text, {
+            parse_mode: 'Markdown',
+            reply_markup: markup
+        });
+    }
+};
+
+async function updateGlobalMirrorProgress(sessionId: string) {
+    const session = activeFullMirrorSessions.get(sessionId);
+    if (!session) return;
+    
+    const { chatId, statusMsgId, totalFiles, processedFiles, successCount, failedCount, topicStats } = session;
+    
+    // Find active topic title
+    let activeTopicName = 'General Discussion';
+    let completedTopics = 0;
+    const totalTopics = Object.keys(topicStats).length;
+    
+    for (const threadId of Object.keys(topicStats)) {
+        const stats = topicStats[threadId];
+        if (stats.processed < stats.total) {
+            // First non-completed topic is considered the active one
+            activeTopicName = stats.title;
+        }
+        if (stats.processed >= stats.total) {
+            completedTopics++;
+        }
+    }
+    
+    const filePercentage = totalFiles > 0 ? Math.round((processedFiles / totalFiles) * 100) : 0;
+    
+    // Build beautiful progress bar (length 15)
+    const barLength = 15;
+    const filledLength = Math.round((filePercentage / 100) * barLength);
+    const emptyLength = barLength - filledLength;
+    const bar = '█'.repeat(filledLength) + '░'.repeat(emptyLength);
+    
+    const isFinished = processedFiles >= totalFiles;
+    
+    let text = `📍 **[GLOBAL PROGRESS] Full Group Mirror Setup**\n\n` +
+               `📁 **Total Files inside Group:** \`${totalFiles}\`\n` +
+               `⏳ **Processed:** \`${processedFiles} / ${totalFiles}\` ` +
+               `(🟢 Success: \`${successCount}\` | 🔴 Failed: \`${failedCount}\`)\n\n` +
+               `👉 **Mirror Progress Bar:**\n` +
+               `\`[${bar}]\` **${filePercentage}%**\n\n` +
+               `📌 **Total Topics:** \`${totalTopics}\`\n` +
+               `✅ **Completed Topics:** \`${completedTopics} / ${totalTopics}\`\n\n` +
+               `🔄 **Current Active Topic:** \`${activeTopicName}\`\n` +
+               `└ _Status:_ ${isFinished ? '🟢 Mirroring Completed!' : '⏳ Mirroring contents...'}\n\n` +
+               `━━━━━━━\n` +
+               `_This pinned status bar tracks the entire folder mirroring process in real-time._`;
+               
+    if (isFinished) {
+        text += `\n\n🎉 **Full Mirror completed successfully!**`;
+    }
+    
+    await safeEditMessage(text, { 
+        chat_id: chatId, 
+        message_id: statusMsgId, 
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '🚫 Block This or Any Topic', callback_data: `add_blocked_topic_start` }]
+            ]
+        }
+    }).catch((err: any) => {
+        console.warn(`[Progress Update] Failed to edit message for session ${sessionId}:`, err.message);
+    });
+    
+    if (isFinished) {
+        activeFullMirrorSessions.delete(sessionId);
+        if (fullMirrorSessionsCollection) {
+            await fullMirrorSessionsCollection.deleteOne({ sessionId }).catch(() => {});
+        }
+    } else {
+        if (fullMirrorSessionsCollection) {
+            await fullMirrorSessionsCollection.replaceOne({ sessionId }, session, { upsert: true }).catch(() => {});
+        }
+    }
+}
 
 async function safelyResolveEntity(client: TelegramClient, entity: any): Promise<any> {
     try {
@@ -540,11 +1086,7 @@ async function safelyResolveEntity(client: TelegramClient, entity: any): Promise
             try {
                 const chResp = await client.invoke(new Api.channels.GetChannels({
                     id: [new Api.InputChannel({ channelId: bigInt(idStrClean), accessHash: bigInt(0) })]
-                })).catch(e => {
-                    // If CHANNEL_INVALID, it might be private or deleted
-                    if (e.errorMessage === 'CHANNEL_INVALID' || e.errorMessage === 'CHANNEL_PRIVATE' || (e.message && (e.message.includes('CHANNEL_INVALID') || e.message.includes('CHANNEL_PRIVATE')))) return null;
-                    throw e;
-                }) as any;
+                })).catch(() => null) as any;
                 
                 if (chResp && chResp.chats && chResp.chats.length > 0) {
                     try {
@@ -561,31 +1103,33 @@ async function safelyResolveEntity(client: TelegramClient, entity: any): Promise
         }
 
         // II. Deep search via getDialogs (Paginating to find "lost" entities)
-        try {
-            console.log(`[safelyResolveEntity] Starting deep resolve for ${idStrClean}...`);
-            let batchLimit = 1000;
-            let currentOffsetDate = 0;
-            
-            // Try first 1000
-            const firstBatch = await client.getDialogs({ limit: 1000 });
-            let found = firstBatch.find(matchDialog);
-            if (found) return await client.getInputEntity(found.entity);
+        if (!(client as any)._isBotInApp) {
+            try {
+                console.log(`[safelyResolveEntity] Starting deep resolve for ${idStrClean}...`);
+                let batchLimit = 1000;
+                let currentOffsetDate = 0;
+                
+                // Try first 1000
+                const firstBatch = await client.getDialogs({ limit: 1000 });
+                let found = firstBatch.find(matchDialog);
+                if (found) return await client.getInputEntity(found.entity);
 
-            // If large account, go deeper (up to 12,000 dialogs)
-            if (firstBatch.length >= 950) {
-                console.log(`[safelyResolveEntity] Extremely large account. Paginating deeply...`);
-                let lastDate = firstBatch[firstBatch.length - 1].date;
-                for (let i = 0; i < 11; i++) {
-                    const moreDialogs = await client.getDialogs({ limit: 1000, offsetDate: lastDate });
-                    if (!moreDialogs || moreDialogs.length === 0) break;
-                    found = moreDialogs.find(matchDialog);
-                    if (found) return await client.getInputEntity(found.entity);
-                    lastDate = moreDialogs[moreDialogs.length - 1].date;
-                    if (moreDialogs.length < 1000) break;
+                // If large account, go deeper (up to 12,000 dialogs)
+                if (firstBatch.length >= 950) {
+                    console.log(`[safelyResolveEntity] Extremely large account. Paginating deeply...`);
+                    let lastDate = firstBatch[firstBatch.length - 1].date;
+                    for (let i = 0; i < 11; i++) {
+                        const moreDialogs = await client.getDialogs({ limit: 1000, offsetDate: lastDate });
+                        if (!moreDialogs || moreDialogs.length === 0) break;
+                        found = moreDialogs.find(matchDialog);
+                        if (found) return await client.getInputEntity(found.entity);
+                        lastDate = moreDialogs[moreDialogs.length - 1].date;
+                        if (moreDialogs.length < 1000) break;
+                    }
                 }
+            } catch (dgErr: any) {
+                console.warn(`[safelyResolveEntity] Deep dialog search failed: ${dgErr.message}`);
             }
-        } catch (dgErr: any) {
-            console.warn(`[safelyResolveEntity] Deep dialog search failed: ${dgErr.message}`);
         }
 
         // III. Last Resort: Forced Construction
@@ -638,7 +1182,7 @@ async function safelyResolveFullEntity(client: TelegramClient, entity: any): Pro
 const adminActiveSession = new Map<number, number>(); // adminTelegramId -> activeUserbotUserId
 
 const userActionStates: Record<number, { 
-    type: 'batch_start' | 'batch_end' | 'mirror_target' | 'set_thumb' | 'set_cap' | 'set_path' | 'mirror_choice' | 'set_mirror_source' | 'enter_topic_id' | 'mirror_path_add_source' | 'mirror_path_await_dest' | 'topic_clone_group' | 'topic_clone_topic_id' | 'add_rename_rule' | 'set_api_id' | 'set_api_hash' | 'full_mirror_group' | 'full_mirror_dest_select' | 'live_mirror_dest_select' | 'set_cooldown_secs' | 'set_concurrency_val' | 'topic_clone_dest_select' | 'enter_clone_dest_id' | 'set_jump_to_path', 
+    type: 'batch_start' | 'batch_end' | 'mirror_target' | 'set_thumb' | 'set_cap' | 'set_path' | 'mirror_choice' | 'set_mirror_source' | 'enter_topic_id' | 'mirror_path_add_source' | 'mirror_path_await_dest' | 'topic_clone_group' | 'topic_clone_topic_id' | 'add_rename_rule' | 'set_api_id' | 'set_api_hash' | 'full_mirror_group' | 'full_mirror_dest_select' | 'live_mirror_dest_select' | 'set_cooldown_secs' | 'set_concurrency_val' | 'topic_clone_dest_select' | 'enter_clone_dest_id' | 'set_jump_to_path' | 'add_blocked_topic', 
     startLink?: string,
     mirrorTarget?: any,
     pendingMirrorDest?: string,
@@ -673,10 +1217,14 @@ async function runActiveWatchdog() {
                 if (existingClient.connected) {
                     try {
                         // Heartbeat ping check (10s timeout)
+                        let timeoutId: any;
                         await Promise.race([
                             existingClient.getMe(),
-                            new Promise((_, reject) => setTimeout(() => reject(new Error("Heartbeat Timeout")), 10000))
+                            new Promise((_, reject) => {
+                                timeoutId = setTimeout(() => reject(new Error("Heartbeat Timeout")), 10000);
+                            })
                         ]);
+                        clearTimeout(timeoutId);
                         healthy = true;
                     } catch (heartbeatErr: any) {
                         console.warn(`[Watchdog] User ${userId} heartbeat check failed: ${heartbeatErr.message}`);
@@ -722,10 +1270,23 @@ if (mongoUri) {
       approvedUsersCollection = db.collection('approved_users');
       mirroredMessagesCollection = db.collection('mirrored_messages');
       queuedTasksCollection = db.collection('queued_tasks');
+      failedTasksCollection = db.collection('failed_tasks');
+      fullMirrorSessionsCollection = db.collection('full_mirror_sessions');
 
       // Load approved users into cache
       const users = await approvedUsersCollection.find({}).toArray();
       users.forEach((u: any) => approvedUsersCache.add(u.userId.toString()));
+
+      // Load active full mirror sessions
+      try {
+          const sessions = await fullMirrorSessionsCollection.find({}).toArray();
+          for (const s of sessions) {
+              activeFullMirrorSessions.set(s.sessionId, s);
+          }
+          console.log(`[Init] Loaded ${activeFullMirrorSessions.size} active full mirror sessions from DB.`);
+      } catch (err) {
+          console.error("[Init Sessions] Failed to load full mirror sessions:", err);
+      }
 
       // Load persistent queued tasks
       try {
@@ -743,7 +1304,9 @@ if (mongoUri) {
                       overrideThreadId: dbTask.overrideThreadId,
                       forceGeneralPath: dbTask.forceGeneralPath,
                       overrideTargetId: dbTask.overrideTargetId,
-                      isMirror: dbTask.isMirror
+                      isMirror: dbTask.isMirror,
+                      fullMirrorSessionId: dbTask.fullMirrorSessionId,
+                      retries: dbTask.retries !== undefined ? Number(dbTask.retries) : 0
                   };
                   taskQueue.push(restored);
               }
@@ -770,6 +1333,9 @@ if (mongoUri) {
         }
         if (settings.maxTasksPerUser !== undefined) {
           MAX_TASKS_PER_USER = Number(settings.maxTasksPerUser);
+        }
+        if (settings.cooldownSeconds !== undefined) {
+          globalCooldownSeconds = Number(settings.cooldownSeconds);
         }
         
         if (settings.stringSession) {
@@ -935,6 +1501,9 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
         bot.getMe().then((me) => {
           botInfo = me;
           console.log(`Bot started: @${me.username}`);
+        }).catch((err) => {
+          botStatus = 'Error';
+          console.error(`Failed to retrieve bot info:`, err.message);
         });
 
         // Security Interceptor to ignore all non-admin messages globally
@@ -951,19 +1520,19 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
         // Commands List for Bot Menu
         bot.setMyCommands([
           { command: 'start', description: 'Start the bot' },
+          { command: 'batch', description: 'Download multiple links' },
+          { command: 'settings', description: 'Show bot settings' },
+          { command: 'cancel', description: 'Stop current task' },
+          { command: 'jumptopath', description: 'Directly set upload destination ID/Username' },
+          { command: 'setpath', description: 'Set upload destination Topic/Group' },
+          { command: 'setmirror', description: 'Configure a new auto-mirror path' },
+          { command: 'mirror', description: 'Clone group/topic content' },
           { command: 'ping', description: 'Check bot latency' },
           { command: 'status', description: 'Show queue and database status' },
           { command: 'login', description: 'Log in with Telegram credentials' },
           { command: 'logout', description: 'Revoke session and clear data' },
-          { command: 'batch', description: 'Download multiple links' },
-          { command: 'cancel', description: 'Stop current task' },
-          { command: 'settings', description: 'Show bot settings' },
           { command: 'sync', description: 'Force sync Userbot groups' },
           { command: 'restart', description: 'Restart bot internal services' },
-          { command: 'mirror', description: 'Clone group/topic content' },
-          { command: 'setpath', description: 'Set upload destination Topic/Group' },
-          { command: 'jumptopath', description: 'Directly set upload destination ID/Username' },
-          { command: 'setmirror', description: 'Configure a new auto-mirror path' },
           { command: 'clearmirrorhistory', description: 'Clear mirrored links history' },
           { command: 'setcooldown', description: 'Set delay between mirror tasks' },
           { command: 'dashboard', description: 'Show active progress & system dashboard' },
@@ -975,14 +1544,7 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
           { command: 'prioritizetask', description: 'Bring task to front: /prioritizetask <idx>' },
           { command: 'clearqueue', description: 'Wipe all pending tasks in queue' },
           { command: 'cleartopiccache', description: 'Clear topic ID cache' },
-          { command: 'help', description: 'Show help guide' },
-          { command: 'start', description: 'Start the bot' },
-          { command: 'ping', description: 'Check bot latency' },
-          { command: 'login', description: 'Login to Telegram' },
-          { command: 'cancel', description: 'Cancel current action' },
-          { command: 'logout', description: 'Logout from Telegram' },
-          { command: 'restart', description: 'Restart the bot process' },
-          { command: 'batch', description: 'Handle batch operations' },
+          { command: 'help', description: 'Show help guide' }
         ]);
 
         const handleSetMirror = async (chatId: number, fromId: number | undefined, msg: TelegramBot.Message) => {
@@ -1113,7 +1675,8 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
         if (userDoc?.mirrorPaths && userDoc.mirrorPaths.length > 0) {
             mirrorPathsText = `\n📂 **Mirror Pairings (${userDoc.mirrorPaths.length}):**\n`;
             userDoc.mirrorPaths.slice(0, 5).forEach((p: any, i: number) => {
-                mirrorPathsText += `${i + 1}. \`${p.sourceId}\` ➔ ${p.groupName}${p.topicName !== 'General' ? ' (' + p.topicName + ')' : ''}\n`;
+                const sourceName = p.sourceName || 'Target Group';
+                mirrorPathsText += `${i + 1}. **(${sourceName}) (${p.sourceId}) ➔ ${p.groupName}**${p.topicName !== 'General' ? ' (' + p.topicName + ')' : ''}\n`;
             });
             if (userDoc.mirrorPaths.length > 5) mirrorPathsText += `_...and ${userDoc.mirrorPaths.length - 5} more_\n`;
         }
@@ -1123,56 +1686,58 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
             uploadModeDisplay = '📁 Document/File';
         }
 
+        let uploadAgentDisplay = '👤 User Account';
+        if (userDoc?.uploadAgent === 'bot') {
+            uploadAgentDisplay = '🤖 Bot itself';
+        }
+
         const apiDisplayId = apiIdValue ? '✅ Set (Hidden for Security)' : '❌ Missing';
         const apiDisplayHash = apiHashValue ? '✅ Set (Hidden for Security)' : '❌ Missing';
 
         const cooldownSecs = userDoc?.cooldownSeconds !== undefined ? userDoc.cooldownSeconds : 5;
         const cooldownDisplay = cooldownSecs === 0 ? '🔴 OFF (0s)' : `🟢 ${cooldownSecs} seconds`;
 
-        const text = `⚙️ **Advanced Configuration**\n\n` +
-                     `• **Database:** ${dbStatus === 'Connected' ? '✅ Online' : '❌ Offline'}\n` +
-                     `• **Userbot:** ${session ? '✅ Active' : '❌ Missing'}\n` +
-                     `• **Upload Mode:** ${uploadModeDisplay}\n` +
-                     `• **Engine:** 🚀 ${currentUploadEngine}\n` +
-                     `• **Destination:** 📍 \`${pathDisplay}\`\n` +
-                     `• **Cooldown Between Tasks:** ${cooldownDisplay}\n` +
-                     `• **Max Concurrency:** \`${MAX_CONCURRENT_TASKS}\` workers (User limit: \`${MAX_TASKS_PER_USER}\`)\n` +
-                     `• **API ID:** ${apiDisplayId}\n` +
-                     `• **API Hash:** ${apiDisplayHash}\n\n` +
+        const text = `⚙️ 𝗔𝗱𝘃𝗮𝗻𝗰𝗲𝗱 𝗖𝗼𝗻𝗳𝗶𝗴𝘂𝗿𝗮𝘁𝗶𝗼𝗻\n\n` +
+                     `🗄️ 𝗗𝗮𝘁𝗮𝗯𝗮𝘀𝗲: ${dbStatus === 'Connected' ? '✅ Online' : '❌ Offline'}\n` +
+                     `👤 𝗨𝘀𝗲𝗿𝗯𝗼𝘁: ${session ? '✅ Active' : '❌ Missing'}\n` +
+                     `🎬 𝗠𝗼𝗱𝗲: ${uploadModeDisplay}\n` +
+                     `🤖 𝗔𝗴𝗲𝗻𝘁: ${uploadAgentDisplay}\n` +
+                     `🚀 𝗘𝗻𝗴𝗶𝗻𝗲: ${currentUploadEngine}\n` +
+                     `📍 𝗗𝗲𝘀𝘁𝗶𝗻𝗮𝘁𝗶𝗼𝗻: \`${pathDisplay}\`\n` +
+                     `⏱️ 𝗖𝗼𝗼𝗹𝗱𝗼𝘄𝗻: ${cooldownDisplay}\n` +
+                     `⚡ 𝗖𝗼𝗻𝗰𝘂𝗿𝗿𝗲𝗻𝗰𝘆: \`${MAX_CONCURRENT_TASKS}\`\n\n` +
                      `${mirrorPathsText}\n` +
-                     `Configure your bot parameters below:`;
+                     `👇 𝗖𝗼𝗻𝗳𝗶𝗴𝘂𝗿𝗲 𝗣𝗮𝗿𝗮𝗺𝗲𝘁𝗲𝗿𝘀:`;
         
         const markup = {
             inline_keyboard: [
               [
-                { text: 'Set Thumb', callback_data: 'set_thumb' },
-                { text: 'Clr Thumb', callback_data: 'clr_thumb' },
-                { text: 'Caption', callback_data: 'set_cap' }
+                { text: '🖼️ 𝗧𝗵𝘂𝗺𝗯', callback_data: 'set_thumb' },
+                { text: '🗑️ 𝗧𝗵𝘂𝗺𝗯', callback_data: 'clr_thumb' },
+                { text: '📝 𝗖𝗮𝗽𝘁𝗶𝗼𝗻', callback_data: 'set_cap' }
               ],
               [
-                { text: '📁 Set Path', callback_data: 'set_path_cmd' },
-                { text: '🗑 Reset Path', callback_data: 'clr_path_cmd' },
-                { text: '📂 Manage Mirror', callback_data: 'manage_mirror_paths' }
+                { text: '📂 𝗣𝗮𝘁𝗵', callback_data: 'set_path_cmd' },
+                { text: '🗑️ 𝗣𝗮𝘁𝗵', callback_data: 'clr_path_cmd' },
+                { text: '🔄 𝗠𝗶𝗿𝗿𝗼𝗿𝘀', callback_data: 'manage_mirror_paths' }
               ],
               [
-                { text: '🔑 Set API ID', callback_data: 'set_api_id' },
-                { text: '🔑 Set API Hash', callback_data: 'set_api_hash' }
+                { text: `🚀 ${currentUploadEngine}`, callback_data: 'toggle_engine' },
+                { text: userDoc?.uploadMode === 'document' ? '📁 𝗙𝗶𝗹𝗲' : '📹 𝗩𝗶𝗱𝗲𝗼', callback_data: 'toggle_mode' },
+                { text: userDoc?.uploadAgent === 'bot' ? '🤖 𝗕𝗼𝘁' : '👤 𝗨𝘀𝗲𝗿', callback_data: 'toggle_agent' }
               ],
               [
-                { text: `Engine: ${currentUploadEngine}`, callback_data: 'toggle_engine' },
-                { text: userDoc?.uploadMode === 'document' ? '📁 Mode: File' : '📹 Mode: Video', callback_data: 'toggle_mode' },
-                { text: 'Rename Rules', callback_data: 'toggle_rename' }
+                { text: '✏️ 𝗥𝗲𝗻𝗮𝗺𝗲', callback_data: 'toggle_rename' },
+                { text: `⏱️ 𝗗𝗲𝗹𝗮𝘆 ${cooldownSecs}`, callback_data: 'change_cooldown_start' },
+                { text: `⚡ 𝗠𝗮𝘅 ${MAX_CONCURRENT_TASKS}`, callback_data: 'change_concurrency_start' }
               ],
               [
-                { text: `⏱ Cooldown: ${cooldownSecs === 0 ? 'OFF (0s)' : `${cooldownSecs}s`}`, callback_data: 'change_cooldown_start' },
-                { text: `⚡ Concurrency: ${MAX_CONCURRENT_TASKS}`, callback_data: 'change_concurrency_start' }
+                { text: '🔄 𝗦𝘆𝗻𝗰', callback_data: 're_login' },
+                { text: '📜 𝗟𝗼𝗴𝘀', callback_data: 'view_logs' },
+                { text: '🛡️ 𝗔𝘂𝗱𝗶𝘁', callback_data: 'check_perms' },
+                { text: '🚫 𝗕𝗮𝗻', callback_data: 'blocked_topics_panel' }
               ],
-              [
-                { text: 'Force Sync', callback_data: 're_login' },
-                { text: 'Logs', callback_data: 'view_logs' },
-                { text: 'Audit', callback_data: 'check_perms' }
-              ],
-              [{ text: '⬅️ Back to Menu', callback_data: 'menu_back' }]
+              [{ text: '⬅️ 𝗕𝗮𝗰𝗸', callback_data: 'menu_back' }]
             ]
         };
 
@@ -1263,13 +1828,13 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
     bot.onText(/\/status/, async (msg) => {
         if (!isAdmin(msg.from?.id)) return;
         const totalUsers = approvedUsersCollection ? await approvedUsersCollection.countDocuments({}) : 0;
-        const msgStr = `📊 System Status:
-Queue: ${taskQueue.length}
-Active: ${activeTasksCount}
-MaxConcurrent: ${MAX_CONCURRENT_TASKS}
-Total Users: ${totalUsers}
-NextTaskRunAt: ${nextTaskRunAt}`;
-        safeSendMessage(msg.chat.id, msgStr);
+        const msgStr = `📊 **𝗦𝘆𝘀𝘁𝗲𝗺 𝗦𝘁𝗮𝘁𝘂𝘀 & 𝗠𝗲𝘁𝗿𝗶𝗰𝘀**\n\n` +
+                       `⏳ **𝗤𝘂𝗲𝘂𝗲 𝗟𝗲𝗻𝗴𝘁𝗵:** \`${taskQueue.length} tasks\`\n` +
+                       `⚙️ **𝗔𝗰𝘁𝗶𝘃𝗲 𝗧𝗮𝘀𝗸𝘀:** \`${activeTasksCount}\`\n` +
+                       `⚡ **𝗠𝗮𝘅 𝗖𝗼𝗻𝗰𝘂𝗿𝗿𝗲𝗻𝗰𝘆:** \`${MAX_CONCURRENT_TASKS}\`\n` +
+                       `👥 **𝗧𝗼𝘁𝗮𝗹 𝗨𝘀𝗲𝗿𝘀:** \`${totalUsers}\`\n` +
+                       `⏱️ **𝗡𝗲𝘅𝘁 𝗥𝘂𝗻 𝗔𝘁:** \`${nextTaskRunAt ? nextTaskRunAt.toLocaleString() : 'Immediate'}\``;
+        safeSendMessage(msg.chat.id, msgStr, { parse_mode: 'Markdown' });
     });
 
     const sendMainMenu = (chatId: number) => {
@@ -1283,7 +1848,7 @@ NextTaskRunAt: ${nextTaskRunAt}`;
             resize_keyboard: true,
             one_time_keyboard: false
         };
-        bot.sendMessage(chatId, "🛠 **Bot Main Menu**\n\nSelect a task:", {
+        bot.sendMessage(chatId, "🛠 𝗕𝗼𝘁 𝗠𝗮𝗶𝗻 𝗠𝗲𝗻𝘂\n\nSelect a task:", {
             reply_markup: keyboard
         });
     };
@@ -1296,41 +1861,100 @@ NextTaskRunAt: ${nextTaskRunAt}`;
             resize_keyboard: true,
             one_time_keyboard: false
         };
-        bot.sendMessage(chatId, "🛠 **Navigation:**", {
+        bot.sendMessage(chatId, "⬅️ Use the button below to return to the Main Menu:", {
             reply_markup: keyboard
         });
     };
 
-    const handleStartMessage = (msg: any) => {
-        const photoUrl = `https://picsum.photos/1000/600?random=${Date.now()}`;
-        
-        if (!isAuthorized(msg.from?.id)) {
-            const unauthorizedText = `🚫 **Access Denied**\n\nHello ${msg.from?.first_name}, you do not have permission to use this bot. Access is strictly limited to authorized administrators.`;
-            return safeBotCall('sendPhoto', msg.chat.id, photoUrl, {
-                caption: unauthorizedText,
+    const handleStartMessage = async (msg: any, messageId?: number, overrideFrom?: any) => {
+        const fromUser = overrideFrom || msg.from;
+        if (!isAuthorized(fromUser?.id)) {
+            const unauthorizedText = `🚫 **Access Denied**\n\nHello ${fromUser?.first_name || 'User'}, you do not have permission to use this bot. Access is strictly limited to authorized administrators.`;
+            if (messageId) {
+                return safeEditMessage(unauthorizedText, { chat_id: msg.chat.id, message_id: messageId, parse_mode: 'Markdown' });
+            }
+            return safeSendMessage(msg.chat.id, unauthorizedText, {
                 parse_mode: 'Markdown'
             });
         }
 
-        const welcomeText = `👋 **Hello ${msg.from?.first_name}!**\n\nI am the **Restricted Content Saver** bot. I help you bypass download restrictions and mirror entire groups efficiently.\n\n✨ **Core Features:**\n• Download Restricted Media\n• Mirror Groups/Channels\n• Topic preservation support\n\n🛡 **Status:** Authorized User`;
+        const welcomeText = `🤖 **𝗥𝗼𝗵𝗶𝘁  𝗦𝗮𝘃𝗲  𝗥𝗲𝘀𝘁𝗿𝗶𝗰𝘁𝗶𝗰𝘁𝗲𝗱  𝗯𝗼𝘁  𝟮𝟬𝟮𝟲**\n\n` +
+                            `👋 𝗛𝗲𝗹𝗹𝗼 **${fromUser?.first_name || 'Admin'}**!\n\n` +
+                            `I am the premium **Restricted Content Saver** bot. I help you bypass download restrictions and mirror entire groups efficiently.\n\n` +
+                            `✨ 𝗖𝗼𝗿𝗲 𝗙𝗲𝗮𝘁𝘂𝗿𝗲𝘀:\n` +
+                            `• Download Restricted Media\n` +
+                            `• Mirror Groups/Channels\n` +
+                            `• Topic preservation support\n\n` +
+                            `🛡 𝗦𝘁𝗮𝘁𝘂𝘀: Authorized Partner`;
         
-        safeBotCall('sendPhoto', msg.chat.id, photoUrl, {
-         caption: welcomeText,
-         parse_mode: 'Markdown',
-         reply_markup: {
-           keyboard: [
-             [{ text: '⚙️ Settings' }, { text: '📈 Dashboard' }],
-             [{ text: '📦 Batch' }, { text: '⚙️ Mirror Engine' }],
-             [{ text: '📍 Set Path' }, { text: '❌ Cancel' }],
-             [{ text: '🚀 Start' }]
-           ],
-           resize_keyboard: true,
-           one_time_keyboard: false
-         }
-       });
+        const menuKeyboard = {
+            inline_keyboard: [
+                [
+                    { text: '⚙️ 𝗦𝗲𝘁𝘁𝗶𝗻𝗴𝘀', callback_data: 'bot_settings' },
+                    { text: '📈 𝗗𝗮𝘀𝗵𝗯𝗼𝗮𝗿𝗱', callback_data: 'dashboard_cmd' }
+                ],
+                [
+                    { text: '📦 𝗕𝗮𝘁𝗰𝗵', callback_data: 'batch_cmd' },
+                    { text: '⚙️ 𝗠𝗶𝗿𝗿𝗼𝗿 𝗘𝗻𝗴𝗶𝗻𝗲', callback_data: 'mirror_cmd' }
+                ],
+                [
+                    { text: '📍 𝗦𝗲𝘁 𝗣𝗮𝘁𝗵', callback_data: 'set_path_cmd' },
+                    { text: '❌ 𝗖𝗮𝗻𝗰𝗲𝗹', callback_data: 'cancel_cmd' }
+                ],
+                [
+                    { text: '🚀 𝗦𝘁𝗮𝗿𝘁 𝗦𝗶𝗻𝗴𝗹𝗲 𝗧𝗮𝗿𝗴𝗲𝘁', callback_data: 'start_cmd_link' }
+                ]
+            ]
+        };
+
+        const logoPath = path.join(process.cwd(), 'src/assets/images/rohit_restricticted_bot_2026_1781261184565.jpg');
+        const hasLogo = fs.existsSync(logoPath);
+
+        if (messageId) {
+             try {
+                 // Try editing to check if the message matches the type
+                 const res = await safeEditMessage(welcomeText, {
+                     chat_id: msg.chat.id,
+                     message_id: messageId,
+                     parse_mode: 'Markdown',
+                     reply_markup: menuKeyboard
+                 });
+                 if (res) return res;
+             } catch (e: any) {
+                 console.log("[Menu] edit failed, falling back to delete-recreate:", e.message);
+             }
+             
+             // If direct edit fails (e.g. text msg trying to set photo, or vice-versa), delete and send fresh
+             await safeBotCall('deleteMessage', msg.chat.id, messageId).catch(() => {});
+             if (hasLogo) {
+                 return await safeBotCall('sendPhoto', msg.chat.id, logoPath, {
+                     caption: welcomeText,
+                     parse_mode: 'Markdown',
+                     reply_markup: menuKeyboard
+                 });
+             } else {
+                 return await safeSendMessage(msg.chat.id, welcomeText, {
+                     parse_mode: 'Markdown',
+                     reply_markup: menuKeyboard
+                 });
+             }
+        } else {
+             if (hasLogo) {
+                 return await safeBotCall('sendPhoto', msg.chat.id, logoPath, {
+                     caption: welcomeText,
+                     parse_mode: 'Markdown',
+                     reply_markup: menuKeyboard
+                 });
+             } else {
+                 return await safeSendMessage(msg.chat.id, welcomeText, {
+                     parse_mode: 'Markdown',
+                     reply_markup: menuKeyboard
+                 });
+             }
+        }
     };
 
-    const handleBatch = async (chatId: number, fromId: number | undefined) => {
+    const handleBatch = async (chatId: number, fromId: number | undefined, messageId?: number) => {
       try {
         if (!isAdmin(fromId) || !fromId) throw new Error("Restricted: Admin access required.");
         
@@ -1339,16 +1963,19 @@ NextTaskRunAt: ${nextTaskRunAt}`;
         if (!client) throw new Error("Userbot Session Required: Please /login first.");
         
         userActionStates[fromId] = { type: 'batch_start' };
-        safeSendMessage(chatId, "📦 **Batch Process Started**\n\nSend the **Starting Link** now.", {
-          reply_markup: { force_reply: true }
-        });
-        sendBackMenu(chatId);
+        
+        const text = "📦 **Batch Process Started**\n\nSend the **Starting Link** now.";
+        if (messageId) {
+            safeEditMessage(text, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
+        } else {
+            safeSendMessage(chatId, text, { reply_markup: { force_reply: true }, parse_mode: 'Markdown' });
+        }
       } catch (err: any) {
         safeSendMessage(chatId, `❌ **Error:** ${err.message}`);
       }
     };
 
-    const handleMirror = async (chatId: number, fromId: number | undefined, msg: any) => {
+    const handleMirror = async (chatId: number, fromId: number | undefined, messageId?: number) => {
       try {
         if (!isAdmin(fromId) || !fromId) throw new Error("Restricted: Mirroring is an Admin feature.");
 
@@ -1361,21 +1988,26 @@ NextTaskRunAt: ${nextTaskRunAt}`;
             reply_markup: {
                 inline_keyboard: [
                     [
-                        { text: '📁 Mirror List', callback_data: 'mirror_list' },
-                        { text: '➕ Add New Mirror', callback_data: 'mirror_add_start' }
+                        { text: '📁 𝗠𝗶𝗿𝗿𝗼𝗿 𝗟𝗶𝘀𝘁', callback_data: 'mirror_list' },
+                        { text: '➕ 𝗔𝗱𝗱 𝗡𝗲𝘄', callback_data: 'mirror_add_start' }
                     ],
                     [
-                        { text: '🎯 Clone Specific Topic', callback_data: 'topic_clone_start' },
-                        { text: '🔄 Full Mirror Group', callback_data: 'full_mirror_start' }
+                        { text: '🎯 𝗧𝗼𝗽𝗶𝗰 𝗖𝗹𝗼𝗻𝗲', callback_data: 'topic_clone_start' },
+                        { text: '🔄 𝗙𝘂𝗹𝗹 𝗠𝗶𝗿𝗿𝗼𝗿', callback_data: 'full_mirror_start' }
                     ],
-                    [ { text: '❌ Close', callback_data: 'start_back' } ]
+                    [
+                        { text: '📊 𝗣𝗿𝗼𝗴𝗿𝗲𝘀𝘀', callback_data: 'full_mirror_progress_list' }
+                    ],
+                    [ { text: '⬅️ 𝗕𝗮𝗰𝗸', callback_data: 'menu_back' } ]
                 ]
             }
         };
-        if (msg?.message_thread_id) options.message_thread_id = msg.message_thread_id;
 
-        safeSendMessage(chatId, "🪞 **Mirror Hub**\n\nChoose an action:", options);
-        sendBackMenu(chatId);
+        if (messageId) {
+            safeEditMessage("🪞 𝗠𝗶𝗿𝗿𝗼𝗿 𝗛𝘂𝗯\n\nChoose an action:", { chat_id: chatId, message_id: messageId, ...options });
+        } else {
+            safeSendMessage(chatId, "🪞 𝗠𝗶𝗿𝗿𝗼𝗿 𝗛𝘂𝗯\n\nChoose an action:", options);
+        }
       } catch (err: any) {
         safeSendMessage(chatId, `❌ **Error:** ${err.message}`);
       }
@@ -1385,9 +2017,45 @@ NextTaskRunAt: ${nextTaskRunAt}`;
         handleStartMessage(msg);
     });
 
+    if (!(bot as any)._isPatchedForAnswer) {
+        const originalAnswer = bot.answerCallbackQuery.bind(bot);
+        (bot as any).answerCallbackQuery = async function(...args: any[]) {
+             const qId = args[0];
+             if (processedCallbackQueryIds.has(`ans_${qId}`)) {
+                 return Promise.resolve(); 
+             }
+             processedCallbackQueryIds.add(`ans_${qId}`);
+             setTimeout(() => processedCallbackQueryIds.delete(`ans_${qId}`), 5 * 60 * 1000);
+             return originalAnswer(...args).catch((err: any) => console.log('Answer CB Error avoided:', err.message));
+        };
+        (bot as any)._isPatchedForAnswer = true;
+    }
+
     bot.on('callback_query', async (query) => {
       const chatId = query.message?.chat.id;
       if (!chatId) return;
+
+      // Deduplicate callback queries
+      if (processedCallbackQueryIds.has(query.id)) {
+        console.log(`[Deduplicator] Ignored duplicate callback query for ID: ${query.id}`);
+        return;
+      }
+      processedCallbackQueryIds.add(query.id);
+      setTimeout(() => {
+        processedCallbackQueryIds.delete(query.id);
+      }, 5 * 60 * 1000);
+
+      // Instantly answer the callback query to remove loading spinner for most menu navigation!
+      const needsCustomAlert = query.data && (
+          query.data.includes('del_') || 
+          query.data.includes('clr_') || 
+          query.data.includes('toggle_') || 
+          query.data.includes('approve_') || 
+          query.data.includes('decline_')
+      );
+      if (!needsCustomAlert && isAdmin(query.from.id)) {
+          bot?.answerCallbackQuery(query.id).catch(() => {});
+      }
 
       if (query.data === 'request_access') {
           safeSendMessage(chatId, "❌ **Request flow disabled.** Access is restricted to predefined admin IDs.");
@@ -1417,23 +2085,31 @@ NextTaskRunAt: ${nextTaskRunAt}`;
       }
 
       if (query.data === 'menu_back') {
+          await handleStartMessage(query.message, query.message!.message_id, query.from);
+          bot?.answerCallbackQuery(query.id).catch(() => {});
+          return;
+      }
+      if (false as any) {
           const menuKeyboard = {
             inline_keyboard: [
                 [
-                    { text: '⚙️ Settings', callback_data: 'bot_settings' },
-                    { text: '📦 Batch', callback_data: 'batch_cmd' }
+                    { text: '⚙️ 𝗦𝗲𝘁𝘁𝗶𝗻𝗴𝘀', callback_data: 'bot_settings' },
+                    { text: '📈 𝗗𝗮𝘀𝗵𝗯𝗼𝗮𝗿𝗱', callback_data: 'dashboard_cmd' }
                 ],
                 [
-                    { text: '📍 Set Path', callback_data: 'set_path_cmd' },
-                    { text: '⚙️ Mirror Engine', callback_data: 'mirror_cmd' }
+                    { text: '📦 𝗕𝗮𝘁𝗰𝗵', callback_data: 'batch_cmd' },
+                    { text: '⚙️ 𝗠𝗶𝗿𝗿𝗼𝗿 𝗘𝗻𝗴𝗶𝗻𝗲', callback_data: 'mirror_cmd' }
                 ],
                 [
-                    { text: '🚀 Start', callback_data: 'start_cmd' },
-                    { text: '❌ Cancel', callback_data: 'cancel_cmd' }
+                    { text: '📍 𝗦𝗲𝘁 𝗣𝗮𝘁𝗵', callback_data: 'set_path_cmd' },
+                    { text: '❌ 𝗖𝗮𝗻𝗰𝗲𝗹', callback_data: 'cancel_cmd' }
+                ],
+                [
+                    { text: '🚀 𝗦𝘁𝗮𝗿𝘁 𝗦𝗶𝗻𝗴𝗹𝗲 𝗧𝗮𝗿𝗴𝗲𝘁', callback_data: 'start_cmd_link' }
                 ]
             ]
         };
-        await safeEditMessage("🛠 **Bot Main Menu**\n\nSelect a task:", {
+        await safeEditMessage("🛠 𝗕𝗼𝘁 𝗠𝗮𝗶𝗻 𝗠𝗲𝗻𝘂\n\nSelect a task:", {
                 chat_id: chatId,
                 message_id: query.message!.message_id,
                 reply_markup: menuKeyboard,
@@ -1524,10 +2200,260 @@ NextTaskRunAt: ${nextTaskRunAt}`;
   }
 
 
-      if (query.data === 'login_cmd') handleLogin(chatId, query.from?.id);
-      if (query.data === 'batch_cmd') handleBatch(chatId, query.from?.id);
-      if (query.data === 'mirror_cmd') handleMirror(chatId, query.from?.id, query.message);
+      if (query.data === 'start_cmd') {
+          handleStartMessage(
+            { ...query.message, from: query.from },
+            query.message?.message_id
+          );
+          bot?.answerCallbackQuery(query.id);
+          return;
+      }
       
+      if (query.data === 'start_cmd_link') {
+          safeSendMessage(chatId, "🔗 **Send Target Link**\n\nPlease send the message link you want to start downloading.", {
+            parse_mode: 'Markdown',
+            reply_markup: { force_reply: true }
+          });
+          bot?.answerCallbackQuery(query.id);
+          return;
+      }
+      
+      if (query.data === 'dashboard_cmd') {
+          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+          try {
+              const text = await generateDashboardText();
+              safeEditMessage(text, {
+                  chat_id: chatId,
+                  message_id: query.message?.message_id || 0,
+                  parse_mode: 'Markdown',
+                  disable_web_page_preview: true,
+                  reply_markup: {
+                      inline_keyboard: [
+                          [
+                              { text: '🔄 Refresh Stats', callback_data: 'refresh_dashboard' },
+                              isQueuePaused ? { text: '▶️ Resume Queue', callback_data: 'resume_queue_cb' } : { text: '⏸️ Pause Queue', callback_data: 'pause_queue_cb' }
+                          ],
+                          [
+                              { text: '📋 View Queue', callback_data: 'view_queue_cb' },
+                              { text: '🗑️ Clear Queue', callback_data: 'clear_queue_cb' }
+                          ],
+                          [
+                              { text: '⬅️ Back to Menu', callback_data: 'menu_back' }
+                          ]
+                      ]
+                  }
+              });
+          } catch (err: any) {
+              bot?.answerCallbackQuery(query.id, { text: '❌ Error: ' + err.message, show_alert: true });
+          }
+          return;
+      }
+      
+      if (query.data === 'login_cmd') {
+          handleLogin(chatId, query.from?.id);
+          bot?.answerCallbackQuery(query.id);
+          return;
+      }
+      if (query.data === 'batch_cmd') {
+          handleBatch(chatId, query.from?.id, query.message?.message_id);
+          bot?.answerCallbackQuery(query.id);
+          return;
+      }
+      if (query.data === 'mirror_cmd') {
+          handleMirror(chatId, query.from?.id, query.message?.message_id);
+          bot?.answerCallbackQuery(query.id);
+          return;
+      }
+
+      if (query.data === 'full_mirror_progress_list') {
+          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+          
+          try {
+              if (activeFullMirrorSessions.size === 0) {
+                  const options = {
+                      parse_mode: 'Markdown',
+                      reply_markup: {
+                          inline_keyboard: [
+                              [
+                                  { text: '🔄 Refresh', callback_data: 'full_mirror_progress_list' },
+                                  { text: '⬅️ Back', callback_data: 'mirror_cmd' }
+                              ]
+                          ]
+                      }
+                  };
+                  try {
+                      await safeEditMessage("📭 **No active full mirror sessions currently in progress.**\n\nAll tasks have concluded or no session is active.", {
+                          chat_id: chatId,
+                          message_id: query.message!.message_id,
+                          ...options
+                      });
+                  } catch (e) {
+                      await safeSendMessage(chatId, "📭 **No active full mirror sessions currently in progress.**\n\nAll tasks have concluded or no session is active.", options);
+                  }
+              } else {
+                  let text = `📊 **Active Full Mirror Sessions (${activeFullMirrorSessions.size}):**\n\n`;
+                  let idx = 1;
+                  const keyboard = [];
+                  for (const [id, session] of activeFullMirrorSessions.entries()) {
+                      const filePercentage = session.totalFiles > 0 ? Math.round((session.processedFiles / session.totalFiles) * 100) : 0;
+                      text += `**${idx}.** Session: \`${id}\`\n`;
+                      if (session.sourceId) text += `└ **Source:** \`${session.sourceId}\`\n`;
+                      text += `└ **Processed:** \`${session.processedFiles} / ${session.totalFiles}\` (${filePercentage}%)\n`;
+                      text += `└ **Status:** 🟢 Success: \`${session.successCount}\` | 🔴 Failed: \`${session.failedCount}\`\n\n`;
+                      
+                      keyboard.push([
+                          { text: `🔄 Resume #${idx}`, callback_data: `fm_resume_${id}` },
+                          { text: `🗑 Del #${idx}`, callback_data: `fm_deltrack_${id}` }
+                      ]);
+                      idx++;
+                  }
+                  
+                  keyboard.push([
+                      { text: '🔄 Refresh List', callback_data: 'full_mirror_progress_list' },
+                      { text: '⬅️ Back', callback_data: 'mirror_cmd' }
+                  ]);
+                  
+                  try {
+                      await safeEditMessage(text, {
+                          chat_id: chatId,
+                          message_id: query.message!.message_id,
+                          parse_mode: 'Markdown',
+                          reply_markup: { inline_keyboard: keyboard }
+                      });
+                  } catch (e) {
+                      await safeSendMessage(chatId, text, {
+                          parse_mode: 'Markdown',
+                          reply_markup: { inline_keyboard: keyboard }
+                      });
+                  }
+              }
+          } catch (err: any) {
+              safeSendMessage(chatId, `❌ Error fetching active sessions: ${err.message}`);
+          }
+          bot?.answerCallbackQuery(query.id);
+          return;
+      }
+
+      if (query.data?.startsWith('fm_resume_')) {
+          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+          const sessId = query.data.split('_').slice(2).join('_');
+          bot?.answerCallbackQuery(query.id, { text: '🔄 Resuming mirror session...' });
+          
+          const statusMsg = await safeSendMessage(chatId, `🔄 **Resuming full mirror session [${sessId}]...**\nChecking already copied files and skipping them. This may take a moment...`);
+          try {
+              const queuedCount = await resumeFullMirrorSession(chatId, sessId, query);
+              await safeEditMessage(`✅ **Session [${sessId}] Resumed Successfully!**\nEnqueued **${queuedCount}** remaining tasks to the download queue.`, {
+                  chat_id: chatId,
+                  message_id: statusMsg!.message_id
+              });
+          } catch (err: any) {
+              await safeEditMessage(`❌ **Resume Failed:** ${err.message}`, {
+                  chat_id: chatId,
+                  message_id: statusMsg!.message_id
+              });
+          }
+          return;
+      }
+
+      if (query.data?.startsWith('fm_deltrack_')) {
+          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+          const sessId = query.data.split('_').slice(2).join('_');
+          
+          activeFullMirrorSessions.delete(sessId);
+          if (fullMirrorSessionsCollection) {
+              await fullMirrorSessionsCollection.deleteOne({ sessionId: sessId }).catch(() => {});
+          }
+          await queuedTasksCollection?.deleteMany({ fullMirrorSessionId: sessId }).catch(() => {});
+          for (let i = taskQueue.length - 1; i >= 0; i--) {
+              if (taskQueue[i].fullMirrorSessionId === sessId) {
+                  taskQueue.splice(i, 1);
+              }
+          }
+          
+          await bot?.answerCallbackQuery(query.id, { text: '🗑 Track deleted successfully!', show_alert: true });
+          // Refresh list
+          try {
+              if (activeFullMirrorSessions.size === 0) {
+                  const options = {
+                      parse_mode: 'Markdown',
+                      reply_markup: {
+                          inline_keyboard: [
+                              [
+                                  { text: '🔄 Refresh', callback_data: 'full_mirror_progress_list' },
+                                  { text: '⬅️ Back', callback_data: 'mirror_cmd' }
+                              ]
+                          ]
+                      }
+                  };
+                  await safeEditMessage("📭 **No active full mirror sessions currently in progress.**\n\nAll tasks have concluded or no session is active.", {
+                      chat_id: chatId,
+                      message_id: query.message!.message_id,
+                      ...options
+                  });
+              } else {
+                  let text = `📊 **Active Full Mirror Sessions (${activeFullMirrorSessions.size}):**\n\n`;
+                  let idx = 1;
+                  const keyboard = [];
+                  for (const [id, session] of activeFullMirrorSessions.entries()) {
+                      const filePercentage = session.totalFiles > 0 ? Math.round((session.processedFiles / session.totalFiles) * 100) : 0;
+                      text += `**${idx}.** Session: \`${id}\`\n`;
+                      if (session.sourceId) text += `└ **Source:** \`${session.sourceId}\`\n`;
+                      text += `└ **Processed:** \`${session.processedFiles} / ${session.totalFiles}\` (${filePercentage}%)\n`;
+                      text += `└ **Status:** 🟢 Success: \`${session.successCount}\` | 🔴 Failed: \`${session.failedCount}\`\n\n`;
+                      
+                      keyboard.push([
+                          { text: `🔄 Resume #${idx}`, callback_data: `fm_resume_${id}` },
+                          { text: `🗑 Del #${idx}`, callback_data: `fm_deltrack_${id}` }
+                      ]);
+                      idx++;
+                  }
+                  keyboard.push([
+                      { text: '🔄 Refresh List', callback_data: 'full_mirror_progress_list' },
+                      { text: '⬅️ Back', callback_data: 'mirror_cmd' }
+                  ]);
+                  
+                  await safeEditMessage(text, {
+                      chat_id: chatId,
+                      message_id: query.message!.message_id,
+                      parse_mode: 'Markdown',
+                      reply_markup: { inline_keyboard: keyboard }
+                  });
+              }
+          } catch (e: any) {
+              console.error("[Del Track Progress Refresh Failed]", e.message);
+          }
+          return;
+      }
+      
+      if (query.data === 'blocked_topics_panel') {
+          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+          await showBlockedTopicsPanel(chatId, query.from.id, query.message!.message_id);
+          bot?.answerCallbackQuery(query.id);
+          return;
+      }
+
+      if (query.data === 'add_blocked_topic_start') {
+          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+          userActionStates[query.from.id] = { type: 'add_blocked_topic' };
+          safeSendMessage(chatId, "🚫 **Add Blocked Topic**\n\nTo block a topic *specifically for a single group*, simply paste the **Topic Link** (e.g. `https://t.me/c/12345/678`).\n\nAlternatively, you can send the exact **Topic Title** (case-insensitive) to block it globally across all groups.\n\n_To cancel, send /cancel._", {
+              parse_mode: 'Markdown',
+              reply_markup: { force_reply: true }
+          });
+          bot?.answerCallbackQuery(query.id);
+          return;
+      }
+
+      if (query.data === 'clear_blocked_topics_action') {
+          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+          const settingsUid = await resolveSettingsUserId(query.from?.id);
+          if (approvedUsersCollection) {
+              await approvedUsersCollection.updateOne({ userId: settingsUid }, { $unset: { blockedTopics: "" } });
+          }
+          await bot?.answerCallbackQuery(query.id, { text: '✅ All Blocked Topics Cleared!', show_alert: true });
+          await showBlockedTopicsPanel(chatId, query.from.id, query.message!.message_id);
+          return;
+      }
+
       if (query.data === 'full_mirror_start') {
           if (!isAdmin(query.from.id)) return safeBotCall('answerCallbackQuery', query.id, { text: '❌ Admin only', show_alert: true });
           userActionStates[query.from.id] = { type: 'full_mirror_group' };
@@ -1653,6 +2579,45 @@ NextTaskRunAt: ${nextTaskRunAt}`;
           }
 
           const sourceId = state.pendingSourceId!;
+          const destDisplay = dest.destThreadId ? `${dest.groupName} (Topic: ${dest.destThreadId})` : dest.groupName;
+
+          const keyboard = [
+              [
+                  { text: '🔄 Full + ⚡ Live Mirror', callback_data: `fmlive_yes_${idx}` },
+                  { text: '📥 History Copy Only', callback_data: `fmlive_no_${idx}` }
+              ],
+              [
+                  { text: '❌ Cancel', callback_data: 'mirror_cmd' }
+              ]
+          ];
+
+          await safeEditMessage(`🔄 **Full Mirror Options**\n\nWould you like to also auto-enable **Live Mirroring** for this setup once started?\n\n**Source:** \`${sourceId}\`\n**Destination:** ${destDisplay}\n\n*If you choose YES, we will queue the full history copy and also automatically register this channel/group to mirror future new posts in real-time!*`, {
+              chat_id: chatId,
+              message_id: query.message!.message_id,
+              parse_mode: 'Markdown',
+              reply_markup: { inline_keyboard: keyboard }
+          });
+          bot?.answerCallbackQuery(query.id);
+          return;
+      }
+
+      if (query.data?.startsWith('fmlive_yes_') || query.data?.startsWith('fmlive_no_')) {
+          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+          const state = userActionStates[query.from.id];
+          if (!state || state.type !== 'full_mirror_dest_select') {
+              return bot?.answerCallbackQuery(query.id, { text: '❌ Session expired.', show_alert: true });
+          }
+
+          const isLiveOption = query.data.startsWith('fmlive_yes_');
+          const idx = parseInt(query.data.split('_')[2]);
+          const settingsUid = await resolveSettingsUserId(query.from.id);
+          const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
+          const dest = (userDoc?.savedDestinations || [])[idx];
+          if (!dest) {
+              return bot?.answerCallbackQuery(query.id, { text: '❌ Destination not found.', show_alert: true });
+          }
+
+          const sourceId = state.pendingSourceId!;
           delete userActionStates[query.from.id];
 
           const statusMsg = await safeSendMessage(chatId, `📂 **Starting Full Mirror...**\nSource Group: \`${sourceId}\`\nFetching history, this may take a moment depending on the group size.`);
@@ -1688,6 +2653,7 @@ NextTaskRunAt: ${nextTaskRunAt}`;
 
               let sourceTopics: Record<number, string> = {};
               let destTopics: Record<string, number> = {};
+              const destTopicsTitleMap: Record<number, string> = {};
               const isSourceForum = (sourceEntity as any).forum;
               const isDestForum = (destEntity as any).forum;
 
@@ -1706,7 +2672,10 @@ NextTaskRunAt: ${nextTaskRunAt}`;
                   try {
                       const res: any = await client.invoke(new Api.channels.GetForumTopics({ channel: destEntity, offsetDate: 0, offsetId: 0, offsetTopic: 0, limit: 100 }));
                       res.topics?.forEach((t: any) => {
-                          if (t.title) destTopics[t.title.trim().toLowerCase()] = t.id;
+                          if (t.title) {
+                              destTopics[t.title.trim().toLowerCase()] = t.id;
+                              destTopicsTitleMap[t.id] = t.title;
+                          }
                       });
                   } catch (e) {
                       console.warn("Failed to fetch destination topics:", e);
@@ -1716,14 +2685,29 @@ NextTaskRunAt: ${nextTaskRunAt}`;
               const sourceIdRaw = (sourceEntity as any).id?.toString() || "";
               const sourceIdClean = sourceIdRaw.replace('-100', '');
 
+              const alreadyMirroredDocs = mirroredMessagesCollection ? 
+                    await mirroredMessagesCollection.find({ destId: destPath }).toArray() : [];
+              const alreadyMirroredLinks = new Set(alreadyMirroredDocs.map((doc: any) => doc.link));
+              let skippedCount = 0;
+
               const msgsToQueue = [];
               const topicMap: Record<number, number | undefined> = {};
+              let latestMsgId = 0;
 
               for await (const m of client.iterMessages(sourceEntity, { reverse: true, limit: undefined })) {
                   if (m.action) continue; 
                   if (!m.message && !m.media) continue;
 
+                  if (m.id > latestMsgId) {
+                      latestMsgId = m.id;
+                  }
+
                   const virtualLink = `https://t.me/c/${sourceIdClean}/${m.id}`;
+                  if (alreadyMirroredLinks.has(virtualLink)) {
+                      skippedCount++;
+                      continue;
+                  }
+
                   let overrideThreadId: number | undefined = dest.destThreadId; // Base thread ID
 
                   if (isSourceForum && isDestForum && (m as any).replyTo) {
@@ -1756,6 +2740,7 @@ NextTaskRunAt: ${nextTaskRunAt}`;
                                           
                                           if (newDestTopicId) {
                                               destTopics[normalizedTitle] = newDestTopicId;
+                                              destTopicsTitleMap[newDestTopicId] = topicTitle;
                                               topicMap[sourceTopicId] = newDestTopicId;
                                               overrideThreadId = newDestTopicId;
                                           }
@@ -1772,23 +2757,140 @@ NextTaskRunAt: ${nextTaskRunAt}`;
                   msgsToQueue.push({ 
                       chatId, 
                       link: virtualLink, 
-                      userId: query.from.id,
+                       userId: query.from.id,
                       forceGeneralPath: true,
                       overrideThreadId,
                       overrideTargetId: destPath,
                       isMirror: true
-                  });
+                   });
               }
 
               if (msgsToQueue.length === 0) {
-                  throw new Error("No messages found inside this group.");
+                  throw new Error(`No new messages found inside this group.${skippedCount > 0 ? ` All ${skippedCount} messages were already successfully mirrored previously.` : ''}`);
               }
 
-              taskQueue.push(...msgsToQueue);
-              dbEnqueueTasks(msgsToQueue).catch(e => console.error("[Queue DB] Bulk enqueue error:", e));
+              // Group and sort messages by topic to achieve grouped sequential downloading (Topic by Topic first)
+              const tasksByTopic = new Map<string | number, any[]>();
+              const generalTasks: any[] = [];
+
+              for (const task of msgsToQueue) {
+                  if (task.overrideThreadId !== undefined && task.overrideThreadId !== null) {
+                      if (!tasksByTopic.has(task.overrideThreadId)) {
+                          tasksByTopic.set(task.overrideThreadId, []);
+                      }
+                      tasksByTopic.get(task.overrideThreadId)!.push(task);
+                  } else {
+                      generalTasks.push(task);
+                  }
+              }
+
+              const orderedTasks: any[] = [];
+              if (generalTasks.length > 0) {
+                  orderedTasks.push(...generalTasks);
+              }
+              for (const [topicId, tasks] of tasksByTopic.entries()) {
+                  orderedTasks.push(...tasks);
+              }
+
+              // Register Global Mirror Session status message and pin it
+              const sessionId = `fm_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+              const topicStats: Record<string | number, { total: number; processed: number; isMarkedCompleted: boolean; title: string }> = {};
+
+              for (const task of orderedTasks) {
+                  task.fullMirrorSessionId = sessionId;
+
+                  const threadId = task.overrideThreadId !== undefined && task.overrideThreadId !== null ? task.overrideThreadId : 'general';
+                  const topicTitle = task.overrideThreadId !== undefined && task.overrideThreadId !== null ? (destTopicsTitleMap[task.overrideThreadId] || `Topic #${task.overrideThreadId}`) : 'General Discussion';
+
+                  if (!topicStats[threadId]) {
+                      topicStats[threadId] = {
+                          total: 0,
+                          processed: 0,
+                          isMarkedCompleted: false,
+                          title: topicTitle
+                      };
+                  }
+                  topicStats[threadId].total++;
+              }
+
+              const globalStatusMsg = await safeSendMessage(chatId, `📍 **[GLOBAL PROGRESS] Setting up Universal Mirror...**\nInitializing tracking bar...`);
+              let globalStatusMsgId = globalStatusMsg?.message_id || 0;
+
+              if (globalStatusMsgId) {
+                  try {
+                      await bot?.pinChatMessage(chatId, globalStatusMsgId);
+                  } catch (pErr: any) {
+                      console.warn("[Full Mirror] Global progress bar pin failed:", pErr.message);
+                  }
+              }
+
+              const fmSession = {
+                  sessionId,
+                  chatId,
+                  userId: query.from.id,
+                  statusMsgId: globalStatusMsgId,
+                  totalFiles: orderedTasks.length,
+                  processedFiles: 0,
+                  successCount: 0,
+                  failedCount: 0,
+                  topicStats,
+                  sourceId,
+                  dest,
+                  isLiveOption
+              };
+
+              activeFullMirrorSessions.set(sessionId, fmSession);
+              if (fullMirrorSessionsCollection) {
+                  await fullMirrorSessionsCollection.insertOne(fmSession).catch(err => {
+                      console.error("[Full Mirror DB Save Failed]", err);
+                  });
+              }
+
+              // Trigger initial progress bar write
+              await updateGlobalMirrorProgress(sessionId).catch(pErr => console.error("[Full Mirror Initial Update Failed]", pErr));
+
+              // --- IF USER ENABLED LIVE MIRROR, AUTO REGISTER THE PATH ---
+              let liveMirrorSuccessInfo = '';
+              if (isLiveOption) {
+                  const sourceName = (sourceEntity as any).title || 'Source Group';
+                  const mirrorPaths = userDoc?.mirrorPaths || [];
+                  const filtered = mirrorPaths.filter((p: any) => p.sourceId !== sourceId);
+                  
+                  filtered.push({
+                      sourceId,
+                      sourceNumericId: sourceId,
+                      sourceUsername: '',
+                      sourceName,
+                      destId: dest.destId,
+                      destThreadId: dest.destThreadId,
+                      groupName: dest.groupName,
+                      topicName: dest.topicName,
+                      isLive: true,
+                      lastProcessedMsgId: latestMsgId,
+                      createdAt: new Date()
+                  });
+
+                  if (approvedUsersCollection) {
+                      await approvedUsersCollection.updateOne(
+                          { userId: settingsUid },
+                          { $set: { mirrorPaths: filtered } }
+                      );
+                      // Start watcher for client
+                      await startAutoMirrorWatcher(Number(settingsUid), client).catch(err => {
+                          console.warn("[Full Mirror -> Live Watcher] Failed to auto start watcher:", err.message);
+                      });
+                      
+                      const destDisplay = dest.destThreadId ? `${dest.groupName} (Topic: ${dest.destThreadId})` : dest.groupName;
+                      liveMirrorSuccessInfo = `\n\n⚡ **Live Mirror registered too!**\n└ **Source:** \`${sourceName}\`\n└ **Destination:** \`${destDisplay}\`\n└ **Status:** 🟢 Live ON (Future posts will auto-mirror starting from ID \`${latestMsgId}\`)`;
+                  }
+              }
+
+              taskQueue.push(...orderedTasks);
+              dbEnqueueTasks(orderedTasks).catch(e => console.error("[Queue DB] Bulk enqueue error:", e));
               runNextTask();
               if (statusMsg) {
-                  await safeEditMessage(`✅ Added **${msgsToQueue.length}** items from Full Mirror to copy queue.\nDestination path: \`${destPath}\`.`, {
+                  const skipText = skippedCount > 0 ? ` (Skipped **${skippedCount}** already mirrored previously)` : '';
+                  await safeEditMessage(`✅ Added **${orderedTasks.length}** items from Full Mirror to copy queue.${skipText}\nDestination path: \`${destPath}\`.${liveMirrorSuccessInfo}`, {
                       chat_id: chatId,
                       message_id: statusMsg.message_id
                   });
@@ -1827,8 +2929,9 @@ NextTaskRunAt: ${nextTaskRunAt}`;
                       const destName = p.groupName || 'Group';
                       const topicName = p.topicName || 'General';
                       const liveStatus = p.isLive ? '🟢 LIVE ON' : '🔴 LIVE OFF';
+                      const sourceName = p.sourceName || 'Target Group';
                       
-                      text += `**${i + 1}.** \`${p.sourceId}\` ➔ ${destName}\n`;
+                      text += `**${i + 1}. (${sourceName}) (${p.sourceId}) ➔ ${destName}**\n`;
                       text += `└ Topic: ${topicName} | Status: ${liveStatus}\n\n`;
                       
                       keyboard.push([
@@ -1922,7 +3025,7 @@ NextTaskRunAt: ${nextTaskRunAt}`;
                   query.data = 'mirror_list';
                   // This is a bit hacky, better to extract the logic to a function, but for now I'll just re-trigger or inform.
                   safeSendMessage(chatId, "✅ Status updated. Checking Mirror List again...");
-                  handleMirror(chatId, query.from.id, query.message);
+                  handleMirror(chatId, query.from.id, query.message?.message_id);
               }
           } catch (err) {
               bot?.answerCallbackQuery(query.id, { text: '❌ Toggle failed' });
@@ -1930,8 +3033,16 @@ NextTaskRunAt: ${nextTaskRunAt}`;
           return;
       }
 
-      if (query.data === 'cancel_cmd') handleCancel(chatId, query.from?.id);
-      if (query.data === 'logout_cmd') handleLogout(chatId, query.from?.id);
+      if (query.data === 'cancel_cmd') {
+          handleCancel(chatId, query.from?.id);
+          bot?.answerCallbackQuery(query.id);
+          return;
+      }
+      if (query.data === 'logout_cmd') {
+          handleLogout(chatId, query.from?.id);
+          bot?.answerCallbackQuery(query.id);
+          return;
+      }
 
       if (query.data === 'mode_recent') {
           const state = userActionStates[query.from.id];
@@ -2112,6 +3223,8 @@ NextTaskRunAt: ${nextTaskRunAt}`;
       if (query.data === 'bot_settings') {
         if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
         handleSettings(chatId, query.from?.id, query.message?.message_id);
+        bot?.answerCallbackQuery(query.id);
+        return;
       }
 
       if (query.data === 'set_path_cmd') {
@@ -2227,6 +3340,22 @@ NextTaskRunAt: ${nextTaskRunAt}`;
                   { $set: { uploadMode: currentMode } }
               );
               bot?.answerCallbackQuery(query.id, { text: `✅ Upload Mode set to ${currentMode === 'document' ? 'Document/File' : 'Video'}` });
+              handleSettings(chatId, query.from?.id, query.message!.message_id);
+          }
+          return;
+      }
+
+      if (query.data === 'toggle_agent') {
+          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+          if (approvedUsersCollection) {
+              const settingsUid = await resolveSettingsUserId(query.from?.id);
+              const userDoc = await approvedUsersCollection.findOne({ userId: settingsUid });
+              const currentAgent = userDoc?.uploadAgent === 'bot' ? 'user' : 'bot';
+              await approvedUsersCollection.updateOne(
+                  { userId: settingsUid },
+                  { $set: { uploadAgent: currentAgent } }
+              );
+              bot?.answerCallbackQuery(query.id, { text: `✅ Upload Agent set to ${currentAgent === 'bot' ? 'Bot itself' : 'User Account'}` });
               handleSettings(chatId, query.from?.id, query.message!.message_id);
           }
           return;
@@ -2582,6 +3711,36 @@ NextTaskRunAt: ${nextTaskRunAt}`;
           return;
       }
 
+      if (query.data === 'retry_all_failed_cb') {
+          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+          const count = await retryAllFailedTasks();
+          bot?.answerCallbackQuery(query.id, { text: `🔄 Requeued ${count} failed tasks!` });
+          await safeEditMessage(`✅ **Failed Tasks Replaced!**\n\nRequeued ${count} tasks back into the active mirror queue successfully.`, {
+              chat_id: chatId,
+              message_id: query.message!.message_id,
+              parse_mode: 'Markdown',
+              reply_markup: {
+                  inline_keyboard: [[{ text: '⬅️ Back to Menu', callback_data: 'menu_back' }]]
+              }
+          }).catch(() => {});
+          return;
+      }
+
+      if (query.data === 'clear_failed_cb') {
+          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+          await clearAllFailedTasks();
+          bot?.answerCallbackQuery(query.id, { text: '🧹 Cleared failed logs!' });
+          await safeEditMessage(`🧹 **Failure Logs Cleared!**\n\nAll historical mirror failures have been erased from the system database.`, {
+              chat_id: chatId,
+              message_id: query.message!.message_id,
+              parse_mode: 'Markdown',
+              reply_markup: {
+                  inline_keyboard: [[{ text: '⬅️ Back to Menu', callback_data: 'menu_back' }]]
+              }
+          }).catch(() => {});
+          return;
+      }
+
       if (query.data === 'view_queue_cb') {
           if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
           bot?.answerCallbackQuery(query.id, { text: '📋 Querying Queue Details...' });
@@ -2642,13 +3801,99 @@ NextTaskRunAt: ${nextTaskRunAt}`;
           return;
       }
 
+      // INTEGRATED WORKLOAD PAUSE/SYNC & LOGIN HANDLERS
+      const fromId = query.from?.id;
+      const data = query.data || "";
+
+      if (data === "start_login") {
+          if (!isAdmin(fromId)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+          await bot?.answerCallbackQuery(query.id);
+          handleLogin(chatId, fromId);
+          return;
+      }
+
+      if (data.startsWith("switch_session:")) {
+          if (!isAdmin(fromId)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+          const targetUid = Number(data.split(":")[1]);
+          adminActiveSession.set(fromId!, targetUid);
+          if (approvedUsersCollection) {
+              await approvedUsersCollection.updateOne(
+                  { userId: fromId!.toString() },
+                  { $set: { activeUserbotUserId: targetUid } },
+                  { upsert: true }
+              ).catch((e: any) => console.error("[Switch DB Switch] Error:", e));
+          }
+          await bot?.answerCallbackQuery(query.id, { text: "✅ Active session switched!" });
+          bot.processUpdate({ message: { ...query.message, text: '/login', from: query.from } } as any);
+          return;
+      }
+
+      if (data.startsWith("logout_session:")) {
+          if (!isAdmin(fromId)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+          const targetUid = Number(data.split(":")[1]);
+          await bot?.answerCallbackQuery(query.id, { text: "Logging out..." });
+          
+          // Perform global logout
+          const client = userClients.get(targetUid);
+          if (client) {
+              await client.disconnect().catch(() => {});
+              userClients.delete(targetUid);
+          }
+          userSessions.delete(targetUid);
+          activeWatchers.delete(targetUid);
+          if (approvedUsersCollection) {
+              await approvedUsersCollection.updateOne({ userId: targetUid.toString() }, { $unset: { stringSession: "", phoneNumber: "", fullName: "" } });
+              await approvedUsersCollection.updateMany(
+                  { activeUserbotUserId: targetUid },
+                  { $unset: { activeUserbotUserId: "" } }
+              ).catch(() => {});
+          }
+
+          safeSendMessage(chatId, `✅ Session for **${targetUid}** has been disconnected.`);
+          // Refresh dashboard
+          bot.processUpdate({ message: { ...query.message, text: '/login', from: query.from } } as any);
+          return;
+      }
+
+      if (data.startsWith("pause_") || data.startsWith("resume_")) {
+          if (!isAdmin(fromId)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+          const jobKey = data.substring(data.indexOf('_') + 1);
+          const isPause = data.startsWith("pause_");
+          
+          const taskState = taskControlMap.get(jobKey) || { isPaused: false, shouldRetry: false };
+          taskState.isPaused = isPause;
+          taskControlMap.set(jobKey, taskState);
+          
+          await bot?.answerCallbackQuery(query.id, { text: isPause ? "⏸️ Download Paused!" : "▶️ Download Resumed!", show_alert: false });
+          
+          // Re-render buttons
+          if (query.message) {
+              const markup = createProgressMarkup(jobKey, isPause);
+              await safeBotCall('editMessageReplyMarkup', markup, {
+                  chat_id: query.message.chat.id,
+                  message_id: query.message.message_id
+              });
+          }
+          return;
+      }
+
+      if (data.startsWith("retry_")) {
+          if (!isAdmin(fromId)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+          const jobKey = data.substring(data.indexOf('_') + 1);
+          const taskState = taskControlMap.get(jobKey) || { isPaused: false, shouldRetry: false };
+          taskState.shouldRetry = true;
+          taskControlMap.set(jobKey, taskState);
+          await bot?.answerCallbackQuery(query.id, { text: "🔁 Retrying download...", show_alert: false });
+          return;
+      }
+
     });
 
     bot.onText(/\/ping/, (msg) => {
         const start = Date.now();
-        bot?.sendMessage(msg.chat.id, "🏓 **Pong!**", { parse_mode: 'Markdown' }).then((m) => {
+        bot?.sendMessage(msg.chat.id, "🏓 **𝗣𝗼𝗻𝗴! 𝗕𝗼𝘁 𝗶𝘀 𝗢𝗻𝗹𝗶𝗻𝗲**", { parse_mode: 'Markdown' }).then((m) => {
             const end = Date.now();
-            bot?.editMessageText(`🏓 **Pong!**\n\nLatency: \`${end - start}ms\``, { chat_id: msg.chat.id, message_id: m.message_id, parse_mode: 'Markdown' });
+            bot?.editMessageText(`🏓 **𝗣𝗼𝗻𝗴! 𝗕𝗼𝘁 𝗶𝘀 𝗔𝗰𝘁𝗶𝘃𝗲**\n\n⚡ 𝗟𝗮𝘁𝗲𝗻𝗰𝘆: \`${end - start}ms\``, { chat_id: msg.chat.id, message_id: m.message_id, parse_mode: 'Markdown' });
         });
     });
 
@@ -2676,8 +3921,7 @@ NextTaskRunAt: ${nextTaskRunAt}`;
             let text = "📱 **Active Sessions Dashboard**\n\n";
             text += `Total Connected: **${allUsers.length}**\n\n`;
             
-            const activeSessionId = adminActiveSession.get(fromId) || fromId;
-            const activeSessionStr = activeSessionId?.toString();
+            const activeSessionStr = await resolveSettingsUserId(fromId);
 
             const keyboard = [];
             for (const u of allUsers) {
@@ -2702,77 +3946,7 @@ NextTaskRunAt: ${nextTaskRunAt}`;
         }
     });
 
-    bot.on('callback_query', async (query) => {
-        const fromId = query.from?.id;
-        const data = query.data || "";
-        const chatId = query.message?.chat.id;
-
-        if (!isAdmin(fromId)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
-
-        if (data === "start_login") {
-            await bot?.answerCallbackQuery(query.id);
-            handleLogin(chatId!, fromId);
-        } else if (data.startsWith("switch_session:")) {
-            const targetUid = Number(data.split(":")[1]);
-            adminActiveSession.set(fromId!, targetUid);
-            if (approvedUsersCollection) {
-                await approvedUsersCollection.updateOne(
-                    { userId: fromId!.toString() },
-                    { $set: { activeUserbotUserId: targetUid } },
-                    { upsert: true }
-                ).catch((e: any) => console.error("[Switch DB Switch] Error:", e));
-            }
-            await bot?.answerCallbackQuery(query.id, { text: "✅ Active session switched!" });
-            bot.processUpdate({ message: { ...query.message, text: '/login', from: query.from } } as any);
-        } else if (data.startsWith("logout_session:")) {
-            const targetUid = Number(data.split(":")[1]);
-            await bot?.answerCallbackQuery(query.id, { text: "Logging out..." });
-            
-            // Perform global logout
-            const client = userClients.get(targetUid);
-            if (client) {
-                await client.disconnect().catch(() => {});
-                userClients.delete(targetUid);
-            }
-            userSessions.delete(targetUid);
-            activeWatchers.delete(targetUid);
-            if (approvedUsersCollection) {
-                await approvedUsersCollection.updateOne({ userId: targetUid.toString() }, { $unset: { stringSession: "", phoneNumber: "", fullName: "" } });
-                await approvedUsersCollection.updateMany(
-                    { activeUserbotUserId: targetUid },
-                    { $unset: { activeUserbotUserId: "" } }
-                ).catch(() => {});
-            }
-
-            safeSendMessage(chatId!, `✅ Session for **${targetUid}** has been disconnected.`);
-            // Refresh dashboard
-            bot.processUpdate({ message: { ...query.message, text: '/login', from: query.from } } as any);
-        } else if (data.startsWith("pause_") || data.startsWith("resume_")) {
-            const jobKey = data.substring(data.indexOf('_') + 1);
-            const isPause = data.startsWith("pause_");
-            
-            const taskState = taskControlMap.get(jobKey) || { isPaused: false, shouldRetry: false };
-            taskState.isPaused = isPause;
-            taskControlMap.set(jobKey, taskState);
-            
-            await bot?.answerCallbackQuery(query.id, { text: isPause ? "⏸️ Download Paused!" : "▶️ Download Resumed!", show_alert: false });
-            
-            // Re-render buttons
-            if (query.message) {
-                const markup = createProgressMarkup(jobKey, isPause);
-                await safeBotCall('editMessageReplyMarkup', markup, {
-                    chat_id: query.message.chat.id,
-                    message_id: query.message.message_id
-                });
-            }
-        } else if (data.startsWith("retry_")) {
-            const jobKey = data.substring(data.indexOf('_') + 1);
-            const taskState = taskControlMap.get(jobKey) || { isPaused: false, shouldRetry: false };
-            taskState.shouldRetry = true;
-            taskControlMap.set(jobKey, taskState);
-            await bot?.answerCallbackQuery(query.id, { text: "🔁 Retrying download...", show_alert: false });
-        }
-    });
+    // Removed duplicate callback query listener to prevent collisions. Handlers successfully integrated into primary listener.
     bot.onText(/\/batch/, (msg) => handleBatch(msg.chat.id, msg.from?.id));
     bot.onText(/\/mirror/, (msg) => {
         // Simple entry, interactive selection starts here
@@ -2892,12 +4066,12 @@ NextTaskRunAt: ${nextTaskRunAt}`;
         if (mirroredMessagesCollection) {
             try {
                 await mirroredMessagesCollection.deleteMany({});
-                safeSendMessage(chatId, "✅ **Mirror History Cleared Successfully!**\nAll previously processed/skipped files can now be cloned again.");
+                safeSendMessage(chatId, "✨ **𝗠𝗶𝗿𝗿𝗼𝗿 𝗛𝗶𝘀𝘁𝗼𝗿𝘆 𝗖𝗹𝗲𝗮𝗿𝗲𝗱 𝗦𝘂𝗰𝗰𝗲𝘀𝘀𝗳𝘂𝗹𝗹𝘆!**\n\n🧹 All historical mirror/copy logs have been wiped. All previously processed/skipped files can now be cloned again!");
             } catch (err: any) {
-                safeSendMessage(chatId, `❌ **Error clearing history:** ${err.message}`);
+                safeSendMessage(chatId, `❌ **𝗘𝗿𝗿𝗼𝗿:** ${err.message}`);
             }
         } else {
-            safeSendMessage(chatId, "⚠️ **Database not ready.** Please try again in a few seconds.");
+            safeSendMessage(chatId, "⚠️ **𝗗𝗮𝘁𝗮𝗯𝗮𝘀𝗲 𝗻𝗼𝘁 𝗿𝗲𝗮𝗱𝘆.** Please try again in a few seconds.");
         }
     });
 
@@ -2933,7 +4107,7 @@ NextTaskRunAt: ${nextTaskRunAt}`;
             }
             
             const dest = topicId ? `${groupTitle} (Topic: ${topicId})` : groupTitle;
-            const confirmationText = `✅ **Destination Saved!**\n\nFiles will now be uploaded to:\n📍 \`${dest}\``;
+            const confirmationText = `🎯 **𝗗𝗲𝘀𝘁𝗶𝗻𝗮𝘁𝗶𝗼𝗻 𝗦𝗮𝘃𝗲𝗱 𝗦𝘂𝗰𝗰𝗲𝘀𝘀𝗳𝘂𝗹𝗹𝘆!**\n\n📁 Files will now be uploaded to:\n📍 \`${dest}\``;
             
             // Send to Group/Channel
             await safeSendMessage(chatId, confirmationText, { 
@@ -2958,7 +4132,7 @@ NextTaskRunAt: ${nextTaskRunAt}`;
         const args = match?.[1]?.trim();
         if (!args) {
             userActionStates[fromId] = { type: 'set_jump_to_path' };
-            return safeSendMessage(chatId, "📍 **Enter the Destination Group ID or Username:**\n\nYou can send:\n• Group/Channel ID (e.g., `-1001844729124`)\n• Channel/Group Username (e.g., `@MyOutputChannel`)\n• Access link with optional Thread/Topic ID (e.g., `https://t.me/c/1844729124 12`)\n\n_Send /cancel to cancel this prompt._", { parse_mode: 'Markdown' });
+            return safeSendMessage(chatId, "📍 **𝗘𝗻𝘁𝗲𝗿 𝗗𝗲𝘀𝘁𝗶𝗻𝗮𝘁𝗶𝗼𝗻 𝗚𝗿𝗼𝘂𝗽 𝗜𝗗 / 𝗨𝘀𝗲𝗿𝗻𝗮𝗺𝗲:**\n\n👉 Send one of the following:\n• Group/Channel ID (e.g., `-1001844729124`)\n• Channel/Group Username (e.g., `@MyOutputChannel`)\n• Access link with optional Thread/Topic ID (e.g., `https://t.me/c/1844729124 12`)\n\n🛑 _Type /cancel to cancel this input request._", { parse_mode: 'Markdown' });
         }
 
         const parts = args.split(/\s+/);
@@ -3011,7 +4185,7 @@ NextTaskRunAt: ${nextTaskRunAt}`;
             }
             
             const dest = topicId ? `${rawPath} (Topic ID: ${topicId})` : rawPath;
-            const confirmationText = `✅ **Upload Destination Saved via JumpToPath!**\n\nAll tasks will now be processed to:\n📍 \`${dest}\``;
+            const confirmationText = `🚀 **𝗨𝗽𝗹𝗼𝗮𝗱 𝗗𝗲𝘀𝘁𝗶𝗻𝗮𝘁𝗶𝗼𝗻 𝗦𝗮𝘃𝗲𝗱 𝘃𝗶𝗮 𝗝𝘂𝗺𝗽𝗧𝗼𝗣𝗮𝘁𝗵!**\n\n📍 All upcoming tasks will be processed and routed to:\n🎯 \`${dest}\``;
             
             await safeSendMessage(chatId, confirmationText, { parse_mode: 'Markdown' });
         } else {
@@ -3026,12 +4200,12 @@ NextTaskRunAt: ${nextTaskRunAt}`;
         
         const seconds = match?.[1] ? parseInt(match[1]) : null;
         if (seconds === null || isNaN(seconds)) {
-            return safeSendMessage(chatId, "❌ Usage: `/setcooldown <seconds>` (min 15)");
+            return safeSendMessage(chatId, "❌ **Usage:** \`/setcooldown <seconds>\` (min 15)", { parse_mode: 'Markdown' });
         }
         
         const targetUid = await resolveSettingsUserId(fromId);
         await approvedUsersCollection?.updateOne({ userId: targetUid }, { $set: { cooldownSeconds: Math.max(5, seconds) } });
-        safeSendMessage(chatId, `✅ Cooldown set to ${seconds} seconds.`);
+        safeSendMessage(chatId, `⏳ **𝗠𝗶𝗿𝗿𝗼𝗿 𝗗𝗲𝗹𝗮𝘆 𝗖𝗼𝗼𝗹𝗱𝗼𝘄𝗻 𝗨𝗽𝗱𝗮𝘁𝗲𝗱!**\n\n⏱️ Cooldown set to **${seconds}** seconds between successive messages.`, { parse_mode: 'Markdown' });
     });
     bot.onText(/\/setmirror/, (msg) => handleSetMirror(msg.chat.id, msg.from?.id, msg));
     bot.onText(/\/sync/, (msg) => handleSync(msg.chat.id, msg.from?.id));
@@ -3042,7 +4216,7 @@ NextTaskRunAt: ${nextTaskRunAt}`;
         if (!fromId || !isAdmin(fromId)) return;
 
         isQueuePaused = true;
-        safeSendMessage(chatId, "⏸️ **Task Queue has been Paused!**\nNo new tasks will be processed until resumed via `/resumequeue`.", { parse_mode: 'Markdown' });
+        safeSendMessage(chatId, "⏸️ **𝗧𝗮𝘀𝗸 𝗤𝘂𝗲𝘂𝗲 𝗵𝗮𝘀 𝗯𝗲𝗲𝗻 𝗣𝗮𝘂𝘀𝗲𝗱!**\n\n⚠️ No new tasks will be processed until resumed via \`/resumequeue\` command.", { parse_mode: 'Markdown' });
     });
 
     bot.onText(/\/resumequeue/, async (msg) => {
@@ -3051,7 +4225,7 @@ NextTaskRunAt: ${nextTaskRunAt}`;
         if (!fromId || !isAdmin(fromId)) return;
 
         isQueuePaused = false;
-        safeSendMessage(chatId, "▶️ **Task Queue has been Resumed!**\nProcessing of queued tasks has recommenced.", { parse_mode: 'Markdown' });
+        safeSendMessage(chatId, "▶️ **𝗧𝗮𝘀𝗸 𝗤𝘂𝗲𝘂𝗲 𝗵𝗮𝘀 𝗯𝗲𝗲𝗻 𝗥𝗲𝘀𝘂𝗺𝗲𝗱!**\n\n⚡ Processing of pending queued tasks has recommenced successfully.", { parse_mode: 'Markdown' });
         runNextTask();
     });
 
@@ -3184,7 +4358,7 @@ NextTaskRunAt: ${nextTaskRunAt}`;
 
         taskQueue.length = 0;
         dbClearAllTasks().catch(e => console.error("[Queue DB] clearqueue error:", e));
-        safeSendMessage(chatId, "🗑️ **Pending Queue Cleared successfully!**", { parse_mode: 'Markdown' });
+        safeSendMessage(chatId, "🗑️ **𝗣𝗲𝗻𝗱𝗶𝗻𝗴 𝗤𝘂𝗲𝘂𝗲 𝗖𝗹𝗲𝗮𝗿𝗲𝗱 𝗦𝘂𝗰𝗰𝗲𝘀𝘀𝗳𝘂𝗹𝗹𝘆!**\n\n🧹 All waiting tasks have been removed from the queue.", { parse_mode: 'Markdown' });
     });
 
     bot.onText(/\/cleartopiccache/, async (msg) => {
@@ -3193,7 +4367,7 @@ NextTaskRunAt: ${nextTaskRunAt}`;
         if (!fromId || !isAdmin(fromId)) return;
 
         topicMappingCache.clear();
-        safeSendMessage(chatId, "🔄 **Topic Mapping Cache Cleared!**\nAll topic IDs will be re-fetched from Telegram on the next request.", { parse_mode: 'Markdown' });
+        safeSendMessage(chatId, "🔄 **𝗧𝗼𝗽𝗶𝗰 𝗠𝗮𝗽𝗽𝗶𝗻𝗴 𝗖𝗮𝗰𝗵𝗲 𝗖𝗹𝗲𝗮𝗿𝗲𝗱!**\n\n⚡ All cached topic IDs will be dynamically resolved from Telegram on the next request.", { parse_mode: 'Markdown' });
     });
 
     bot.onText(/\/dashboard/, async (msg) => {
@@ -3265,30 +4439,63 @@ NextTaskRunAt: ${nextTaskRunAt}`;
         
         safeSendMessage(chatId, `✅ **Speed configuration updated!**\n\n• **Global Concurrency:** \`${limit}\` concurrent tasks\n• **User Concurrency:** \`${perUserLimit}\` tasks per user`, { parse_mode: 'Markdown' });
     });
+
+    bot.onText(/\/failed/, async (msg) => {
+        if (!isAdmin(msg.from?.id)) return;
+        const chatId = msg.chat.id;
+        try {
+            const failedTasks = failedTasksCollection ? await failedTasksCollection.find({}).sort({ failedAt: -1 }).limit(10).toArray() : [];
+            const failedCount = failedTasksCollection ? await failedTasksCollection.countDocuments({}) : 0;
+            
+            if (failedCount === 0) {
+                await safeSendMessage(chatId, "🎉 **No current failed tasks!** All copy & mirror operations are clean and successful.", { parse_mode: 'Markdown' });
+                return;
+            }
+            
+            let failedText = `⚠️ **Failed Mirror/Copy Tasks Report**\n`;
+            failedText += `• **Total Failed Logs:** \`${failedCount} tasks\`\n`;
+            failedText += `===============================\n\n`;
+            
+            failedTasks.forEach((t: any, i: number) => {
+                const parts = t.link.split('/');
+                const msgId = parts[parts.length - 1] || 'Media';
+                failedText += `**${i + 1}. [Message ${msgId}](${t.link})**\n`;
+                failedText += `  ├─ **Error:** \`${t.error || 'Unknown Error'}\`\n`;
+                failedText += `  └─ **Failed At:** \`${t.failedAt ? new Date(t.failedAt).toLocaleString() : 'N/A'}\`\n\n`;
+            });
+            
+            if (failedCount > 10) {
+                failedText += `_...and ${failedCount - 10} more failed tasks._\n\n`;
+            }
+            
+            failedText += `💡 You can retry these failed tasks using the dashboard or buttons below.`;
+            
+            await bot?.sendMessage(chatId, failedText, {
+                parse_mode: 'Markdown',
+                disable_web_page_preview: true,
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: '🔄 Retry All Failed', callback_data: 'retry_all_failed_cb' },
+                            { text: '🗑️ Clear Failed Logs', callback_data: 'clear_failed_cb' }
+                        ],
+                        [
+                            { text: '⬅️ Back to Menu', callback_data: 'menu_back' }
+                        ]
+                    ]
+                }
+            });
+        } catch (err: any) {
+            safeSendMessage(chatId, `❌ **Failed Tracker Error:** ${err.message}`);
+        }
+    });
     
     bot.onText(/\/settings/, async (msg) => {
       try {
         if (!isAdmin(msg.from?.id)) throw new Error("Restricted: Settings are locked.");
         if (!msg.from?.id) return;
 
-        const session = userSessions.get(msg.from.id) || (await approvedUsersCollection?.findOne({ userId: msg.from.id.toString() }))?.stringSession;
-
-        const text = `⚙️ **Bot Configuration**\n\n` +
-                     `• **Database:** ${dbStatus === 'Connected' ? '✅ Connected' : '❌ Disconnected'}\n` +
-                     `• **Userbot:** ${session ? '✅ Connected' : '❌ Missing Session'}\n\n` +
-                     `Use the interactive menu to manage settings.`;
-        
-        bot?.sendMessage(msg.chat.id, text, {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [
-              [
-                { text: 'Settings Menu', callback_data: 'bot_settings' },
-                { text: 'Logout Session', callback_data: 'logout_cmd' }
-              ]
-            ]
-          }
-        });
+        await handleSettings(msg.chat.id, msg.from.id);
       } catch (err: any) {
         bot?.sendMessage(msg.chat.id, `❌ **Error:** ${err.message}`);
       }
@@ -3399,7 +4606,7 @@ interface ActiveJob {
     cooldownRemaining?: number;
     startTime: number;
 }
-const activeTaskJobs = new Map<string, ActiveJob>();
+activeTaskJobs = new Map<string, ActiveJob>();
 
 function formatBytes(bytes: number, decimals = 2) {
     if (!bytes || isNaN(bytes) || bytes <= 0) return '0 Bytes';
@@ -3433,16 +4640,16 @@ async function generateDashboardText() {
         const remaining = info.total - info.processed;
         if (remaining > 0) {
             activeBatchesCount++;
-            const progress = info.total > 0 ? Math.floor((info.processed / info.total) * 100) : 0;
+            const progress = info.total > 0 ? Math.min(100, Math.max(0, Math.floor((info.processed / info.total) * 100))) : 0;
             const barLength = 10;
-            const filled = Math.round((progress / 100) * barLength);
-            const bar = '█'.repeat(filled) + '░'.repeat(barLength - filled);
+            const filled = Math.min(barLength, Math.max(0, Math.round((progress / 100) * barLength)));
+            const bar = '█'.repeat(filled) + '░'.repeat(Math.max(0, barLength - filled));
             const elapsed = (Date.now() - info.startTime) / 1000;
             
-            activeBatchesText += `• **Batch:** \`${batchId.substring(0, 8)}\`\n`;
+            activeBatchesText += `\n📦 **BATCH ID:** \`${batchId.substring(0, 8)}\`\n`;
             activeBatchesText += `  ├─ **Progress:** \`[${bar}]\` **${progress}%**\n`;
             activeBatchesText += `  ├─ **Processed:** \`${info.processed} / ${info.total}\` (Success: \`${info.success}\` | Failed: \`${info.failed}\`)\n`;
-            activeBatchesText += `  ├─ **Current:** \`${info.currentLink ? info.currentLink.split('/').pop() : 'Idle'}\`\n`;
+            activeBatchesText += `  ├─ **Current Link:** \`${info.currentLink ? info.currentLink.split('/').pop() : 'Idle'}\`\n`;
             activeBatchesText += `  └─ **Running:** \`${formatDashboardTime(elapsed)}\`\n`;
         } else {
             completedBatchesCount++;
@@ -3450,7 +4657,7 @@ async function generateDashboardText() {
     }
 
     if (activeBatchesCount === 0) {
-        activeBatchesText = `_No active batch synchronizations running._`;
+        activeBatchesText = `\n_No active batch synchronizations running._`;
     }
 
     // 2. Active Mirror Jobs & Standalone Jobs
@@ -3463,7 +4670,7 @@ async function generateDashboardText() {
         const linkParts = job.link.split('/');
         const msgId = linkParts[linkParts.length - 1] || 'Media';
         
-        let jobText = `• **Task:** [Message ${msgId}](${job.link})\n`;
+        let jobText = `\n⚙️ **TASK:** [Message ${msgId}](${job.link})\n`;
         jobText += `  ├─ **Phase:** `;
         if (job.phase === 'searching') jobText += `🔍 Searching/Resolving source\n`;
         else if (job.phase === 'cooldown') jobText += `⏳ In Cooldown (${job.cooldownRemaining || 0}s remaining)\n`;
@@ -3474,8 +4681,8 @@ async function generateDashboardText() {
             const progress = job.progress;
             const barLength = 10;
             const percentVal = Math.min(100, Math.max(0, progress.percent || 0));
-            const filledLength = Math.round((percentVal / 100) * barLength);
-            const emptyLength = barLength - filledLength;
+            const filledLength = Math.min(barLength, Math.max(0, Math.round((percentVal / 100) * barLength)));
+            const emptyLength = Math.max(0, barLength - filledLength);
             const bar = '█'.repeat(filledLength) + '░'.repeat(emptyLength);
             
             jobText += `  ├─ **Progress:** \`[${bar}]\` **${percentVal.toFixed(1)}%**\n`;
@@ -3501,23 +4708,26 @@ async function generateDashboardText() {
         activeTaskText = `_No active standalone downloads running._`;
     }
 
-    return `📊 **Mirror Control Center & Dynamic Dashboard**\n` +
-           `===============================\n\n` +
-           `🖥 **System Health:**\n` +
-           `• **Database:** ${dbStatusText}\n` +
-           `• **Task Scheduler:** \`${activeTasks} active / ${MAX_CONCURRENT_TASKS} max concurrent\`\n` +
-           `• **Pending Queue:** \`${queueLen} files waiting\`\n\n` +
-           `⚡ **Dynamic Speed Settings:**\n` +
-           `• **Concurrency limit:** \`${MAX_CONCURRENT_TASKS} concurrent tasks\`\n` +
-           `• **Max Tasks Per User:** \`${MAX_TASKS_PER_USER} tasks/user\`\n\n` +
-           `📦 **Batch Sync Status Summary:**\n` +
-           `• **Total Batches:** \`${totalBatches}\` | **Active:** \`${activeBatchesCount}\` | **Completed:** \`${completedBatchesCount}\`\n` +
+    return `📈 **𝗗𝗔𝗦𝗛𝗕𝗢𝗔𝗥𝗗 : 𝗥𝗼𝗵𝗶𝘁  𝗦𝗮𝘃𝗲  𝗥𝗲𝘀𝘁𝗿𝗶𝗰𝘁𝗶𝗰𝘁𝗲𝗱  𝗯𝗼𝘁  𝟮𝟬𝟮𝟲**\n` +
+           `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n\n` +
+           `🖥️ **𝗦𝗬𝗦𝗧𝗘𝗠  𝗛𝗘𝗔𝗟𝗧𝗛:**\n` +
+           `├ **Database Connect:** ${dbStatusText}\n` +
+           `├ **Active Pipelines:** \`${activeTasks} / ${MAX_CONCURRENT_TASKS} workers\`\n` +
+           `└ **Queue Backlog:** \`${queueLen} pending files\`\n\n` +
+           `⚡ **𝗦𝗣𝗘𝗘𝗗  &  𝗟𝗜𝗠𝗜𝗧𝗦:**\n` +
+           `├ **Global Concurrency:** \`${MAX_CONCURRENT_TASKS} tasks\`\n` +
+           `└ **Max User Limit:** \`${MAX_TASKS_PER_USER} tasks/user\`\n\n` +
+           `📦 **𝗕𝗔𝗧𝗖𝗛  𝗦𝗬𝗡𝗖  𝗦𝗨𝗠𝗠𝗔𝗥𝗬:**\n` +
+           `├ **Total Registered:** \`${totalBatches}\`\n` +
+           `├ **Running Syncs:** \`${activeBatchesCount}\`\n` +
+           `└ **Finished Batches:** \`${completedBatchesCount}\`\n` +
            `${activeBatchesText}\n\n` +
-           `🔄 **Mirror Active Jobs:**\n` +
+           `🔄 **𝗠𝗜𝗥𝗥𝗢𝗥  𝗔𝗖𝗧𝗜𝗩𝗘  𝗝𝗢𝗕𝗦:**\n` +
            `${activeMirrorText}\n\n` +
-           `📥 **Standalone Active Jobs:**\n` +
+           `📥 **𝗦𝗧𝗔𝗡𝗗𝗔𝗟𝗢𝗡𝗘  𝗔𝗖𝗧𝗜𝗩𝗘  𝗝𝗢𝗕𝗦:**\n` +
            `${activeTaskText}\n\n` +
-           `🕒 _Last updated: ${new Date().toISOString().replace('T', ' ').substring(0, 19)} UTC_`;
+           `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n` +
+           `🕒 _Last Auto-Update: ${new Date().toISOString().replace('T', ' ').substring(0, 19)} UTC_`;
 }
 
 const lastTaskTimePerUser = new Map<number, number>();
@@ -3533,7 +4743,7 @@ interface BatchInfo {
     currentLink?: string;
     lastUpdate?: number;
 }
-const batchStatusMap = new Map<string, BatchInfo>();
+batchStatusMap = new Map<string, BatchInfo>();
 
 const refreshBatchSummary = async (batchId: string, force = false) => {
     const info = batchStatusMap.get(batchId);
@@ -3559,11 +4769,12 @@ const refreshBatchSummary = async (batchId: string, force = false) => {
 
     const progress = info.total > 0 ? Math.floor((info.processed / info.total) * 100) : 0;
     const size = 15;
-    const filled = Math.floor((size * info.processed) / info.total);
-    const bar = "🟩".repeat(filled) + "⬜".repeat(size - filled);
+    const filled = Math.min(size, Math.max(0, Math.floor((size * (info.processed || 0)) / (info.total || 1))));
+    const empty = Math.max(0, size - filled);
+    const bar = "🟩".repeat(filled) + "⬜".repeat(empty);
 
     const isFinished = remaining <= 0;
-    const progressBar = "█".repeat(Math.round(progress / 12.5));
+    const progressBar = "█".repeat(Math.min(8, Math.max(0, Math.round(progress / 12.5))));
 
     const text = `╔═══ ⚡ 𝗕𝗮𝘁𝗰𝗵 𝗘𝗻𝗴𝗶𝗻𝗲 ⚡ ═══╗\n` +
                  `║ 🟢 𝗦𝘆𝘀𝘁𝗲𝗺: 𝗢𝗻𝗹𝗶𝗻𝗲\n` +
@@ -3614,7 +4825,7 @@ async function dbEnqueueTask(task: Task) {
     }
 }
 
-async function dbEnqueueTasks(tasks: Task[]) {
+dbEnqueueTasks = async function(tasks: Task[]) {
     if (tasks.length === 0) return;
     for (const t of tasks) {
         if (!t.id) {
@@ -3643,7 +4854,7 @@ async function dbEnqueueTasks(tasks: Task[]) {
     }
 }
 
-async function dbDequeueTask(task: Task) {
+dbDequeueTask = async function(task: Task) {
     if (queuedTasksCollection && task.id) {
         try {
             await queuedTasksCollection.deleteOne({ id: task.id });
@@ -3667,6 +4878,7 @@ async function dbRequeueFrontTask(task: Task) {
                 forceGeneralPath: task.forceGeneralPath,
                 overrideTargetId: task.overrideTargetId,
                 isMirror: task.isMirror,
+                retries: task.retries || 0,
                 createdAt: new Date(Date.now() - 3600000)
             });
         } catch (err) {
@@ -3675,7 +4887,7 @@ async function dbRequeueFrontTask(task: Task) {
     }
 }
 
-async function dbClearAllTasks() {
+dbClearAllTasks = async function() {
     if (queuedTasksCollection) {
         try {
             await queuedTasksCollection.deleteMany({});
@@ -3683,6 +4895,105 @@ async function dbClearAllTasks() {
             console.error('[DB Queue] Error clearing tasks:', err);
         }
     }
+}
+
+async function saveFailedTask(task: Task, reason: string) {
+    if (failedTasksCollection) {
+        try {
+            await failedTasksCollection.insertOne({
+                id: task.id || Date.now().toString(36) + Math.random().toString(36).substring(2, 8),
+                chatId: Number(task.chatId),
+                userId: Number(task.userId),
+                link: task.link,
+                error: reason,
+                failedAt: new Date(),
+                overrideThreadId: task.overrideThreadId,
+                forceGeneralPath: task.forceGeneralPath,
+                overrideTargetId: task.overrideTargetId,
+                isMirror: task.isMirror
+            });
+            console.log(`[Failed Tracker] Saved failed task to MongoDB: ${task.link}`);
+        } catch (err) {
+            console.error('[Failed Tracker] Error saving failed task:', err);
+        }
+    }
+}
+
+retryFailedTask = async function(id: string) {
+    if (failedTasksCollection) {
+        try {
+            const taskDoc = await failedTasksCollection.findOne({ id });
+            if (taskDoc) {
+                const newTask: Task = {
+                    id: taskDoc.id,
+                    chatId: Number(taskDoc.chatId),
+                    userId: Number(taskDoc.userId),
+                    link: taskDoc.link,
+                    overrideThreadId: taskDoc.overrideThreadId,
+                    forceGeneralPath: taskDoc.forceGeneralPath,
+                    overrideTargetId: taskDoc.overrideTargetId,
+                    isMirror: taskDoc.isMirror,
+                    retries: 0
+                };
+                taskQueue.push(newTask);
+                await dbEnqueueTask(newTask);
+                await failedTasksCollection.deleteOne({ id });
+                console.log(`[Failed Tracker] Retrying failed task: ${newTask.link}`);
+                runNextTask();
+                return true;
+            }
+        } catch (err) {
+            console.error('[Failed Tracker] Error retrying failed task:', err);
+        }
+    }
+    return false;
+}
+
+retryAllFailedTasks = async function() {
+    if (failedTasksCollection) {
+        try {
+            const failedTasks = await failedTasksCollection.find({}).toArray();
+            if (failedTasks.length > 0) {
+                const restoredTasks: Task[] = [];
+                for (const taskDoc of failedTasks) {
+                    const newTask: Task = {
+                        id: taskDoc.id || Date.now().toString(36) + Math.random().toString(36).substring(2, 8),
+                        chatId: Number(taskDoc.chatId),
+                        userId: Number(taskDoc.userId),
+                        link: taskDoc.link,
+                        overrideThreadId: taskDoc.overrideThreadId,
+                        forceGeneralPath: taskDoc.forceGeneralPath,
+                        overrideTargetId: taskDoc.overrideTargetId,
+                        isMirror: taskDoc.isMirror,
+                        retries: 0
+                    };
+                    taskQueue.push(newTask);
+                    restoredTasks.push(newTask);
+                }
+                await dbEnqueueTasks(restoredTasks);
+                await failedTasksCollection.deleteMany({});
+                console.log(`[Failed Tracker] Requeued ${failedTasks.length} failed tasks.`);
+                runNextTask();
+                return failedTasks.length;
+            }
+        } catch (err) {
+            console.error('[Failed Tracker] Error retrying all failed tasks:', err);
+        }
+    }
+    return 0;
+}
+
+clearAllFailedTasks = async function() {
+    if (failedTasksCollection) {
+        try {
+            await failedTasksCollection.deleteMany({});
+            console.log('[Failed Tracker] Cleared all failed tasks from database');
+            return true;
+        } catch (err) {
+            console.error('[Failed Tracker] Error clearing failed tasks:', err);
+        }
+    }
+    return false;
 }
 
 runNextTask = async () => {
@@ -3782,13 +5093,13 @@ runNextTask = async () => {
             statusMsgId = sMsg?.message_id || 0;
         }
 
-        let cooldownSecs = 5; // Updated to 5 seconds as requested
+        let cooldownSecs = globalCooldownSeconds;
         if (approvedUsersCollection) {
             try {
                 const targetUidStr = await resolveSettingsUserId(fromId);
                 const userDoc = await approvedUsersCollection.findOne({ userId: targetUidStr });
                 if (userDoc && userDoc.cooldownSeconds !== undefined) {
-                    cooldownSecs = Math.max(5, Number(userDoc.cooldownSeconds));
+                    cooldownSecs = Number(userDoc.cooldownSeconds);
                 }
             } catch (dbErr) {
                 console.error("[Queue] Failed to fetch cooldownSeconds from DB:", dbErr);
@@ -3815,7 +5126,20 @@ runNextTask = async () => {
                     if (job) {
                         job.cooldownRemaining = i;
                     }
-                    await safeEditMessage(`⏳ **Cooldown:** Waiting ${i} seconds to avoid Telegram API limit before downloading next file...`, { chat_id: task.chatId, message_id: statusMsgId });
+                    const totalBarLen = 12;
+                    const elapsed = waitSecs - i;
+                    const filledLen = Math.min(totalBarLen, Math.max(0, Math.round((elapsed / Math.max(1, waitSecs)) * totalBarLen)));
+                    const emptyLen = Math.max(0, totalBarLen - filledLen);
+                    const cBar = '█'.repeat(filledLen) + '░'.repeat(emptyLen);
+                    const pct = Math.round((elapsed / waitSecs) * 100);
+
+                    const cooldownText = `⏳ **Auto-Countdown Cooldown Active**\n\n` +
+                                         `• **Status:** Anti-Flood Limit Buffer\n` +
+                                         `• **Time Remaining:** \`${i} seconds\`\n` +
+                                         `• **Delay Progress:** \`[${cBar}]\` **${pct}%**\n\n` +
+                                         `🛡 _Protecting your Telegram session against API throttling limits._`;
+
+                    await safeEditMessage(cooldownText, { chat_id: task.chatId, message_id: statusMsgId, parse_mode: 'Markdown' }).catch(() => {});
                     await sleep(1000);
                 }
             }
@@ -3824,26 +5148,118 @@ runNextTask = async () => {
         nextTaskRunAt = null;
         console.log(`[Queue] Starting processTask for link ${task.link}`);
         let success = false;
+        let finalDone = false;
+        let isTopicBlocked = false;
+
+        if (task.fullMirrorSessionId) {
+            const session = activeFullMirrorSessions.get(task.fullMirrorSessionId);
+            if (session) {
+                const threadId = task.overrideThreadId !== undefined && task.overrideThreadId !== null ? task.overrideThreadId : 'general';
+                const topicStat = session.topicStats[threadId];
+                if (topicStat) {
+                    const topicTitle = (topicStat.title || '').trim().toLowerCase();
+                    // Load blocked topics
+                    const settingsUid = await resolveSettingsUserId(fromId);
+                    const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
+                    const blockedTopics = (userDoc?.blockedTopics || []).map((t: string) => t.trim().toLowerCase());
+                    
+                    const srcMatch = task.link.match(/t\.me\/(?:c\/)?([a-zA-Z0-9_-]+)\/(\d+)/i);
+                    let sourceGroupIdStr = srcMatch ? srcMatch[1].replace('-100', '') : '';
+                    
+                    if (blockedTopics.some((bt: string) => 
+                        bt === topicTitle || 
+                        bt === threadId.toString() || 
+                        (sourceGroupIdStr && (bt === `-100${sourceGroupIdStr}_${threadId}` || bt === `${sourceGroupIdStr}_${threadId}`))
+                    )) {
+                        isTopicBlocked = true;
+                        console.log(`[Queue] Skipping blocked topic: "${topicStat.title}" (ThreadId: ${threadId})`);
+                    }
+                }
+            }
+        }
+
         try {
-            const timeoutPromise = new Promise<boolean>((_, reject) => setTimeout(() => reject(new Error("Global Task Timeout (90 minutes)")), 90 * 60 * 1000));
-            success = await Promise.race([
-                processTask(task.chatId, task.link, statusMsgId, fromId, task.overrideThreadId, task.forceGeneralPath, task.overrideTargetId, task.isMirror),
-                timeoutPromise
-            ]);
+            if (isTopicBlocked) {
+                await safeEditMessage(`🚫 **Skipped task (Blocked Topic):**\n└ Link: ${task.link}`, { chat_id: task.chatId, message_id: statusMsgId });
+                success = true; // Act as success so that it iterates forward cleanly without errors
+                finalDone = true;
+            } else {
+                // Task timeout is completely removed as requested, allowing unlimited download time for large content.
+                success = await processTask(task.chatId, task.link, statusMsgId, fromId, task.overrideThreadId, task.forceGeneralPath, task.overrideTargetId, task.isMirror);
+                finalDone = true;
+            }
         } catch (taskErr: any) {
-            console.error(`[Queue] processTask timed out or threw natively:`, taskErr);
+            console.error(`[Queue] processTask failed or threw natively:`, taskErr);
+            
+            if (taskErr.message.includes("FloodWait")) {
+                console.log(`[Queue] Task paused due to flood wait. Re-queueing at the end.`);
+                taskQueue.push(task); // Re-queue at the end
+                await safeEditMessage(`⚠️ **Task Paused (FloodWait):** Telegram Bot currently under heavy abuse. Waiting... \n\n🔗 **Link:** ${task.link}`, { chat_id: task.chatId, message_id: statusMsgId });
+                return;
+            }
+
             task.retries = (task.retries || 0) + 1;
             if (task.retries <= 3) {
                 console.log(`[Queue] Retrying task (Retry ${task.retries}/3)`);
                 taskQueue.unshift(task); // Re-queue at the front
-                await safeEditMessage(`⚠️ **Task Error:** ${taskErr.message}\nRetrying (${task.retries}/3)...`, { chat_id: task.chatId, message_id: statusMsgId });
+                dbRequeueFrontTask(task).catch(e => console.error("[Queue DB] requeue front error on retry:", e));
+                await safeEditMessage(`⚠️ **Task Error:** ${taskErr.message}\nRetrying (${task.retries}/3)...\n\n🔗 **Link:** ${task.link}`, { chat_id: task.chatId, message_id: statusMsgId });
             } else {
-                await safeEditMessage(`❌ **Task Failed:** ${taskErr.message} (Max retries reached)`, { chat_id: task.chatId, message_id: statusMsgId });
+                await safeEditMessage(`❌ **Task Failed:** ${taskErr.message} (Max retries reached)\n\n🔗 **Link:** ${task.link}`, { chat_id: task.chatId, message_id: statusMsgId });
+                await saveFailedTask(task, taskErr.message);
+
+                // Add to in-memory logs as 'Failed'
+                const cleanLink = task.link.trim();
+                const destTargetStr = task.overrideTargetId ? task.overrideTargetId.toString() : 'Default';
+                inMemoryMirrorLogs.unshift({
+                    link: cleanLink,
+                    destId: destTargetStr,
+                    mirroredAt: new Date().toISOString(),
+                    status: 'Failed',
+                    info: taskErr.message || "Max retries reached"
+                });
+                if (inMemoryMirrorLogs.length > 500) inMemoryMirrorLogs.pop();
+                finalDone = true;
             }
             success = false;
         }
         console.log(`[Queue] processTask finished with success=${success}`);
+        if (success) {
+            downloadCounter++;
+            if (downloadCounter >= 100) {
+                console.log("[Anti-Flood] Cool down triggered (100 tasks). Waiting 90s...");
+                await sleep(90000);
+                downloadCounter = 0;
+            }
+        }
         lastTaskTimePerUser.set(fromIdKey, Date.now());
+
+        if (finalDone && task.fullMirrorSessionId) {
+            const session = activeFullMirrorSessions.get(task.fullMirrorSessionId);
+            if (session) {
+                session.processedFiles++;
+                if (success) {
+                    session.successCount++;
+                } else {
+                    session.failedCount++;
+                }
+
+                // Update topic stats
+                const threadId = task.overrideThreadId !== undefined && task.overrideThreadId !== null ? task.overrideThreadId : 'general';
+                const topicStat = session.topicStats[threadId];
+                if (topicStat) {
+                    topicStat.processed++;
+                    if (topicStat.processed >= topicStat.total && !topicStat.isMarkedCompleted) {
+                        topicStat.isMarkedCompleted = true;
+                    }
+                }
+
+                // Trigger progress bar write
+                await updateGlobalMirrorProgress(task.fullMirrorSessionId).catch(err => {
+                    console.error("[Full Mirror Progress Update Failed]", err);
+                });
+            }
+        }
         
         if (task.batchId) {
             const info = batchStatusMap.get(task.batchId);
@@ -4193,7 +5609,7 @@ startAutoMirrorWatcher = async (userId: number, client: TelegramClient) => {
                                 }
                             }
                             if (destTopicId) userDestCache.set(topicName, destTopicId);
-                        } catch (err) {
+                        } catch (err: any) {
                             console.error(`[Watcher] Dest Topic Error: ${err.message}`);
                         }
                     }
@@ -4238,7 +5654,7 @@ startAutoMirrorWatcher = async (userId: number, client: TelegramClient) => {
                 // Keep track of the last processed message ID in real-time
                 await updateMirrorPathLastId(userId, chatIdRaw, message.id);
             }
-        } catch (e) {
+        } catch (e: any) {
             console.error(`[Watcher] Event Handler Error: ${e.message}`);
         }
     }, new NewMessage({}));
@@ -4308,9 +5724,9 @@ getConnectedUserbotClient = async (userId: number) => {
                 apiIdValue,
                 apiHashValue,
                 {
-                    connectionRetries: 50,
-                    timeout: 600000,
-                    requestRetries: 15,
+                    connectionRetries: 15,
+                    timeout: 300000,
+                    requestRetries: 10,
                     ...getRandomDeviceProps(),
                     useWSS: false,
                     autoReconnect: true,
@@ -4362,70 +5778,70 @@ getConnectedUserbotClient = async (userId: number) => {
     }
 };
 
-    const createProgressBar = (total: number, current: number, label: string, startTime: number, pathStr?: string) => {
-        const percentage = Math.min(100, Math.max(0, Math.floor((current / total) * 100)));
-        const size = 12;
-        const filled = Math.floor((size * current) / total);
-        const empty = size - filled;
-        
-        const colors = ["🟥", "🟧", "🟨", "🟩", "🟦", "🟪"];
-        let progressBar = "";
-        for(let i = 0; i < filled; i++) {
-            progressBar += colors[Math.floor((i / size) * colors.length)];
-        }
-        progressBar += "⬜".repeat(empty);
-        
-        const now = Date.now();
-        const elapsed = (now - startTime) / 1000;
-        const speed = elapsed > 0 ? (current / elapsed) : 0; // bytes per second
-        const remaining = total - current;
-        const eta = speed > 0 ? Math.ceil(remaining / speed) : 0;
+createProgressBar = (total: number, current: number, label: string, startTime: number, pathStr?: string) => {
+    const percentage = Math.min(100, Math.max(0, Math.floor((current / (total || 1)) * 100)));
+    const size = 12;
+    const filled = Math.min(size, Math.max(0, Math.floor((size * (current || 0)) / (total || 1))));
+    const empty = Math.max(0, size - filled);
+    
+    const colors = ["🟥", "🟧", "🟨", "🟩", "🟦", "🟪"];
+    let progressBar = "";
+    for(let i = 0; i < filled; i++) {
+        progressBar += colors[Math.floor((i / size) * colors.length)];
+    }
+    progressBar += "⬜".repeat(empty);
+    
+    const now = Date.now();
+    const elapsed = (now - startTime) / 1000;
+    const speed = elapsed > 0 ? (current / elapsed) : 0; // bytes per second
+    const remaining = total - current;
+    const eta = speed > 0 ? Math.ceil(remaining / speed) : 0;
 
-        const formatBytes = (bytes: number) => {
-            if (!bytes || isNaN(bytes) || bytes <= 0) return '0 B';
-            const k = 1024;
-            const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
-            let i = Math.floor(Math.log(bytes) / Math.log(k));
-            if (i < 0) i = 0;
-            if (i >= sizes.length) i = sizes.length - 1;
-            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-        };
-
-        const formatTime = (seconds: number) => {
-            if (seconds === 0 || seconds > 86400 * 7) return "∞";
-            if (seconds < 60) return `${seconds}s`;
-            const totalMins = Math.floor(seconds / 60);
-            const secs = seconds % 60;
-            if (totalMins < 60) return `${totalMins}m ${secs}s`;
-            const hours = Math.floor(totalMins / 60);
-            const mins = totalMins % 60;
-            return `${hours}h ${mins}m`;
-        };
-
-        const icon = label === "Downloading" ? "⬇️" : "⬆️";
-        const meta = label === "Downloading" ? "Server ⟿ Bot" : "Bot ⟿ Your Chat";
-
-        // Enhanced progress tracker
-        const text = `╔═══ ${icon} ${label.toUpperCase()} ═══╗\n` +
-               `║ ${progressBar} ${percentage}%\n` +
-               `╠══════════════════════╣\n` +
-               `║ 📦 𝗦𝗶𝘇𝗲   : ${formatBytes(current)} / ${formatBytes(total)}\n` +
-               `║ ⚡ 𝗦𝗽𝗲𝗲𝗱  : ${formatBytes(speed)}/s\n` +
-               `║ ⏳ 𝗘𝗧𝗔    : ${formatTime(eta)}\n` +
-               `╠══════════════════════╣\n` +
-               `║ 🚀 𝗠𝗼𝗱𝗲   : ${currentUploadEngine}\n` +
-               `║ 🛰 𝗥𝗼𝘂𝘁𝗲  : ${meta}\n` +
-               `║ 👣 𝗣𝗮𝘁𝗵    : ${pathStr || 'N/A'}\n` +
-               `╚══════════════════════╝`;
-        return text;
+    const formatBytes = (bytes: number) => {
+        if (!bytes || isNaN(bytes) || bytes <= 0) return '0 B';
+        const k = 1024;
+        const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+        let i = Math.floor(Math.log(bytes) / Math.log(k));
+        if (i < 0) i = 0;
+        if (i >= sizes.length) i = sizes.length - 1;
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
     };
 
-    const createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
-        inline_keyboard: [[
-            { text: isPaused ? '▶️ Resume' : '⏸️ Pause', callback_data: `${isPaused ? 'resume' : 'pause'}_${jobKey}` },
-            { text: '🔁 Retry', callback_data: `retry_${jobKey}` }
-        ]]
-    });
+    const formatTime = (seconds: number) => {
+        if (seconds === 0 || seconds > 86400 * 7) return "∞";
+        if (seconds < 60) return `${seconds}s`;
+        const totalMins = Math.floor(seconds / 60);
+        const secs = seconds % 60;
+        if (totalMins < 60) return `${totalMins}m ${secs}s`;
+        const hours = Math.floor(totalMins / 60);
+        const mins = totalMins % 60;
+        return `${hours}h ${mins}m`;
+    };
+
+    const icon = label === "Downloading" ? "⬇️" : "⬆️";
+    const meta = label === "Downloading" ? "Server ⟿ Bot" : "Bot ⟿ Your Chat";
+
+    // Enhanced progress tracker
+    const text = `╔═══ ${icon} ${label.toUpperCase()} ═══╗\n` +
+           `║ ${progressBar} ${percentage}%\n` +
+           `╠══════════════════════╣\n` +
+           `║ 📦 𝗦𝗶𝘇𝗲   : ${formatBytes(current)} / ${formatBytes(total)}\n` +
+           `║ ⚡ 𝗦𝗽𝗲𝗲𝗱  : ${formatBytes(speed)}/s\n` +
+           `║ ⏳ 𝗘𝗧𝗔    : ${formatTime(eta)}\n` +
+           `╠══════════════════════╣\n` +
+           `║ 🚀 𝗠𝗼𝗱𝗲   : ${currentUploadEngine}\n` +
+           `║ 🛰 𝗥𝗼𝘂𝘁𝗲  : ${meta}\n` +
+           `║ 👣 𝗣𝗮𝘁𝗵    : ${pathStr || 'N/A'}\n` +
+           `╚══════════════════════╝`;
+    return text;
+};
+
+createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
+    inline_keyboard: [[
+        { text: isPaused ? '▶️ Resume' : '⏸️ Pause', callback_data: `${isPaused ? 'resume' : 'pause'}_${jobKey}` },
+        { text: '🔁 Retry', callback_data: `retry_${jobKey}` }
+    ]]
+});
 
     const getBestClientForLinkData = async (linkData: any, preferredUserIdParam: number, statusMsgId?: number, chatId?: number) => {
         const preferredUserId = Number(await resolveSettingsUserId(preferredUserIdParam)) || preferredUserIdParam;
@@ -4516,6 +5932,11 @@ getConnectedUserbotClient = async (userId: number) => {
     };
 
     const processTask = async (chatId: number, link: string, statusMsgId: number, userId: number, threadIdOverride?: number, forceGeneralPath?: boolean, targetIdOverride?: any, isMirror?: boolean): Promise<boolean> => {
+        let cleanLink = link.trim();
+        let destTargetStr = (targetIdOverride || "Default").toString();
+        let tempFilePath: string | undefined = undefined;
+        let thumbPath: string | undefined = undefined;
+        let hasThumb = false;
         try {
             const getLinkData = (url: string) => {
                 const cleanUrl = url.trim().split('?')[0];
@@ -4586,8 +6007,36 @@ getConnectedUserbotClient = async (userId: number) => {
                 }
             }
 
-            // Smart Route Destination: Find a client that can reach the destination
-            const { client: destClient, peer: destPeer } = await getBestClientForTarget(uploadTarget, userId, statusMsgId, chatId);
+        // Smart Route Destination: Find a client that can reach the destination
+            let destClient: any = null;
+            let destPeer: any = null;
+
+            if (userDoc?.uploadAgent === 'bot') {
+                let bClient = await getConnectedBotClient();
+                if (!bClient) {
+                    console.warn("Bot GramJS Client not initially available, retrying once...");
+                    await new Promise(resolve => setTimeout(resolve, 3000));
+                    bClient = await getConnectedBotClient();
+                }
+                
+                if (!bClient) {
+                    if (botFloodWaitEnd > Date.now()) {
+                        throw new Error("Telegram Bot currently under heavy abuse (FloodWait). Please wait a few minutes.");
+                    }
+                    throw new Error("Bot GramJS Client is not configured or connected. Please make sure BOT_TOKEN, API_ID, and API_HASH are valid.");
+                }
+                destClient = bClient;
+                try {
+                    const directResolve = await destClient.getEntity(uploadTarget);
+                    destPeer = await destClient.getInputEntity(directResolve);
+                } catch (e: any) {
+                    throw new Error("Target destination could not be resolved by the Telegram Bot. Ensure the Bot has been joined/invited to the destination chat/channel as an Administrator.");
+                }
+            } else {
+                const resolvedTarget = await getBestClientForTarget(uploadTarget, userId, statusMsgId, chatId);
+                destClient = resolvedTarget.client;
+                destPeer = resolvedTarget.peer;
+            }
             
             let finalDestPeer = destPeer;
             
@@ -4609,22 +6058,47 @@ getConnectedUserbotClient = async (userId: number) => {
                     const directResolve = await destClient.getEntity(uploadTarget);
                     finalDestPeer = await destClient.getInputEntity(directResolve);
                 } catch (e: any) {
-                    throw new Error("Target destination could not be resolved by your Userbot. Ensure the Userbot has joined the destination chat/channel.");
+                    if (userDoc?.uploadAgent === 'bot') {
+                        throw new Error("Target destination could not be resolved by the Telegram Bot. Ensure the Bot is added as an Administrator in the destination.");
+                    } else {
+                        throw new Error("Target destination could not be resolved by your Userbot. Ensure the Userbot has joined the destination chat/channel.");
+                    }
                 }
             }
-            if (!destClient) throw new Error("Destination unreachable. Ensure your Userbot is a member.");
+            if (!destClient) {
+                if (userDoc?.uploadAgent === 'bot') {
+                    throw new Error("Telegram Bot destination client unreachable.");
+                } else {
+                    throw new Error("Destination unreachable. Ensure your Userbot is a member.");
+                }
+            }
 
-            const destTargetStr = uploadTarget.toString();
-            const cleanLink = link.trim();
+            destTargetStr = uploadTarget.toString();
+            cleanLink = link.trim();
             if (isMirror && mirroredMessagesCollection) {
                 const existing = await mirroredMessagesCollection.findOne({ link: cleanLink, destId: destTargetStr });
                 if (existing) {
-                    await safeEditMessage(`⚡ **Skipped:** Already mirrored to destination.`, { chat_id: chatId, message_id: statusMsgId });
+                    inMemoryMirrorLogs.unshift({
+                        link: cleanLink,
+                        destId: destTargetStr,
+                        mirroredAt: new Date().toISOString(),
+                        status: 'Skipped',
+                        info: 'Already mirrored to destination'
+                    });
+                    if (inMemoryMirrorLogs.length > 500) inMemoryMirrorLogs.pop();
+                    await safeEditMessage(`⚡ **Skipped:** Already mirrored to destination.\n\n🔗 **Link:** ${link}`, { chat_id: chatId, message_id: statusMsgId });
                     return true;
                 }
             }
 
             const recordSuccessfulMirror = async () => {
+                inMemoryMirrorLogs.unshift({
+                    link: cleanLink,
+                    destId: destTargetStr,
+                    mirroredAt: new Date().toISOString(),
+                    status: 'Success'
+                });
+                if (inMemoryMirrorLogs.length > 500) inMemoryMirrorLogs.pop();
                 if (mirroredMessagesCollection) {
                     await mirroredMessagesCollection.updateOne(
                         { link: cleanLink, destId: destTargetStr },
@@ -4675,64 +6149,87 @@ getConnectedUserbotClient = async (userId: number) => {
 
             if (!msg || !(msg instanceof Api.Message)) throw new Error("Content not found. The Userbot session used does not have access to this message. Please switch to an account that is a member of the source channel, or verify the link.");
 
-            // Check if forwarding is allowed by source (Content Protection / Restrict Content is OFF)
-            let isForwardingRestricted = !!msg.noforwards;
-            let chatEntity = null;
-            try {
-                chatEntity = await msg.getChat().catch(() => null);
-                if (chatEntity && chatEntity.noforwards) {
-                    isForwardingRestricted = true;
+            // Advanced Topic Blocking logic for all MIRROR modes
+            if (isMirror) {
+                const settingsUid = await resolveSettingsUserId(userId);
+                const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
+                const blockedTopics = (userDoc?.blockedTopics || []).map((t: string) => t.trim().toLowerCase());
+                
+                let sourceThreadId = msg.replyTo?.replyToTopId || msg.replyTo?.replyToMsgId || msg.replyToMsgId;
+                const sourceGroupIdStr = linkData.channelId.toString().replace('-100', '');
+                
+                if (sourceThreadId) {
+                    const blockStr = `-100${sourceGroupIdStr}_${sourceThreadId}`.toLowerCase();
+                    const blockStrWithoutMinus100 = `${sourceGroupIdStr}_${sourceThreadId}`.toLowerCase();
+                    
+                    if (blockedTopics.some((bt: string) => bt === sourceThreadId.toString() || bt === blockStr || bt === blockStrWithoutMinus100)) {
+                        console.log(`[Queue] Skipping blocked topic for message ${linkData.msgId} (ThreadId: ${sourceThreadId})`);
+                        await safeEditMessage(`🚫 **Skipped task (Blocked Topic):**\n└ Link: ${link}`, { chat_id: chatId, message_id: statusMsgId });
+                        return true; // Return success so queue continues without breaking
+                    }
                 }
-            } catch (chatError) {
-                console.warn(`Failed to inspect chat entity for restricted forwarding check:`, chatError);
             }
 
-            console.log(`[Debug] Checking forward. msg.noforwards: ${msg.noforwards}, chatEntity.noforwards: ${chatEntity?.noforwards}, linkData: ${JSON.stringify(linkData)}`);
-            if (!isForwardingRestricted) {
-                console.log(`[Debug] Attempting direct forward.`);
-                await safeEditMessage("🚀 **Mirroring...**", { chat_id: chatId, message_id: statusMsgId });
+            // Attempt direct forward first as requested by user
+            let canForward = true;
+            if (msg.noforwards || (msg as any).noforwards) {
+                console.log(`[Debug] Direct forward not possible: Message noforwards flag is set.`);
+                canForward = false;
+            } else {
+                try {
+                    const chatEntity = await msg.getChat().catch(() => null);
+                    if (chatEntity && (chatEntity.noforwards || (chatEntity as any).noforwards)) {
+                        console.log(`[Debug] Direct forward not possible: Chat content protection is enabled.`);
+                        canForward = false;
+                    }
+                } catch (chatError) {
+                    console.warn(`Failed to inspect chat entity for restricted forwarding check:`, chatError);
+                }
+            }
+
+            if (canForward) {
+                console.log(`[Debug] Attempting direct forward for msg ${linkData.msgId}`);
+                await safeEditMessage("🚀 **Attempting direct forward...**", { chat_id: chatId, message_id: statusMsgId });
                 try {
                     let finalSourcePeer = (destClient === sourceClient) ? sourcePeer : await safelyResolveEntity(destClient, linkData.channelId).catch(() => null);
                     if (!finalSourcePeer) {
                         finalSourcePeer = sourcePeer;
                     }
-                    console.log(`[Debug] finalSourcePeer: ${finalSourcePeer ? 'Resolved' : 'Not Resolved'}`);
-
-                    if (finalSourcePeer) {
-                        const targetPeer = finalDestPeer || await safelyResolveEntity(destClient, uploadTarget);
-                        console.log(`[Debug] targetPeer: ${targetPeer ? 'Resolved' : 'Not Resolved'}`);
-
-                        if (targetPeer) {
-                            await destClient.invoke(new Api.messages.ForwardMessages({
-                                fromPeer: finalSourcePeer,
-                                id: [linkData.msgId],
-                                toPeer: targetPeer,
-                                dropAuthor: true,
-                                topMsgId: threadId,
-                                randomId: [helpers.generateRandomLong(true)]
-                            }));
-                            console.log(`[Debug] Forward successful.`);
-                            await safeEditMessage("🎯 **Success!**", { chat_id: chatId, message_id: statusMsgId });
-                            await recordSuccessfulMirror();
-                            return true;
-                        } else {
-                            console.log(`[Debug] Forward failed: Could not resolve targetPeer.`);
-                        }
+                    const targetPeer = finalDestPeer || await safelyResolveEntity(destClient, uploadTarget);
+                    
+                    if (finalSourcePeer && targetPeer) {
+                        await destClient.invoke(new Api.messages.ForwardMessages({
+                            fromPeer: finalSourcePeer,
+                            id: [linkData.msgId],
+                            toPeer: targetPeer,
+                            dropAuthor: true,
+                            topMsgId: threadId,
+                            randomId: [helpers.generateRandomLong(true)]
+                        }));
+                        console.log(`[Debug] Direct forward successful.`);
+                        await safeEditMessage(`🎯 **Success! (Direct Forward)**\n\n🔗 **Link:** ${link}`, { chat_id: chatId, message_id: statusMsgId });
+                        await recordSuccessfulMirror();
+                        return true;
                     } else {
-                        console.log(`[Debug] Forward failed: Could not resolve finalSourcePeer.`);
+                        console.log(`[Debug] Direct forward skipped: finalSourcePeer or targetPeer missing.`);
                     }
-                } catch (e) {
-                    console.error(`[Debug] Forward exception: ${e}`);
+                } catch (e: any) {
+                    console.log(`[Debug] Direct forward attempt failed: ${e.message || e}. Falling back to download/upload flow.`);
                 }
             } else {
-                console.log(`[Debug] Skipping direct forward due to restriction.`);
+                console.log(`[Debug] Skipped direct forward because forwarding is restricted/not possible.`);
             }
 
-            if (!msg.media) {
+            if (!msg.media || msg.media instanceof Api.MessageMediaWebPage) {
                 await destClient.sendMessage(finalDestPeer, { message: applyRenameRules(msg.message || "", customRules), replyTo: threadId });
-                await safeEditMessage("🎯 **Success!**", { chat_id: chatId, message_id: statusMsgId });
+                await safeEditMessage(`🎯 **Success!**\n\n🔗 **Link:** ${link}`, { chat_id: chatId, message_id: statusMsgId });
                 await recordSuccessfulMirror();
                 return true;
+            }
+
+            if (!(msg.media instanceof Api.MessageMediaDocument) && !(msg.media instanceof Api.MessageMediaPhoto)) {
+                // If it is another type of media (e.g. Geo, Contact, Poll), forward it or throw a better error.
+                throw new Error(`Unsupported media type: ${msg.media.className}`);
             }
 
             await safeEditMessage(`📥 **Downloading via Source Account...**`, { chat_id: chatId, message_id: statusMsgId });
@@ -4747,10 +6244,10 @@ getConnectedUserbotClient = async (userId: number) => {
             }
             filename = applyRenameRules(filename, customRules);
 
-            const tempFilePath = path.join(os.tmpdir(), `dl_${Date.now()}_${filename}`);
-            const thumbPath = path.join(os.tmpdir(), `thumb_${Date.now()}.jpg`);
-            let hasThumb = false;
-            const downloadStartTime = Date.now();
+            tempFilePath = path.join(os.tmpdir(), `dl_${userId}_${linkData.channelId}_${linkData.msgId}_${filename}`);
+            thumbPath = path.join(os.tmpdir(), `thumb_${userId}_${linkData.channelId}_${linkData.msgId}.jpg`);
+            hasThumb = false;
+            let downloadStartTime = Date.now();
 
             // Try custom thumbnail first
             const settingsUidForThumb = await resolveSettingsUserId(userId);
@@ -4780,48 +6277,43 @@ getConnectedUserbotClient = async (userId: number) => {
                 }
             }
             
+            let totalBytes = 0;
+            let currentBytes = 0;
             let lastDownloadUpdate = 0;
             const jobKey = `${userId}-${link}`;
             const tryDownload = async () => {
-                await sourceClient.downloadMedia(msg, {
-                    outputFile: tempFilePath,
-                    progressCallback: async (c, t) => {
-                        // Pause check
-                        while (true) {
-                             const taskState = taskControlMap.get(jobKey);
-                             if (taskState && taskState.isPaused) {
-                                 await new Promise(resolve => setTimeout(resolve, 1000));
-                             } else {
-                                 break;
-                             }
-                        }
+                await resumeDownloadFile(sourceClient, msg, tempFilePath, jobKey, async (c, t) => {
+                    // Pause check (Throw early to prevent GramJS idle socket TIMEOUT)
+                    const taskState = taskControlMap.get(jobKey);
+                    if (taskState && taskState.isPaused) {
+                        throw new Error("DOWNLOAD_PAUSED");
+                    }
 
-                        const now = Date.now();
-                        const totalBytes = Number(t || 0);
-                        const currentBytes = Number(c);
-                        const elapsed = (now - downloadStartTime) / 1000;
-                        const speed = elapsed > 0 ? (currentBytes / elapsed) : 0;
-                        const percent = totalBytes > 0 ? ((currentBytes / totalBytes) * 100) : 0;
-                        const eta = speed > 0 && totalBytes > 0 ? Math.max(0, (totalBytes - currentBytes) / speed) : -1;
+                    const now = Date.now();
+                    totalBytes = Number(t || 0);
+                    currentBytes = Number(c);
+                    const elapsed = (now - downloadStartTime) / 1000;
+                    const speed = elapsed > 0 ? (currentBytes / elapsed) : 0;
+                    const percent = totalBytes > 0 ? ((currentBytes / totalBytes) * 100) : 0;
+                    const eta = speed > 0 && totalBytes > 0 ? Math.max(0, (totalBytes - currentBytes) / speed) : -1;
 
-                        const job = activeTaskJobs.get(jobKey);
-                        if (job) {
-                            job.phase = 'downloading';
-                            job.progress = {
-                                total: totalBytes,
-                                current: currentBytes,
-                                speed: speed,
-                                percent: percent,
-                                elapsed: Math.floor(elapsed),
-                                eta: Math.round(eta)
-                            };
-                        }
+                    const job = activeTaskJobs.get(jobKey);
+                    if (job) {
+                        job.phase = 'downloading';
+                        job.progress = {
+                            total: totalBytes,
+                            current: currentBytes,
+                            speed: speed,
+                            percent: percent,
+                            elapsed: Math.floor(elapsed),
+                            eta: Math.round(eta)
+                        };
+                    }
 
-                        if (now - lastDownloadUpdate > 2000 || currentBytes === totalBytes) {
-                            lastDownloadUpdate = now;
-                            const isPaused = taskControlMap.get(jobKey)?.isPaused || false;
-                            safeEditMessage(createProgressBar(totalBytes, currentBytes, "Downloading", downloadStartTime, pathDisplay), { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown', reply_markup: createProgressMarkup(jobKey, isPaused) }).catch(() => {});
-                        }
+                    if (now - lastDownloadUpdate > 5000 || currentBytes === totalBytes) {
+                        lastDownloadUpdate = now;
+                        const isPaused = taskControlMap.get(jobKey)?.isPaused || false;
+                        safeEditMessage(createProgressBar(totalBytes, currentBytes, "Downloading", downloadStartTime, pathDisplay), { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown', reply_markup: createProgressMarkup(jobKey, isPaused) }).catch(() => {});
                     }
                 });
             };
@@ -4833,6 +6325,30 @@ getConnectedUserbotClient = async (userId: number) => {
                     downloadDone = true;
                 } catch (err: any) {
                     const taskState = taskControlMap.get(jobKey);
+                    if (taskState && taskState.isPaused) {
+                        console.log(`[Download] Task ${jobKey} is paused by user. Entering idle wait...`);
+                        
+                        // Edit message status to (Paused)
+                        safeEditMessage(createProgressBar(totalBytes || 100, currentBytes || 0, "Downloading (Paused)", downloadStartTime, pathDisplay), { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown', reply_markup: createProgressMarkup(jobKey, true) }).catch(() => {});
+                        
+                        // Loop to wait for resume
+                        while (true) {
+                            const currentTaskState = taskControlMap.get(jobKey);
+                            if (!currentTaskState || !currentTaskState.isPaused) {
+                                break;
+                            }
+                            await new Promise(resolve => setTimeout(resolve, 1000));
+                        }
+                        
+                        // Edited status to (Resuming...)
+                        safeEditMessage(createProgressBar(totalBytes || 100, currentBytes || 0, "Downloading (Resuming...)", downloadStartTime, pathDisplay), { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown', reply_markup: createProgressMarkup(jobKey, false) }).catch(() => {});
+                        console.log(`[Download] Task ${jobKey} was resumed. Reconnecting stream...`);
+                        
+                        // Reset downloadStartTime to compensate for paused duration, so speed calculations remain correct
+                        downloadStartTime = Date.now();
+                        continue;
+                    }
+
                     if (taskState && taskState.shouldRetry) {
                         taskState.shouldRetry = false;
                         taskControlMap.set(jobKey, taskState);
@@ -4841,7 +6357,7 @@ getConnectedUserbotClient = async (userId: number) => {
                     }
 
                     const errStr = (err.message || "").toUpperCase();
-                    const isTimeout = errStr.includes("TIMEOUT") || errStr.includes("ETIMEDOUT") || errStr.includes("SOCKET HANG UP");
+                    const isTimeout = errStr.includes("TIMEOUT") || errStr.includes("ETIMEDOUT") || errStr.includes("SOCKET HANG UP") || errStr.includes("DOWNLOAD_TIMEOUT_STALLED");
                     const isFileRef = errStr.includes("FILE_REFERENCE_EXPIRED") || errStr.includes("FILE_REFERENCE") || errStr.includes("REFERENCE_EXPIRED") || errStr.includes("FILE_REFERENCE_INVALID");
                     
                     if (isTimeout || isFileRef) {
@@ -4882,7 +6398,8 @@ getConnectedUserbotClient = async (userId: number) => {
                 delete prepJob.progress;
             }
 
-            await safeEditMessage(`📤 **Uploading via Destination Account...**`, { chat_id: chatId, message_id: statusMsgId });
+            const agentLabel = (userDoc?.uploadAgent === 'bot') ? 'Bot itself' : 'Destination Account';
+            await safeEditMessage(`📤 **Uploading via ${agentLabel}...**`, { chat_id: chatId, message_id: statusMsgId });
             
             const uploadStartTime = Date.now();
             const totalSize = fs.statSync(tempFilePath).size;
@@ -4916,7 +6433,7 @@ getConnectedUserbotClient = async (userId: number) => {
                         };
                     }
 
-                    if (now - lastUploadUpdate > 2000 || currentBytes === totalSize) {
+                    if (now - lastUploadUpdate > 5000 || currentBytes === totalSize) {
                         lastUploadUpdate = now;
                         const text = createProgressBar(Number(totalSize), currentBytes, "Uploading", uploadStartTime, pathDisplay);
                         safeEditMessage(text, { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown' }).catch(() => {});
@@ -4960,7 +6477,7 @@ getConnectedUserbotClient = async (userId: number) => {
                 caption = template.includes("{original}") ? template.replace("{original}", caption) : `${caption}\n\n${template}`;
             }
 
-            await destClient.sendFile(finalDestPeer, {
+            const sentMsg = await destClient.sendFile(finalDestPeer, {
                 file: uploadedFile,
                 caption: caption,
                 workers: 8,
@@ -4972,7 +6489,26 @@ getConnectedUserbotClient = async (userId: number) => {
             if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
             if (hasThumb && fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath);
             
-            await safeEditMessage("🎯 **Successfully mirrored!**", { chat_id: chatId, message_id: statusMsgId });
+            let uploadedLink = "";
+            try {
+                const entity = await destClient.getEntity(finalDestPeer);
+                const channelId = entity.id.toString().replace("-100", "");
+                uploadedLink = `https://t.me/c/${channelId}/${sentMsg.id}`;
+            } catch(e) {}
+            
+            let message = `┏━━━━━━━━━━━━━━━━━━━━━━┓\n┃ 🎯 𝗦𝘂𝗰𝗰𝗲𝘀𝘀𝗳𝘂𝗹𝗹𝘆 𝗠𝗶𝗿𝗿𝗼𝗿𝗲𝗱! ┃\n┗━━━━━━━━━━━━━━━━━━━━━━┛`;
+            
+            const kb: any[] = [];
+            const row: any[] = [];
+            if (link && link.startsWith("http")) {
+                row.push({ text: "🔗 𝗦𝗼𝘂𝗿𝗰𝗲", url: link });
+            }
+            if (uploadedLink) {
+                row.push({ text: "📥 𝗗𝗼𝘄𝗻𝗹𝗼𝗮𝗱", url: uploadedLink });
+            }
+            if (row.length > 0) kb.push(row);
+            
+            await safeEditMessage(message, { chat_id: chatId, message_id: statusMsgId, reply_markup: kb.length > 0 ? { inline_keyboard: kb } : undefined });
             await recordSuccessfulMirror();
             return true;
         } catch (err: any) {
@@ -4980,19 +6516,39 @@ getConnectedUserbotClient = async (userId: number) => {
             let errMsg = err.message || "";
             if (err.errorMessage === 'CHANNEL_INVALID' || errMsg.includes("CHANNEL_INVALID")) errMsg = "Channel not found. Ensure Userbot is a member of BOTH chats.";
             else if (errMsg.includes("Content not found") || errMsg.includes("PEER_ID_INVALID") || errMsg.includes("USER_NOT_PARTICIPANT")) {
-                errMsg = "❌ **Content inaccessible:** The Userbot session does not have access to this link. Please ensure the Userbot account joined the source channel/group, and verify the link is not restricted or private.";
+                errMsg = "Content inaccessible: Userbot session does not have access. Join source chats, verify link is not restricted.";
             }
             if (!errMsg && err.errorMessage) errMsg = err.errorMessage;
-            await safeEditMessage(`❌ **Failed:** ${errMsg || "Unknown Error"}`, { chat_id: chatId, message_id: statusMsgId });
-            return false;
+            
+            // Clean up files on error
+            if (tempFilePath && fs.existsSync(tempFilePath)) {
+                try { fs.unlinkSync(tempFilePath); } catch (e) {}
+            }
+            if (thumbPath && fs.existsSync(thumbPath)) {
+                try { fs.unlinkSync(thumbPath); } catch (e) {}
+            }
+
+            throw new Error(errMsg || "Unknown Error");
         }
     };
 
     bot.on('message', async (msg) => {
-      console.log(`[Message Handler] Received message from ${msg.from?.id}: ${msg.text || 'No text'}`);
       const chatId = msg.chat.id;
       const fromId = msg.from?.id;
       const text = msg.text;
+
+      // Deduplicate messages within a sliding window
+      const msgKey = `${chatId}:${msg.message_id}`;
+      if (processedMessageKeys.has(msgKey)) {
+        console.log(`[Deduplicator] Ignored duplicate message update for key: ${msgKey}`);
+        return;
+      }
+      processedMessageKeys.add(msgKey);
+      setTimeout(() => {
+        processedMessageKeys.delete(msgKey);
+      }, 5 * 60 * 1000);
+
+      console.log(`[Message Handler] Received message from ${fromId}: ${text || 'No text'}`);
 
       if (text === '⚙️ Settings') { handleSettings(chatId, fromId); return; }
       if (text === '📈 Dashboard') {
@@ -5034,7 +6590,7 @@ getConnectedUserbotClient = async (userId: number) => {
           });
           return; 
       }
-      if (text === '⚙️ Mirror Engine') { handleMirror(chatId, fromId, msg); return; }
+      if (text === '⚙️ Mirror Engine') { handleMirror(chatId, fromId, msg.message_id); return; }
       if (text === '❌ Cancel') { handleCancel(chatId, fromId); return; }
       if (text === '🚀 Start') { 
           handleStartMessage(msg);
@@ -5046,6 +6602,43 @@ getConnectedUserbotClient = async (userId: number) => {
           const state = userActionStates[fromId];
 
           console.log(`[Message Handler] State type for ${fromId}: ${state.type}`);
+          if (state.type === 'add_blocked_topic') {
+              const textInput = msg.text || '';
+              delete userActionStates[fromId];
+              const cleanedTopic = textInput.trim();
+              if (cleanedTopic) {
+                  let finalVal = cleanedTopic;
+                  const match = cleanedTopic.match(/t\.me\/(?:c\/)?([a-zA-Z0-9_-]+)\/(\d+)/i);
+                  if (match) {
+                      let groupId = match[1];
+                      let topicId = match[2];
+                      
+                      // normalize numerical group ids
+                      if (/^\d+$/.test(groupId)) {
+                          groupId = '-100' + groupId; // Standardize to -100 format if it was numerical
+                      } else {
+                          groupId = groupId.toLowerCase();
+                      }
+                      
+                      finalVal = `${groupId}_${topicId}`;
+                  }
+
+                  const settingsUid = await resolveSettingsUserId(fromId);
+                  if (approvedUsersCollection) {
+                      await approvedUsersCollection.updateOne(
+                          { userId: settingsUid },
+                          { $addToSet: { blockedTopics: finalVal } },
+                          { upsert: true }
+                      );
+                      safeSendMessage(chatId, `✅ **Topic Blocked successfully!**\n└ Link/Name: \`${cleanedTopic}\`${finalVal !== cleanedTopic ? `\n└ Internal Format: \`${finalVal}\`` : ''}`, { parse_mode: 'Markdown' });
+                  }
+              } else {
+                  safeSendMessage(chatId, `❌ **Invalid input.** Blocked topic name cannot be empty.`);
+              }
+              await showBlockedTopicsPanel(chatId, fromId);
+              return;
+          }
+
           if (state.type === 'set_api_id') {
               const textInput = msg.text || '';
               delete userActionStates[fromId];
@@ -5464,6 +7057,19 @@ getConnectedUserbotClient = async (userId: number) => {
                   let groupName = "Source Group";
                   if (msg.forward_from_chat && msg.forward_from_chat.title) {
                       groupName = msg.forward_from_chat.title;
+                  } else {
+                      try {
+                          const targetUid = Number(settingsUid);
+                          const userbotClient = await getConnectedUserbotClient(targetUid);
+                          if (userbotClient) {
+                              const sourceEntity = await safelyResolveFullEntity(userbotClient, sourceId).catch(() => null);
+                              if (sourceEntity && (sourceEntity as any).title) {
+                                  groupName = (sourceEntity as any).title;
+                              }
+                          }
+                      } catch (e) {
+                          // ignore
+                      }
                   }
                   state.pendingSourceName = groupName;
 
@@ -5585,7 +7191,7 @@ getConnectedUserbotClient = async (userId: number) => {
               const settingsUid = await resolveSettingsUserId(fromId);
               const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
               const paths = userDoc?.mirrorPaths || [];
-              paths.push({ sourceId: sourceGroupId, destId: destGroupId, destThreadId: Number(topicId), groupName: "Topic " + topicId + " Mirror" });
+              paths.push({ sourceId: sourceGroupId, destId: destGroupId, destThreadId: Number(topicId), groupName: "Topic " + topicId + " Mirror", sourceName: "Source Group" });
               await approvedUsersCollection?.updateOne({ userId: settingsUid }, { $set: { mirrorPaths: paths } });
               
               try {
@@ -5595,6 +7201,14 @@ getConnectedUserbotClient = async (userId: number) => {
                   
                   const sourceEntity = await safelyResolveFullEntity(client, sourceGroupId);
                   const destEntity = await safelyResolveEntity(client, destGroupId);
+                  
+                  // Dynamically assign correct sourceName to the mirrorPath
+                  const entityTitle = (sourceEntity as any).title || "Source Group";
+                  const pIdx = paths.findIndex((p: any) => p.sourceId === sourceGroupId && p.destId === destGroupId && p.destThreadId === Number(topicId));
+                  if (pIdx !== -1) {
+                      paths[pIdx].sourceName = entityTitle;
+                      await approvedUsersCollection?.updateOne({ userId: settingsUid }, { $set: { mirrorPaths: paths } });
+                  }
                   
                   // Get topic title
                   let topicTitle = "Mirrored Topic";
@@ -5631,6 +7245,11 @@ getConnectedUserbotClient = async (userId: number) => {
 
                   messages.sort((a: any, b: any) => a.id - b.id);
 
+                  const alreadyMirroredDocs = mirroredMessagesCollection ? 
+                        await mirroredMessagesCollection.find({ destId: destGroupId }).toArray() : [];
+                  const alreadyMirroredLinks = new Set(alreadyMirroredDocs.map((doc: any) => doc.link));
+                  let skippedCount = 0;
+
                   let queuedCount = 0;
                   const topicTasksToQueue: Task[] = [];
                   for (const m of messages) {
@@ -5638,6 +7257,10 @@ getConnectedUserbotClient = async (userId: number) => {
                       if (!m.message && !m.media) continue;
 
                       const virtualLink = `https://t.me/c/${sourceIdClean}/${m.id}`;
+                      if (alreadyMirroredLinks.has(virtualLink)) {
+                          skippedCount++;
+                          continue;
+                      }
                       
                       topicTasksToQueue.push({ 
                           chatId, 
@@ -5657,7 +7280,8 @@ getConnectedUserbotClient = async (userId: number) => {
                   }
 
                   runNextTask();
-                  safeSendMessage(chatId, `✅ Added **${queuedCount}** items from Topic ID \`${topicId}\` to copy queue for destination: \`${destGroupId}\` (Topic: \`${topicTitle}\`).`);
+                  const skipText = skippedCount > 0 ? ` (Skipped **${skippedCount}** already mirrored previously)` : '';
+                  safeSendMessage(chatId, `✅ Added **${queuedCount}** items from Topic ID \`${topicId}\` to copy queue${skipText} for destination: \`${destGroupId}\` (Topic: \`${topicTitle}\`).`);
               } catch (err: any) {
                   safeSendMessage(chatId, `❌ **Clone Error:** ${err.message}`);
               }
@@ -5741,7 +7365,6 @@ getConnectedUserbotClient = async (userId: number) => {
                   delete userActionStates[fromId];
 
                   try {
-                      const getMsgId = (url: string) => parseInt(url.trim().split('/').pop() || '0');
                       const startId = getMsgId(startLink);
                       const endId = getMsgId(endLink);
                       const baseUrl = startLink.substring(0, startLink.lastIndexOf('/') + 1);
@@ -5750,7 +7373,7 @@ getConnectedUserbotClient = async (userId: number) => {
                       if (endId < startId) throw new Error("End link ID must be greater than start link ID.");
 
                       const count = endId - startId + 1;
-                      if (count > 200) throw new Error("Batch limit exceeded (Max 200 links at once).");
+                      // Unlimited batch size as requested by user
 
                       const batchId = `batch_${Date.now()}_${fromId}`;
                       
@@ -5875,10 +7498,10 @@ getConnectedUserbotClient = async (userId: number) => {
                      return;
                 }
 
-                const client = new TelegramClient(new StringSession(""), apiIdValue, apiHashValue, { 
-                    connectionRetries: 50,
-                    timeout: 600000,
-                    requestRetries: 15,
+                const client = new TelegramClient(new StringSession(""), apiIdValue, apiHashValue, {
+                    connectionRetries: 15,
+                    timeout: 300000,
+                    requestRetries: 10,
                     ...getRandomDeviceProps(),
                     floodSleepThreshold: 300,
                     proxy: undefined,
@@ -6062,7 +7685,10 @@ getConnectedUserbotClient = async (userId: number) => {
         runNextTask();
         const options: any = { parse_mode: 'Markdown' };
         if (msg.message_thread_id) options.message_thread_id = msg.message_thread_id;
-        safeSendMessage(msg.chat.id, `⌛ **Queued:** Added ${links.length} task(s) to the processing queue.\n\n_Total items waiting: ${taskQueue.length}_`, options);
+         const addedCount = links.length;
+         const totalQueued = taskQueue.length;
+         const message = `╭─ ⌛ 𝗤𝘂𝗲𝘂𝗲𝗱 ───╮\n│ ✅ 𝗔𝗱𝗱𝗲𝗱 : ${addedCount}         \n│ 📦 𝗧𝗼𝘁𝗮𝗹 : ${totalQueued}\n╰────────────╯`;
+         safeSendMessage(msg.chat.id, message, options);
         return;
       }
     });
@@ -6109,7 +7735,7 @@ getConnectedUserbotClient = async (userId: number) => {
 
 app.use(express.json());
 
-app.get('/api/status', (req, res) => {
+app.get('/api/status', async (req, res) => {
   res.json({
     status: botStatus,
     dbStatus: dbStatus,
@@ -6118,6 +7744,41 @@ app.get('/api/status', (req, res) => {
     queueSize: taskQueue.length,
     nextTaskIn: nextTaskRunAt ? Math.max(0, Math.round((nextTaskRunAt - Date.now()) / 1000)) : 0,
     proxy: undefined,
+    isQueuePaused: isQueuePaused,
+    activeJobs: Array.from(activeTaskJobs.values()).map(job => ({
+      link: job.link,
+      phase: job.phase,
+      progress: job.progress ? {
+        percent: job.progress.percent,
+        current: job.progress.current,
+        total: job.progress.total,
+        speed: job.progress.speed,
+        elapsed: job.progress.elapsed,
+        eta: job.progress.eta
+      } : null,
+      cooldownRemaining: job.cooldownRemaining,
+      isMirror: job.isMirror
+    })),
+    batches: Array.from(batchStatusMap.entries()).map(([batchId, info]) => {
+      const remaining = info.total - info.processed;
+      const progress = info.total > 0 ? Math.floor((info.processed / info.total) * 100) : 0;
+      return {
+        batchId,
+        total: info.total,
+        processed: info.processed,
+        success: info.success,
+        failed: info.failed,
+        currentLink: info.currentLink,
+        startTime: info.startTime,
+        progress,
+        isActive: remaining > 0
+      };
+    }),
+    taskQueue: taskQueue.map(t => ({
+      link: t.link,
+      isMirror: t.isMirror,
+      userId: t.userId
+    })),
     config: {
       hasToken: !!token,
       hasMongo: !!mongoUri,
@@ -6129,9 +7790,282 @@ app.get('/api/status', (req, res) => {
       apiId: process.env.API_ID || null,
       apiHash: process.env.API_HASH || null,
       downloadLibrary: currentDownloadLibrary,
-      renameRules: globalRenameRules
+      renameRules: globalRenameRules,
+      cooldownSeconds: globalCooldownSeconds,
+      mirrorPaths: approvedUsersCollection && currentAdminId ? ((await approvedUsersCollection.findOne({userId: currentAdminId.toString()}))?.mirrorPaths || []) : []
     }
   });
+});
+
+app.post('/api/queue/pause', (req, res) => {
+  isQueuePaused = true;
+  res.json({ success: true });
+});
+
+app.post('/api/queue/resume', (req, res) => {
+  isQueuePaused = false;
+  if (typeof runNextTask === 'function') {
+    runNextTask();
+  }
+  res.json({ success: true });
+});
+
+app.post('/api/queue/clear', (req, res) => {
+  taskQueue.length = 0;
+  if (typeof dbClearAllTasks === 'function') {
+    dbClearAllTasks().catch(e => console.error("[Queue DB] Clear cancel-all error:", e));
+  }
+  res.json({ success: true });
+});
+
+app.post('/api/queue/cancel-item', (req, res) => {
+  const { index } = req.body;
+  if (index === undefined || index < 0 || index >= taskQueue.length) {
+    return res.status(400).json({ error: 'Invalid task queue index' });
+  }
+  const removed = taskQueue.splice(index, 1)[0];
+  if (typeof dbDequeueTask === 'function') {
+    dbDequeueTask(removed).catch(e => console.error("[Queue DB] Dequeue cancelled task error:", e));
+  }
+  res.json({ success: true, removed });
+});
+
+app.post('/api/queue/prioritize-item', (req, res) => {
+  const { index } = req.body;
+  if (index === undefined || index < 0 || index >= taskQueue.length) {
+    return res.status(400).json({ error: 'Invalid task queue index' });
+  }
+  if (index === 0) {
+    return res.json({ success: true, info: 'Task already at top' });
+  }
+  const chosen = taskQueue.splice(index, 1)[0];
+  taskQueue.unshift(chosen);
+  res.json({ success: true, chosen });
+});
+
+app.get('/api/failed/list', async (req, res) => {
+  try {
+     const failed = failedTasksCollection ? await failedTasksCollection.find({}).sort({ failedAt: -1 }).toArray() : [];
+     res.json({ failed });
+  } catch (err: any) {
+     res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/failed/retry-all', async (req, res) => {
+  try {
+     const count = await retryAllFailedTasks();
+     res.json({ success: true, count });
+  } catch (err: any) {
+     res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/failed/retry-item', async (req, res) => {
+  const { id } = req.body;
+  try {
+     const success = await retryFailedTask(id);
+     res.json({ success });
+  } catch (err: any) {
+     res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/failed/clear', async (req, res) => {
+  try {
+     await clearAllFailedTasks();
+     res.json({ success: true });
+  } catch (err: any) {
+     res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/mirrored/history', async (req, res) => {
+  try {
+    let logs = [...inMemoryMirrorLogs];
+    if (mirroredMessagesCollection) {
+      try {
+        const dbLogs = await mirroredMessagesCollection.find({}).sort({ mirroredAt: -1 }).limit(100).toArray();
+        const mappedDbLogs = dbLogs.map((log: any) => ({
+          link: log.link,
+          destId: log.destId,
+          mirroredAt: log.mirroredAt ? new Date(log.mirroredAt).toISOString() : new Date().toISOString(),
+          status: 'Success',
+          info: 'Fetched from database collection'
+        }));
+        
+        // Merge list preventing duplicates
+        const seen = new Set();
+        const merged = [];
+        for (const log of [...logs, ...mappedDbLogs]) {
+          const key = `${log.link}-${log.destId}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            merged.push(log);
+          }
+        }
+        return res.json({ logs: merged.slice(0, 100) });
+      } catch (dbErr) {
+        console.error("Database logs fetching error:", dbErr);
+      }
+    }
+    res.json({ logs });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message, logs: inMemoryMirrorLogs });
+  }
+});
+
+app.post('/api/mirrored/clear', async (req, res) => {
+  inMemoryMirrorLogs.length = 0;
+  if (mirroredMessagesCollection) {
+    try {
+      await mirroredMessagesCollection.deleteMany({});
+    } catch (err: any) {
+      console.error("[API clear history] Error clearing Mongo mirror history:", err);
+    }
+  }
+  res.json({ success: true });
+});
+
+app.post('/api/queue/add', async (req, res) => {
+  const { link, isMirror } = req.body;
+  if (!link) return res.status(400).json({ error: 'Missing link' });
+  try {
+    const systemAdminId = Number(currentAdminId || ALLOWED_ADMIN_IDS[0] || 0);
+    const task: Task = {
+      chatId: systemAdminId,
+      userId: systemAdminId,
+      link,
+      isMirror: !!isMirror
+    };
+    taskQueue.push(task);
+    if (approvedUsersCollection) {
+      dbEnqueueTasks([task]).catch(e => console.error("[Queue DB] enqueue error:", e));
+    }
+    if (typeof runNextTask === 'function') {
+      runNextTask();
+    }
+    res.json({ success: true, task });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/system/restart', (req, res) => {
+  res.json({ success: true, message: 'Restarting bot server...' });
+  setTimeout(() => process.exit(0), 1000);
+});
+
+app.post('/api/system/ping', (req, res) => {
+  res.json({ success: true, message: 'Pong! Bot is active.' });
+});
+
+app.post('/api/system/cleartopics', (req, res) => {
+  topicMappingCache.clear();
+  res.json({ success: true, message: 'Topic cache cleared.' });
+});
+
+app.post('/api/system/logout', async (req, res) => {
+  const { adminId } = req.body;
+  if (!approvedUsersCollection) return res.status(503).json({ error: 'Database not ready' });
+  try {
+     const settingsUid = adminId || currentAdminId || ALLOWED_ADMIN_IDS[0]?.toString();
+     await approvedUsersCollection.updateOne({ userId: settingsUid }, { $unset: { stringSession: "" } });
+     userSessions.delete(Number(settingsUid));
+     res.json({ success: true, message: 'Logged out successfully.' });
+  } catch(e: any) {
+     res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/mirror/add-path', async (req, res) => {
+  const { sourceId, destId, groupName, destThreadId, destTopicName } = req.body;
+  if (!approvedUsersCollection) return res.status(503).json({ error: 'Database not ready' });
+  try {
+     const settingsUid = currentAdminId || ALLOWED_ADMIN_IDS[0]?.toString();
+     const newPath = { sourceId, destId, groupName: groupName || "App Mirror Target", destThreadId, destTopicName };
+     await approvedUsersCollection.updateOne(
+        { userId: settingsUid },
+        { $push: { mirrorPaths: newPath } } as any,
+        { upsert: true }
+     );
+     res.json({ success: true, message: 'Mirror path added.' });
+  } catch(e: any) {
+     res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/mirror/delete-path', async (req, res) => {
+  const { index } = req.body;
+  if (!approvedUsersCollection) return res.status(503).json({ error: 'Database not ready' });
+  try {
+     const settingsUid = currentAdminId || ALLOWED_ADMIN_IDS[0]?.toString();
+     const userDoc = await approvedUsersCollection.findOne({ userId: settingsUid });
+     const paths = userDoc?.mirrorPaths || [];
+     if (paths[index]) {
+         paths.splice(index, 1);
+         await approvedUsersCollection.updateOne({ userId: settingsUid }, { $set: { mirrorPaths: paths } });
+     }
+     res.json({ success: true, message: 'Mirror path removed.' });
+  } catch(e: any) {
+     res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/batch/start', async (req, res) => {
+  const { startLink, endLink, isMirror } = req.body;
+  if (!startLink || !endLink) return res.status(400).json({ error: 'Missing startLink or endLink' });
+  
+  try {
+    const startId = getMsgId(startLink);
+    const endId = getMsgId(endLink);
+    const baseUrl = startLink.substring(0, startLink.lastIndexOf('/') + 1);
+
+    if (isNaN(startId) || isNaN(endId)) throw new Error("Invalid range message IDs.");
+    if (endId < startId) throw new Error("End link ID must be greater than start link ID.");
+
+    const count = endId - startId + 1;
+    // Unlimited batch size as requested by user
+
+    const systemAdminId = Number(currentAdminId || ALLOWED_ADMIN_IDS[0] || 0);
+    const batchId = `batch_${Date.now()}_web`;
+
+    batchStatusMap.set(batchId, {
+      total: count,
+      processed: 0,
+      success: 0,
+      failed: 0,
+      startTime: Date.now(),
+      summaryMsgId: 0,
+      chatId: systemAdminId
+    });
+
+    const batchTasksToQueue: Task[] = [];
+    for (let i = startId; i <= endId; i++) {
+        const link = `${baseUrl}${i}`;
+        batchTasksToQueue.push({ 
+          chatId: systemAdminId, 
+          link, 
+          batchId, 
+          userId: systemAdminId,
+          isMirror: !!isMirror 
+        });
+    }
+
+    if (batchTasksToQueue.length > 0) {
+        taskQueue.push(...batchTasksToQueue);
+        if (approvedUsersCollection) {
+          dbEnqueueTasks(batchTasksToQueue).catch(e => console.error("[Queue DB] Bulk enqueue error:", e));
+        }
+    }
+    
+    if (typeof runNextTask === 'function') {
+      runNextTask();
+    }
+    res.json({ success: true, count, batchId });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/api/setpath', async (req, res) => {
@@ -6196,6 +8130,7 @@ app.post('/api/settings', async (req, res) => {
         }
         if (cooldownSeconds !== undefined) {
              updateData.cooldownSeconds = Number(cooldownSeconds);
+             globalCooldownSeconds = Number(cooldownSeconds);
         }
         if (Array.isArray(renameRules)) {
             updateData.renameRules = renameRules;

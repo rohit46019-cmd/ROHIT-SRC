@@ -1,0 +1,84 @@
+53:        const time = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false });
+54:        sysLogs.push(`[${time}] [${level}] ${text}`);
+130:                timeout: 120000,
+137:        // Connect with a fast timeout wrapper to avoid hangs
+141:        const timeoutPromise = new Promise((_, reject) => {
+142:            setTimeout(() => reject(new Error("GramJS bot start timeout after 60000ms")), 60000);
+144:        await Promise.race([startPromise, timeoutPromise]);
+151:        connectedBotClient = null; // Ensure we try afresh next time
+203:const recordSpeed = (lib: string, bytes: number, timeMs: number) => {
+205:    if (timeMs <= 0) return;
+207:    libraryPerfMetrics[lib].totalTimeMs += timeMs;
+294:    const media = msg.media;
+367:    const defaultLink = 'https://t.me/telegram';
+375:    if (val.startsWith('t.me/')) {
+379:        return 'https://t.me/' + val.substring(1);
+389:        return `https://t.me/c/${cleanId}/999999`;
+392:    return `https://t.me/${val}`;
+521:    // 3. Ultimate Fallback: Delete and send new text message
+643:        const virtualLink = `https://t.me/c/${sourceIdClean}/${m.id}`;
+871:               `_This pinned status bar tracks the entire folder mirroring process in real-time._`;
+887:        console.warn(`[Progress Update] Failed to edit message for session ${sessionId}:`, err.message);
+1202:                        // Heartbeat ping check (10s timeout)
+1474:              timeout: 30
+1568:                    safeSendMessage(chatId, `✅ **Destination Saved!**\n\n**Destination:** ${destDisplay}\n\nYou can now select this destination when using **Live Mirror** or **Full Mirror Group** from the bot menu.`, { parse_mode: 'Markdown' });
+1839:            one_time_keyboard: false
+1852:            one_time_keyboard: false
+1883:           one_time_keyboard: false
+1988:          const menuKeyboard = {
+2286:          safeSendMessage(chatId, "🚫 **Add Blocked Topic**\n\nTo block a topic *specifically for a single group*, simply paste the **Topic Link** (e.g. `https://t.me/c/12345/678`).\n\nAlternatively, you can send the exact **Topic Title** (case-insensitive) to block it globally across all groups.\n\n_To cancel, send /cancel._", {
+2380:              console.error("[Init Path] Failed to fetch last message ID for new live mirror:", e.message);
+2442:          await safeEditMessage(`🔄 **Full Mirror Options**\n\nWould you like to also auto-enable **Live Mirroring** for this setup once started?\n\n**Source:** \`${sourceId}\`\n**Destination:** ${destDisplay}\n\n*If you choose YES, we will queue the full history copy and also automatically register this channel/group to mirror future new posts in real-time!*`, {
+2553:                  const virtualLink = `https://t.me/c/${sourceIdClean}/${m.id}`;
+2620:              // Group and sort messages by topic to achieve grouped sequential downloading (Topic by Topic first)
+2997:                          const messages: any = await client.getMessages(sourceEntity, {
+3007:                                  const virtualLink = `https://t.me/c/${entityId}/${m.id}`;
+3058:          `• **Batch** 📦 - Starts input prompting to process a bulk queue of distinct message links.\n` +
+3171:          safeSendMessage(chatId, "📝 **Set Custom Caption Template**\n\nPlease send your custom caption template. Use \`{original}\` where you want the original (renamed) caption text to appear.\n\n**Example:**\n\`🍿 Name: {original}\n\nJoin: @MyChannel\`\n\n_To reset anytime, send \"clear\" or \"reset\"._\n_To cancel, send /cancel or other text._", {
+3312:                  const me = await client.getMe().catch(() => null);
+3982:            return safeSendMessage(chatId, "📍 **Enter the Destination Group ID or Username:**\n\nYou can send:\n• Group/Channel ID (e.g., `-1001844729124`)\n• Channel/Group Username (e.g., `@MyOutputChannel`)\n• Access link with optional Thread/Topic ID (e.g., `https://t.me/c/1844729124 12`)\n\n_Send /cancel to cancel this prompt._", { parse_mode: 'Markdown' });
+3991:            const domainIdx = urlParts.findIndex(p => p.includes('t.me') || p === 't.me');
+4392:          `• **Batch** 📦 - Starts input prompting to process a bulk queue of distinct message links.\n` +
+4976:            const timeDiff = taskNow - userLastTaskTime;
+4977:            if (timeDiff < cooldownMs) {
+4978:                const waitSecs = Math.ceil((cooldownMs - timeDiff) / 1000);
+5048:                // Task timeout is completely removed as requested, allowing unlimited download time for large content.
+5202:                // If there's no lastProcessedMsgId, initialize it with the latest message ID
+5232:                const messages: any = await client.getMessages(sourceEntity, {
+5276:                        const virtualLink = `https://t.me/c/${entityId}/${m.id}`;
+5323:            const message = event.message;
+5358:                    const chatEntity = await message.getChat();
+5382:                    chatTopicCache.set(message.id, topicName);
+5397:                                const chatEntity = await message.getChat();
+5472:                const virtualLink = `https://t.me/c/${entityId}/${message.id}`;
+5507:                // Keep track of the last processed message ID in real-time
+5515:    // Trigger catch-up scanning for any messages sent during downtime
+5581:                    timeout: 300000,
+5675:    const meta = label === "Downloading" ? "Server ⟿ Bot" : "Bot ⟿ Your Chat";
+5801:                const domainIdx = parts.findIndex(p => p.includes('t.me') || p === 't.me');
+5972:                    const messages = await sourceClient.getMessages(sourcePeer, { ids: [linkData.msgId] });
+6181:                        // Edit message status to (Paused)
+6214:                        console.log(`[Download] Download failed (timeout/file ref). Retrying... Error: ${errStr}`);
+6562:                  safeSendMessage(chatId, `✅ **Custom Caption Template Saved!**\n\n**Template:**\n\`\`\`\n${textInput}\n\`\`\`\n\n_To reset anytime, click Caption again and send "clear"._`, { parse_mode: 'Markdown' });
+6681:                  const domainIdx = urlParts.findIndex(p => p.includes('t.me') || p === 't.me');
+6741:              } else if (text.startsWith('https://t.me/c/')) {
+6745:              } else if (text.startsWith('https://t.me/')) {
+6784:              if (destId.startsWith('https://t.me/') || destId.startsWith('-100') || /^\d+$/.test(destId)) {
+6815:              } else if (text.startsWith('https://t.me/')) {
+6868:              } else if (text.startsWith('https://t.me/')) {
+6921:              } else if (text.startsWith('https://t.me/')) {
+6949:              } else if (text.startsWith('https://t.me/')) {
+7050:                  const messages: any = await client.getMessages(sourceEntity, { limit: 500, replyTo: topicId });
+7069:                      const virtualLink = `https://t.me/c/${sourceIdClean}/${m.id}`;
+7129:                  const messages: any = await client.getMessages(sourceEntity, {
+7138:                          const virtualLink = `https://t.me/c/${entityId}/${m.id}`;
+7161:              if (text.startsWith('https://t.me/')) {
+7172:              if (text.startsWith('https://t.me/')) {
+7233:              if (text.startsWith('https://t.me/') || text.startsWith('-100') || /^\d+$/.test(text)) {
+7313:                    timeout: 300000,
+7375:                    const me = await client.getMe().catch(() => null) as any;
+7437:      // Invite link autodetection & join (Resolves t.me/joinchat/... and t.me/+...)
+7500:         const message = `╭─ ⌛ 𝗤𝘂𝗲𝘂𝗲𝗱 ───╮\n│ ✅ 𝗔𝗱𝗱𝗲𝗱 : ${addedCount}         \n│ 📦 𝗧𝗼𝘁𝗮𝗹 : ${totalQueued}\n╰────────────╯`;
+7709:        const merged = [];
+7963:    if (msg.includes('429') || reason?.error_code === 429 || msg.includes('topic_closed') || msg.includes('message thread not found') || msg.includes('timeout') || msg.includes('etimedout') || msg.includes('socket hang up') || msg.includes('econnreset') || msg.includes('econnrefused')) {
+7972:    if (msg.includes('timeout') || msg.includes('etimedout') || msg.includes('socket hang up') || msg.includes('econnreset') || msg.includes('econnrefused')) {

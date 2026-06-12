@@ -1,0 +1,6 @@
+147:        console.log("[Bot GramJS Client] Successfully connected!");
+2193:              await safeEditMessage(`✅ **Session [${sessId}] Resumed Successfully!**\nEnqueued **${queuedCount}** remaining tasks to the download queue.`, {
+3916:                safeSendMessage(chatId, "✅ **Mirror History Cleared Successfully!**\nAll previously processed/skipped files can now be cloned again.");
+6342:            await safeEditMessage(`🎯 **Successfully mirrored!**\n\n🔗 **Link:** ${link}`, { chat_id: chatId, message_id: statusMsgId });
+7406:                    safeSendMessage(chatId, `✅ **Successfully Logged In!**\n\n👤 Account: **${fullName}**\n📱 Phone: **${phoneNumber}**`);
+7454:              await safeEditMessage(`✅ **Successfully Joined Private Channel/Group!**\n\n📌 Title: **${chatTitle}**\n👤 Userbot ID: **${targetUid}**\n\nYou can now copy links from this channel and paste them here to download/mirror.`, { chat_id: chatId, message_id: statusMsg?.message_id || 0 });
