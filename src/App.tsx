@@ -42,7 +42,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>('dashboard');
-  const [isDarkMode, setIsDarkMode] = useState(false);
+  const [isDarkMode, setIsDarkMode] = useState(true);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
 
   // Operator Panel Forms
@@ -143,6 +143,7 @@ export default function App() {
   const [apiIdInput, setApiIdInput] = useState('');
   const [apiHashInput, setApiHashInput] = useState('');
   const [libSelection, setLibSelection] = useState('GramJS');
+  const [uploadEngineSelection, setUploadEngineSelection] = useState('GramJS');
   const [renameRules, setRenameRules] = useState<Array<{ keyword: string; replaceWith: string }>>([]);
   const [newKeyword, setNewKeyword] = useState('');
   const [newReplaceWith, setNewReplaceWith] = useState('');
@@ -164,6 +165,7 @@ export default function App() {
       setApiIdInput(data.settings.apiId || '');
       setApiHashInput(data.settings.apiHash || '');
       setLibSelection(data.settings.downloadLibrary || 'GramJS');
+      setUploadEngineSelection(data.settings.uploadEngine || 'GramJS');
       if (data.settings.renameRules) {
         setRenameRules(data.settings.renameRules);
       }
@@ -188,6 +190,7 @@ export default function App() {
           apiId: apiIdInput,
           apiHash: apiHashInput,
           downloadLibrary: libSelection,
+          uploadEngine: uploadEngineSelection,
           renameRules: renameRules,
           cooldownSeconds: cooldownInput,
           proxy: data?.proxy
@@ -1129,23 +1132,45 @@ export default function App() {
                 </div>
               </div>
 
-              <div>
-                <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3">Download Engine</label>
-                <div className="grid grid-cols-2 gap-2">
-                  {['Auto', 'GramJS', 'Telethon', 'Pyrogram', 'Hydrogram'].map((lib) => (
-                    <button
-                      key={lib}
-                      type="button"
-                      onClick={() => setLibSelection(lib)}
-                      className={`py-3 rounded-2xl text-[10px] font-bold border transition-all ${
-                        libSelection === lib 
-                          ? 'bg-sky-600 border-sky-500 text-white shadow-md' 
-                          : 'bg-slate-100 dark:bg-slate-800/80 border-slate-200 dark:border-slate-800 text-slate-500 hover:border-slate-400 dark:hover:border-slate-700'
-                      }`}
-                    >
-                      {lib}
-                    </button>
-                  ))}
+               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3">Download Engine</label>
+                  <div className="grid grid-cols-2 gap-2">
+                    {['Auto', 'GramJS', 'Telethon', 'Pyrogram', 'Hydrogram'].map((lib) => (
+                      <button
+                        key={lib}
+                        type="button"
+                        onClick={() => setLibSelection(lib)}
+                        className={`py-3 rounded-2xl text-[10px] font-bold border transition-all ${
+                          libSelection === lib 
+                            ? 'bg-sky-600 border-sky-500 text-white shadow-md' 
+                            : 'bg-slate-100 dark:bg-slate-800/80 border-slate-200 dark:border-slate-800 text-slate-500 hover:border-slate-400 dark:hover:border-slate-700'
+                        }`}
+                      >
+                        {lib}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-[10px] font-bold text-emerald-500 dark:text-emerald-400 uppercase tracking-widest mb-3">Upload Engine</label>
+                  <div className="grid grid-cols-2 gap-2">
+                    {['Auto', 'GramJS', 'Telethon', 'Pyrogram', 'Hydrogram'].map((lib) => (
+                      <button
+                        key={lib}
+                        type="button"
+                        onClick={() => setUploadEngineSelection(lib)}
+                        className={`py-3 rounded-2xl text-[10px] font-bold border transition-all ${
+                          uploadEngineSelection === lib 
+                            ? 'bg-emerald-600 border-emerald-500 text-white shadow-md' 
+                            : 'bg-slate-100 dark:bg-slate-800/80 border-slate-200 dark:border-slate-800 text-slate-500 hover:border-slate-400 dark:hover:border-slate-700'
+                        }`}
+                      >
+                        {lib}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
             </div>
@@ -1334,6 +1359,32 @@ export default function App() {
   };
 
   const renderMirror = () => {
+    const formatISTTime = (isoString?: string) => {
+      if (!isoString) return 'Never checked';
+      const d = new Date(isoString);
+      if (isNaN(d.getTime())) return 'Never checked';
+      
+      // Convert UTC to IST (+5:30)
+      const istTime = new Date(d.getTime() + (5.5 * 60 * 60 * 1000));
+      
+      const pad = (num: number) => num.toString().padStart(2, '0');
+      const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      
+      const day = pad(istTime.getUTCDate());
+      const month = months[istTime.getUTCMonth()];
+      const year = istTime.getUTCFullYear();
+      
+      let hours = istTime.getUTCHours();
+      const minutes = pad(istTime.getUTCMinutes());
+      const seconds = pad(istTime.getUTCSeconds());
+      const ampm = hours >= 12 ? 'PM' : 'AM';
+      hours = hours % 12;
+      hours = hours ? hours : 12; // 0 should be 12
+      const strHours = pad(hours);
+      
+      return `${day} ${month} ${year}, ${strHours}:${minutes}:${seconds} ${ampm} (IST)`;
+    };
+
     const handleSetPath = async () => {
       setSettingPath(true);
       try {
@@ -1422,23 +1473,92 @@ export default function App() {
             </div>
           </form>
 
-          <div className="space-y-2">
+          <div className="space-y-4">
+            <h3 className="text-slate-900 dark:text-slate-100 text-xs font-black tracking-widest uppercase text-slate-500/80 mb-1 font-display flex items-center gap-2">
+              <Layers className="text-sky-500" size={14} /> Configured Route Bindings ({data?.settings?.mirrorPaths?.length || 0})
+            </h3>
             {data?.settings?.mirrorPaths && data.settings.mirrorPaths.length > 0 ? (
-              data.settings.mirrorPaths.map((path, idx) => (
-                <div key={idx} className="flex flex-wrap items-center justify-between gap-4 p-3 bg-slate-50 dark:bg-slate-800/40 rounded-xl border border-slate-200 dark:border-slate-800 text-xs">
-                  <div className="flex items-center gap-3 min-w-0 flex-1">
-                    <span className="font-mono text-slate-500 line-clamp-1">{path.sourceId}</span>
-                    <span className="text-slate-400">➔</span>
-                    <span className="font-mono text-slate-500 line-clamp-1">{path.destId} {path.destThreadId ? `<Topic: ${path.destThreadId}>` : ''}</span>
-                    <span className="mx-2 text-[10px] uppercase font-bold text-sky-500 bg-sky-500/10 px-2 py-0.5 rounded truncate">{path.groupName}</span>
-                  </div>
-                  <button onClick={() => handleDeleteMirrorPath(idx)} className="p-1.5 text-slate-400 hover:text-red-500 transition-colors bg-white dark:bg-slate-800 rounded-lg border border-slate-200 dark:border-slate-700">
-                    <Trash2 size={14} />
-                  </button>
-                </div>
-              ))
+              <div className="grid grid-cols-1 gap-4">
+                {data.settings.mirrorPaths.map((path: any, idx: number) => {
+                  const sourceTitle = path.sourceName || path.groupName || 'Source Channel';
+                  const isLive = path.isLive !== false; // default to true if undefined
+                  
+                  return (
+                    <div 
+                      key={idx} 
+                      className="group relative flex flex-col md:flex-row md:items-center justify-between gap-4 p-5 bg-white dark:bg-[#070a13]/55 rounded-2xl border border-slate-200 dark:border-[#15203c] hover:border-sky-550/30 hover:shadow-lg dark:hover:shadow-sky-500/5 transition-all duration-300"
+                    >
+                      {/* Left Side: flow & ID labels info */}
+                      <div className="flex-1 min-w-0 space-y-2">
+                        {/* Title Row */}
+                        <div className="flex flex-wrap items-center gap-1.5 text-sm">
+                          <span className="text-slate-900 dark:text-slate-100 font-display font-semibold truncate max-w-[160px] sm:max-w-[220px]" title={sourceTitle}>
+                            {sourceTitle}
+                          </span>
+                          
+                          <span className="text-sky-500 font-bold mx-1 text-xs">➔</span>
+                          
+                          <span className="text-slate-800 dark:text-slate-200 font-display font-semibold truncate max-w-[160px] sm:max-w-[220px]" title={path.destGroupName || 'Destination'}>
+                            {path.destGroupName || 'Destination'}
+                          </span>
+                          {path.destThreadId && (
+                            <span className="text-[10px] font-mono font-semibold text-cyan-600 dark:text-cyan-400 bg-cyan-500/10 px-1.5 py-0.5 rounded border border-cyan-500/15">
+                              Topic: {path.destThreadId}
+                            </span>
+                          )}
+                        </div>
+
+                        {/* ID block row */}
+                        <div className="flex flex-wrap items-center gap-2 text-[10px] text-slate-500 dark:text-slate-400 font-mono">
+                          <span className="bg-slate-105 dark:bg-[#0a0f1d] px-1.5 py-0.5 rounded border border-slate-200/50 dark:border-slate-805/60" title="Source Telegram ID">
+                            SRC: {path.sourceId}
+                          </span>
+                          <span className="text-slate-300 dark:text-slate-800">|</span>
+                          <span className="bg-slate-105 dark:bg-[#0a0f1d] px-1.5 py-0.5 rounded border border-slate-200/50 dark:border-slate-805/60" title="Destination Telegram ID">
+                            DST: {path.destId}
+                          </span>
+                        </div>
+
+                        {/* Scan Time Status */}
+                        <div className="flex flex-wrap items-center gap-3 pt-2.5 border-t border-slate-100 dark:border-slate-850/50">
+                          <div className="flex items-center gap-2 text-slate-500 dark:text-slate-400 font-sans text-[11px] font-semibold">
+                            <Clock size={12} className="text-sky-500/70" />
+                            <span>Last Scan (IST):</span>
+                            <span className="font-mono text-slate-700 dark:text-slate-350 bg-slate-100 dark:bg-slate-800/80 px-2 py-0.5 rounded font-bold border border-slate-200/30 dark:border-slate-850">
+                              {formatISTTime(path.lastScannedAt)}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Right Side: Badges & Trash actions */}
+                      <div className="flex items-center justify-between md:justify-end gap-3 pt-3 md:pt-0 border-t md:border-t-0 border-slate-100 dark:border-slate-850 shrink-0">
+                        <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-[9px] uppercase tracking-wider font-extrabold font-display ${
+                          isLive 
+                            ? 'text-emerald-500 bg-emerald-500/10 border border-emerald-500/20 active-pulse' 
+                            : 'text-amber-500 bg-amber-100/10 border border-amber-500/20'
+                        }`}>
+                          <span className={`w-1.5 h-1.5 rounded-full ${isLive ? 'bg-emerald-550 animate-pulse' : 'bg-amber-500'}`} />
+                          {isLive ? 'Live Scanner' : 'Offline'}
+                        </span>
+
+                        <button 
+                          onClick={() => handleDeleteMirrorPath(idx)} 
+                          className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-500/10 dark:hover:bg-red-500/10 transition-all bg-white dark:bg-[#070a13] rounded-xl border border-slate-200 dark:border-[#15203c]"
+                          title="Delete Mapping"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
             ) : (
-              <p className="text-xs text-slate-500 text-center py-4 italic">No multi-paths configured.</p>
+              <div className="text-center py-8 border border-dashed border-slate-200 dark:border-[#15203c] rounded-2xl bg-slate-50/50 dark:bg-slate-900/10">
+                <Layers className="mx-auto text-slate-350 dark:text-slate-800 mb-2" size={24} />
+                <p className="text-xs text-slate-500 italic font-medium leading-relaxed font-sans">No route bindings configured yet.</p>
+              </div>
             )}
           </div>
         </div>
@@ -1536,38 +1656,38 @@ export default function App() {
 
   return (
     <div className={isDarkMode ? 'dark' : ''}>
-      <div className="min-h-screen bg-slate-50 dark:bg-[#0f172a] text-slate-800 dark:text-slate-200 font-sans selection:bg-sky-500/30 pb-6 overflow-x-hidden flex">
+      <div className="min-h-screen bg-slate-50 dark:bg-[#070a13] text-slate-800 dark:text-[#f1f5f9] font-sans selection:bg-emerald-500/30 pb-6 overflow-x-hidden flex transition-colors duration-300">
         
         {/* Desktop Sidebar (Permanent) */}
-        <aside className="hidden lg:flex flex-col w-64 border-r border-slate-200 dark:border-slate-800 bg-white dark:bg-[#1e293b] p-4 h-screen sticky top-0">
+        <aside className="hidden lg:flex flex-col w-64 border-r border-slate-200/80 dark:border-[#15203c] bg-white dark:bg-[#0b1224] p-5 h-screen sticky top-0">
           <div className="flex items-center mb-8 pl-2">
-            <h1 className="text-xl font-black text-slate-900 dark:text-white tracking-tighter flex items-center gap-2.5">
-              <div className="p-2 bg-sky-500 rounded-lg shrink-0">
-                 <Bot className="text-white animate-bounce" size={16} />
+            <h1 className="text-xl font-black text-slate-900 dark:text-white tracking-tighter flex items-center gap-2.5 font-display">
+              <div className="p-2 bg-gradient-to-tr from-sky-500 to-emerald-500 rounded-lg shrink-0 shadow-lg shadow-sky-500/20">
+                 <Bot className="text-white animate-pulse" size={16} />
               </div>
-              STUDIO <span className="text-sky-500">V3</span>
+              STUDIO <span className="text-sky-500 font-display">V3</span>
             </h1>
           </div>
           
           <nav className="flex flex-col gap-2 flex-1">
-            <button onClick={() => setActiveTab('dashboard')} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all ${activeTab === 'dashboard' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'}`}>
+            <button onClick={() => setActiveTab('dashboard')} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all font-display ${activeTab === 'dashboard' ? 'bg-sky-500/10 text-sky-500 shadow-sm border-l-2 border-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
               <Home size={18} /> Status
             </button>
-            <button onClick={() => setActiveTab('config')} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all ${activeTab === 'config' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'}`}>
+            <button onClick={() => setActiveTab('config')} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all font-display ${activeTab === 'config' ? 'bg-sky-500/10 text-sky-500 shadow-sm border-l-2 border-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
               <Settings size={18} /> Config
             </button>
-            <button onClick={() => setActiveTab('rules')} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all ${activeTab === 'rules' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'}`}>
+            <button onClick={() => setActiveTab('rules')} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all font-display ${activeTab === 'rules' ? 'bg-sky-500/10 text-sky-500 shadow-sm border-l-2 border-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
               <FileEdit size={18} /> Rules
             </button>
-            <button onClick={() => setActiveTab('mirror')} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all ${activeTab === 'mirror' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'}`}>
+            <button onClick={() => setActiveTab('mirror')} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all font-display ${activeTab === 'mirror' ? 'bg-sky-500/10 text-sky-500 shadow-sm border-l-2 border-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
               <Layers size={18} /> Mirror
             </button>
-            <button onClick={() => setActiveTab('system')} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all ${activeTab === 'system' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'}`}>
+            <button onClick={() => setActiveTab('system')} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all font-display ${activeTab === 'system' ? 'bg-sky-500/10 text-sky-500 shadow-sm border-l-2 border-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
               <Bot size={18} /> System
             </button>
           </nav>
         </aside>
-
+ 
         {/* Mobile/Tablet Overlay Sidebar */}
         <AnimatePresence>
           {isSidebarOpen && (
@@ -1577,21 +1697,21 @@ export default function App() {
                 animate={{ opacity: 1 }}
                 exit={{ opacity: 0 }}
                 onClick={() => setIsSidebarOpen(false)}
-                className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-40 lg:hidden"
+                className="fixed inset-0 bg-slate-950/60 backdrop-blur-sm z-40 lg:hidden"
               />
               <motion.aside
                 initial={{ x: '-100%' }}
                 animate={{ x: 0 }}
                 exit={{ x: '-100%' }}
                 transition={{ type: 'spring', bounce: 0, duration: 0.4 }}
-                className="fixed inset-y-0 left-0 w-64 bg-white dark:bg-[#1e293b] border-r border-slate-200 dark:border-slate-800 z-50 flex flex-col p-4 shadow-2xl lg:hidden"
+                className="fixed inset-y-0 left-0 w-64 bg-white dark:bg-[#0b1224] border-r border-slate-200 dark:border-[#15203c] z-50 flex flex-col p-4 shadow-2xl lg:hidden"
               >
                 <div className="flex items-center justify-between mb-8 pl-2">
-                  <h1 className="text-xl font-black text-slate-900 dark:text-white tracking-tighter flex items-center gap-2.5">
-                    <div className="p-2 bg-sky-500 rounded-lg shrink-0">
-                       <Bot className="text-white animate-bounce" size={16} />
+                  <h1 className="text-xl font-black text-slate-900 dark:text-white tracking-tighter flex items-center gap-2.5 font-display">
+                    <div className="p-2 bg-gradient-to-tr from-sky-500 to-emerald-500 rounded-lg shrink-0">
+                       <Bot className="text-white animate-pulse" size={16} />
                     </div>
-                    STUDIO <span className="text-sky-500">V3</span>
+                    STUDIO <span className="text-sky-500 font-display">V3</span>
                   </h1>
                   <button onClick={() => setIsSidebarOpen(false)} className="p-2 text-slate-500 hover:text-slate-700 dark:hover:text-slate-300">
                     <X size={20} />
@@ -1599,19 +1719,19 @@ export default function App() {
                 </div>
                 
                 <nav className="flex flex-col gap-2 flex-1">
-                  <button onClick={() => { setActiveTab('dashboard'); setIsSidebarOpen(false); }} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all ${activeTab === 'dashboard' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'}`}>
+                  <button onClick={() => { setActiveTab('dashboard'); setIsSidebarOpen(false); }} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all font-display ${activeTab === 'dashboard' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
                     <Home size={18} /> Status
                   </button>
-                  <button onClick={() => { setActiveTab('config'); setIsSidebarOpen(false); }} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all ${activeTab === 'config' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'}`}>
+                  <button onClick={() => { setActiveTab('config'); setIsSidebarOpen(false); }} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all font-display ${activeTab === 'config' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
                     <Settings size={18} /> Config
                   </button>
-                  <button onClick={() => { setActiveTab('rules'); setIsSidebarOpen(false); }} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all ${activeTab === 'rules' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'}`}>
+                  <button onClick={() => { setActiveTab('rules'); setIsSidebarOpen(false); }} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all font-display ${activeTab === 'rules' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
                     <FileEdit size={18} /> Rules
                   </button>
-                  <button onClick={() => { setActiveTab('mirror'); setIsSidebarOpen(false); }} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all ${activeTab === 'mirror' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'}`}>
+                  <button onClick={() => { setActiveTab('mirror'); setIsSidebarOpen(false); }} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all font-display ${activeTab === 'mirror' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
                     <Layers size={18} /> Mirror
                   </button>
-                  <button onClick={() => { setActiveTab('system'); setIsSidebarOpen(false); }} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all ${activeTab === 'system' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'}`}>
+                  <button onClick={() => { setActiveTab('system'); setIsSidebarOpen(false); }} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all font-display ${activeTab === 'system' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
                     <Bot size={18} /> System
                   </button>
                 </nav>
@@ -1619,29 +1739,29 @@ export default function App() {
             </>
           )}
         </AnimatePresence>
-
+ 
         {/* Main Content Area */}
         <div className="flex-1 flex flex-col min-w-0 h-screen overflow-y-auto">
           <div className="max-w-4xl w-full mx-auto p-4 sm:p-6 lg:p-8 flex flex-col gap-6">
             
             {/* Header */}
-            <header className="flex items-center justify-between gap-4 bg-white/80 dark:bg-[#1e293b]/95 backdrop-blur-xl py-3 px-5 border border-slate-200/80 dark:border-slate-800 rounded-2xl shadow-sm">
+            <header className="flex items-center justify-between gap-4 bg-white/90 dark:bg-[#0b1224]/90 backdrop-blur-xl py-4.5 px-6 border border-slate-200/80 dark:border-[#15203c] rounded-2xl shadow-md">
               <div className="flex items-center gap-3">
-                <button onClick={() => setIsSidebarOpen(true)} className="lg:hidden p-2 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors">
+                <button onClick={() => setIsSidebarOpen(true)} className="lg:hidden p-2.5 rounded-xl bg-slate-100 dark:bg-slate-850 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800 transition-colors">
                   <Menu size={20} />
                 </button>
-                <div className="hidden sm:flex items-center gap-2">
+                <div className="hidden sm:flex items-center gap-2.5">
                    <StatusBadge label={data?.status || 'Unknown'} active={data?.status === 'Running'} icon={Activity} />
                    <StatusBadge label="Atlas DB" active={data?.dbStatus === 'Connected'} icon={Database} />
                 </div>
               </div>
               <div className="flex items-center gap-2">
-                <button onClick={() => setIsDarkMode(!isDarkMode)} className="p-2 rounded-lg border border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors">
+                <button onClick={() => setIsDarkMode(!isDarkMode)} className="p-2.5 rounded-xl border border-slate-200/80 dark:border-[#15203c] text-slate-600 dark:text-slate-450 hover:bg-slate-100 dark:hover:bg-slate-800/70 transition-colors bg-white/50 dark:bg-transparent">
                   {isDarkMode ? '🌙' : '☀️'}
                 </button>
               </div>
             </header>
-
+ 
             <main className="space-y-6 pb-20 lg:pb-6">
               {activeTab === 'dashboard' && renderDashboard()}
               {activeTab === 'config' && renderConfig()}
@@ -1651,9 +1771,9 @@ export default function App() {
             </main>
           </div>
         </div>
-
+ 
         {/* Persistent Bottom Nav for Mobile/Tablet */}
-        <nav className="lg:hidden fixed bottom-0 inset-x-0 bg-white/95 dark:bg-[#1e293b]/95 backdrop-blur-2xl border-t border-slate-200 dark:border-slate-800 px-4 py-1.5 z-50 shadow-[0_-10px_40px_rgba(0,0,0,0.15)] dark:shadow-[0_-10px_40px_rgba(0,0,0,0.4)]">
+        <nav className="lg:hidden fixed bottom-0 inset-x-0 bg-white/95 dark:bg-[#0b1224]/95 backdrop-blur-2xl border-t border-slate-200 dark:border-[#15203c] px-4 py-1.5 z-50 shadow-[0_-10px_40px_rgba(0,0,0,0.15)] dark:shadow-[0_-10px_40px_rgba(0,0,0,0.5)]">
           <div className="max-w-md mx-auto flex items-center justify-between gap-1">
             <NavButton tab="dashboard" icon={Home} label="Status" />
             <NavButton tab="config" icon={Settings} label="Config" />

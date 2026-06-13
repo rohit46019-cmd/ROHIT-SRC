@@ -32,6 +32,32 @@ function sleep(ms: number) {
     return new Promise(r => setTimeout(r, ms));
 }
 
+function formatISTTime(dateInput: Date | string | undefined): string {
+    if (!dateInput) return 'Never scanned';
+    const d = new Date(dateInput);
+    if (isNaN(d.getTime())) return 'Never scanned';
+    
+    // Add 5 hours and 30 minutes to get Indian Time (IST)
+    const istTime = new Date(d.getTime() + (5.5 * 60 * 60 * 1000));
+    
+    const pad = (num: number) => num.toString().padStart(2, '0');
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    
+    const day = pad(istTime.getUTCDate());
+    const month = months[istTime.getUTCMonth()];
+    const year = istTime.getUTCFullYear();
+    
+    let hours = istTime.getUTCHours();
+    const minutes = pad(istTime.getUTCMinutes());
+    const seconds = pad(istTime.getUTCSeconds());
+    const ampm = hours >= 12 ? 'PM' : 'AM';
+    hours = hours % 12;
+    hours = hours ? hours : 12; // the hour '0' should be '12'
+    const strHours = pad(hours);
+    
+    return `${day} ${month} ${year}, ${strHours}:${minutes}:${seconds} ${ampm} (IST)`;
+}
+
 dotenv.config();
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -331,52 +357,35 @@ async function resumeDownloadFile(
         } catch (e) {}
     }
 
-    const customWriter = {
-        stream: fs.createWriteStream(tempFilePath),
-        size: 0,
-        async write(chunk: Buffer) {
-            if (!this.stream.writable) return;
-            this.size += chunk.length;
-            if (!this.stream.write(chunk)) {
-                await new Promise(r => this.stream.once('drain', r));
-            }
-        },
-        close() {
-            this.stream.end();
-        }
-    };
+    let downloadWorkers = 4;
+    if (totalSize > 500 * 1024 * 1024) {
+        downloadWorkers = 32; // > 500 MB gets 32 concurrent download channels
+    } else if (totalSize > 100 * 1024 * 1024) {
+        downloadWorkers = 16; // > 100 MB gets 16 concurrent download channels
+    } else if (totalSize > 20 * 1024 * 1024) {
+        downloadWorkers = 8;  // > 20 MB gets 8 concurrent download channels
+    }
 
     let lastProgressTime = Date.now();
     const DOWNLOAD_STALL_TIMEOUT = 60000;
 
-    try {
-        await client.downloadMedia(msg, {
-            outputFile: customWriter,
-            progressCallback: async (downloaded: any, total: any) => {
-                const taskState = taskControlMap.get(jobKey);
-                if (taskState && taskState.isPaused) {
-                    throw new Error("DOWNLOAD_PAUSED");
-                }
-                
-                const now = Date.now();
-                if (now - lastProgressTime > DOWNLOAD_STALL_TIMEOUT) {
-                    throw new Error("DOWNLOAD_TIMEOUT_STALLED");
-                }
-                lastProgressTime = now;
-                
-                await onProgress(Number(downloaded), Number(total || totalSize || 0));
+    await client.downloadMedia(msg, {
+        outputFile: tempFilePath,
+        workers: downloadWorkers,
+        progressCallback: async (downloaded: any, total: any) => {
+            const taskState = taskControlMap.get(jobKey);
+            if (taskState && taskState.isPaused) {
+                throw new Error("DOWNLOAD_PAUSED");
             }
-        });
-    } finally {
-        if (!customWriter.stream.writableFinished) {
-            customWriter.close();
+            
+            const now = Date.now();
+            if (now - lastProgressTime > DOWNLOAD_STALL_TIMEOUT) {
+                throw new Error("DOWNLOAD_TIMEOUT_STALLED");
+            }
+            lastProgressTime = now;
+            
+            await onProgress(Number(downloaded), Number(total || totalSize || 0));
         }
-    }
-
-    await new Promise<void>((resolve) => {
-        if (customWriter.stream.writableFinished) return resolve();
-        customWriter.stream.once('finish', () => resolve());
-        customWriter.stream.once('error', () => resolve());
     });
 }
 
@@ -1326,6 +1335,8 @@ if (mongoUri) {
         if (settings.destinationChatId) destinationChatId = settings.destinationChatId;
         if (settings.apiId) apiIdValue = Number(settings.apiId);
         if (settings.apiHash) apiHashValue = settings.apiHash;
+        if (settings.downloadLibrary) currentDownloadLibrary = settings.downloadLibrary;
+        if (settings.uploadEngine) currentUploadEngine = settings.uploadEngine;
         if (settings.renameRules) globalRenameRules = settings.renameRules;
         if (settings.proxy) globalProxy = settings.proxy;
         if (settings.maxConcurrentTasks !== undefined) {
@@ -1702,7 +1713,8 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                      `👤 𝗨𝘀𝗲𝗿𝗯𝗼𝘁: ${session ? '✅ Active' : '❌ Missing'}\n` +
                      `🎬 𝗠𝗼𝗱𝗲: ${uploadModeDisplay}\n` +
                      `🤖 𝗔𝗴𝗲𝗻𝘁: ${uploadAgentDisplay}\n` +
-                     `🚀 𝗘𝗻𝗴𝗶𝗻𝗲: ${currentUploadEngine}\n` +
+                     `🚀 𝗨𝗽𝗹𝗼𝗮𝗱 𝗘𝗻𝗴𝗶𝗻𝗲: ${currentUploadEngine}\n` +
+                     `📥 𝗗𝗼𝘄𝗻𝗹𝗼𝗮𝗱 𝗘𝗻𝗴𝗶𝗻𝗲: ${currentDownloadLibrary}\n` +
                      `📍 𝗗𝗲𝘀𝘁𝗶𝗻𝗮𝘁𝗶𝗼𝗻: \`${pathDisplay}\`\n` +
                      `⏱️ 𝗖𝗼𝗼𝗹𝗱𝗼𝘄𝗻: ${cooldownDisplay}\n` +
                      `⚡ 𝗖𝗼𝗻𝗰𝘂𝗿𝗿𝗲𝗻𝗰𝘆: \`${MAX_CONCURRENT_TASKS}\`\n\n` +
@@ -1722,8 +1734,11 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                 { text: '🔄 𝗠𝗶𝗿𝗿𝗼𝗿𝘀', callback_data: 'manage_mirror_paths' }
               ],
               [
-                { text: `🚀 ${currentUploadEngine}`, callback_data: 'toggle_engine' },
-                { text: userDoc?.uploadMode === 'document' ? '📁 𝗙𝗶𝗹𝗲' : '📹 𝗩𝗶𝗱𝗲𝗼', callback_data: 'toggle_mode' },
+                { text: `🚀 𝗨𝗽: ${currentUploadEngine}`, callback_data: 'toggle_engine' },
+                { text: `📥 𝗗𝗼𝘄𝗻: ${currentDownloadLibrary}`, callback_data: 'toggle_down_library' }
+              ],
+              [
+                { text: userDoc?.uploadMode === 'document' ? '📁 𝗙𝗶𝗹𝗲 𝗠𝗼𝗱𝗲' : '📹 𝗩𝗶𝗱𝗲𝗼 𝗠𝗼𝗱𝗲', callback_data: 'toggle_mode' },
                 { text: userDoc?.uploadAgent === 'bot' ? '🤖 𝗕𝗼𝘁' : '👤 𝗨𝘀𝗲𝗿', callback_data: 'toggle_agent' }
               ],
               [
@@ -1823,6 +1838,91 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
       }
     };
 
+    const userAnimeHistory = new Map<number, Set<string>>();
+
+    async function getRandomAnimePhotoUrl(userId?: number): Promise<string> {
+        // High contrast, colorful anime and cartoon style students (boys and girls) engaging in education, studying, holding books, wearing glasses, graduating, coding, and classrooms with clear faces. All optimized for Telegram to avoid HTTP/Timeout errors.
+        const faceCatalog = [
+            // Smart pink-haired anime girl studying with book close-up (Girl)
+            'https://images.unsplash.com/photo-1578632767115-351597cf2477?w=480&q=70&fm=jpg&fit=crop',
+            // Cyberpunk student girl with glowing glasses studying complex tech digital screens (Girl)
+            'https://images.unsplash.com/photo-1607604276583-eef5d076aa5f?w=480&q=70&fm=jpg&fit=crop',
+            // Cool student boy coder with colorful backlight coding on laptop (Boy)
+            'https://images.unsplash.com/photo-1538481199705-c710c4e965fc?w=480&q=70&fm=jpg&fit=crop',
+            // Elegant watercolor-style studious cartoon girl reading books (Girl)
+            'https://images.unsplash.com/photo-1541562232579-512a21360020?w=480&q=70&fm=jpg&fit=crop',
+            // Creative bright pop-art student girl with stylish blue eye-shadow drawing (Girl)
+            'https://images.unsplash.com/photo-1613376023733-0a73315d9b06?w=480&q=70&fm=jpg&fit=crop',
+            // Colorful 3D cute cartoon student boy avatar with graduation cap / degree (Boy)
+            'https://images.unsplash.com/photo-1608889175123-8ec330b86f84?w=480&q=70&fm=jpg&fit=crop',
+            // Smart boy student coder sitting in front of neon computer workspace (Boy)
+            'https://images.unsplash.com/photo-1566492031773-4f4e44671857?w=480&q=70&fm=jpg&fit=crop',
+            // Cute animated study girl with headphones sketch-paint style (Girl)
+            'https://images.unsplash.com/photo-1542751371-adc38448a05e?w=480&q=70&fm=jpg&fit=crop',
+            // Bright cheerful cartoon girl student profile surrounded by colourful school blackboard (Girl)
+            'https://images.unsplash.com/photo-1503676260728-1c00da094a0b?w=480&q=70&fm=jpg&fit=crop',
+            // Smart handsome student boy avatar with glasses looking confident (Boy)
+            'https://images.unsplash.com/photo-1560250097-0b93528c311a?w=480&q=70&fm=jpg&fit=crop',
+            // Colorful chemistry student girl holding bright colorful test tubes in science class (Girl)
+            'https://images.unsplash.com/photo-1507413245164-6160d8298b31?w=480&q=70&fm=jpg&fit=crop',
+            // Vibrant anime-style young girl student with big glowing blue eyes reading (Girl)
+            'https://images.unsplash.com/photo-1580477667995-2b94f01c9516?w=480&q=70&fm=jpg&fit=crop',
+            // Artistic anime student boy sketching layout with colorful markers (Boy)
+            'https://images.unsplash.com/photo-1506794778202-cad84cf45f1d?w=480&q=70&fm=jpg&fit=crop',
+            // Beautiful smart student girl inside high-tech modern VR research lab (Girl)
+            'https://images.unsplash.com/photo-1593508512255-86ab42a8e620?w=480&q=70&fm=jpg&fit=crop',
+            // High contrast cute pastel-drawn cartoon chibi student with book bag (Boy/Girl Chibi)
+            'https://images.unsplash.com/photo-1561037404-61cd46aa615b?w=480&q=70&fm=jpg&fit=crop',
+            // Joyful young classmates reading together in creative school study room (Girls)
+            'https://images.unsplash.com/photo-1509062522246-3755977927d7?w=480&q=70&fm=jpg&fit=crop',
+            // Vibrant tech master boy student with glowing cyber background (Boy)
+            'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=480&q=70&fm=jpg&fit=crop',
+            // Glowing magical library learning concept with colorful swirling galaxy and books
+            'https://images.unsplash.com/photo-1532012197267-da84d127e765?w=480&q=70&fm=jpg&fit=crop',
+            // Innovative digital learning student with creative neon screen light reflections
+            'https://images.unsplash.com/photo-1620641788421-7a1c342ea42e?w=480&q=70&fm=jpg&fit=crop',
+            // Smart group of students looking up, celebrating graduation milestones (Boys & Girls)
+            'https://images.unsplash.com/photo-1517245386807-bb43f82c33c4?w=480&q=70&fm=jpg&fit=crop',
+            // Whimsical 3D blocky cartoon smart-boy learning model avatar with clear face (Boy)
+            'https://images.unsplash.com/photo-1628157582853-a796fa650a6a?w=480&q=70&fm=jpg&fit=crop',
+            // Neon color-wheel graphic design student in abstract aesthetic workspace
+            'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=480&q=70&fm=jpg&fit=crop',
+            // Beautiful colorful stack of neon study notebooks and creative markers setup
+            'https://images.unsplash.com/photo-1513364776144-60967b0f800f?w=480&q=70&fm=jpg&fit=crop',
+            // Modern studious student girl with glowing red ink background sketch (Girl)
+            'https://images.unsplash.com/photo-1601987177651-8edfe6c20009?w=480&q=70&fm=jpg&fit=crop'
+        ];
+
+        const id = userId || 0;
+        if (!userAnimeHistory.has(id)) {
+            userAnimeHistory.set(id, new Set<string>());
+        }
+        const history = userAnimeHistory.get(id)!;
+
+        // Reset history if user has seen almost all to allow infinite loop safely
+        if (history.size >= faceCatalog.length - 2) {
+            history.clear();
+        }
+
+        // We will select a unique educational cartoon style boy/girl face
+        for (let attempt = 0; attempt < 20; attempt++) {
+            const possibleUrl = faceCatalog[Math.floor(Math.random() * faceCatalog.length)];
+
+            if (history.has(possibleUrl)) {
+                continue; // Repeat detected, try another candidate to ensure a NEW one is served
+            }
+
+            history.add(possibleUrl);
+            return possibleUrl;
+        }
+
+        // Emergency fallback to avoid failures, reset history
+        history.clear();
+        const fallbackUrl = faceCatalog[Math.floor(Math.random() * faceCatalog.length)];
+        history.add(fallbackUrl);
+        return fallbackUrl;
+    }
+
     // Developer debug command
 
     bot.onText(/\/status/, async (msg) => {
@@ -1903,6 +2003,9 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                 ],
                 [
                     { text: '🚀 𝗦𝘁𝗮𝗿𝘁 𝗦𝗶𝗻𝗴𝗹𝗲 𝗧𝗮𝗿𝗴𝗲𝘁', callback_data: 'start_cmd_link' }
+                ],
+                [
+                    { text: '🌸 𝗔𝗻𝗶𝗺𝗲 𝗣𝗵𝗼𝘁𝗼', callback_data: 'send_anime_photo' }
                 ]
             ]
         };
@@ -2206,6 +2309,71 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
             query.message?.message_id
           );
           bot?.answerCallbackQuery(query.id);
+          return;
+      }
+
+      if (query.data === 'send_anime_photo') {
+          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+          bot?.answerCallbackQuery(query.id, { text: '🎨 Fetching Anime Photo...' }).catch(() => {});
+          try {
+              const url = await getRandomAnimePhotoUrl(query.from?.id);
+              const captionText = `🌸 **Here is your random Anime photo!** ✨\n\n_Keep clicking the button below to get more!_`;
+              const replyMarkup = {
+                  inline_keyboard: [
+                      [
+                          { text: '🔄 Get Another Anime (Ek Aur Bhejo)', callback_data: 'send_anime_photo' }
+                      ],
+                      [
+                          { text: '⬅️ Back to Menu', callback_data: 'menu_back' }
+                      ]
+                  ]
+              };
+
+              let success = false;
+              if (query.message) {
+                  try {
+                      const editResult = await safeBotCall('editMessageMedia', {
+                          type: 'photo',
+                          media: url,
+                          caption: captionText,
+                          parse_mode: 'Markdown'
+                      }, {
+                          chat_id: chatId,
+                          message_id: query.message.message_id,
+                          reply_markup: replyMarkup
+                      });
+                      
+                      // safeBotCall returns null on error rather than throwing, so we must check if editResult is truthy
+                      if (editResult) {
+                          success = true;
+                      } else {
+                          console.log("[Anime] editMessageMedia returned null, triggering sendPhoto fallback");
+                      }
+                  } catch (err: any) {
+                      console.log("[Anime] editMessageMedia exception, falling back:", err.message);
+                  }
+              }
+
+              if (!success) {
+                  if (query.message) {
+                      await safeBotCall('deleteMessage', chatId, query.message.message_id).catch(() => {});
+                  }
+                  await safeBotCall('sendPhoto', chatId, url, {
+                      caption: captionText,
+                      parse_mode: 'Markdown',
+                      reply_markup: replyMarkup
+                  });
+              }
+          } catch (err: any) {
+              console.error("[Anime] Error in sending anime photo:", err);
+              try {
+                  await safeSendMessage(chatId, `❌ **Could not fetch Anime Photo:** ${err.message}`, {
+                      reply_markup: {
+                          inline_keyboard: [[{ text: '⬅️ Back to Menu', callback_data: 'menu_back' }]]
+                      }
+                  });
+              } catch (e) {}
+          }
           return;
       }
       
@@ -2930,9 +3098,10 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                       const topicName = p.topicName || 'General';
                       const liveStatus = p.isLive ? '🟢 LIVE ON' : '🔴 LIVE OFF';
                       const sourceName = p.sourceName || 'Target Group';
+                      const lastScanText = p.isLive ? `\n   └ **Last Scan (IST):** \`${formatISTTime(p.lastScannedAt)}\`` : '';
                       
                       text += `**${i + 1}. (${sourceName}) (${p.sourceId}) ➔ ${destName}**\n`;
-                      text += `└ Topic: ${topicName} | Status: ${liveStatus}\n\n`;
+                      text += `└ Topic: ${topicName} | Status: ${liveStatus}${lastScanText}\n\n`;
                       
                       keyboard.push([
                           { text: liveStatus, callback_data: `mirrortoggle_${i}` },
@@ -3112,7 +3281,10 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                     p.sourceId === sourceId || p.sourceId === `-100${sourceId}` || sourceId === p.sourceId.replace('-100', '')
                   );
 
-                  const destPath = mirrorPath ? mirrorPath.destId : (userDoc?.uploadPath || DEFAULT_LOG_GROUP);
+                  let destPath = mirrorPath ? mirrorPath.destId : (userDoc?.uploadPath || DEFAULT_LOG_GROUP);
+                  if (!userDoc?.uploadPath) {
+                      destPath = DEFAULT_LOG_GROUP;
+                  }
                   const destEntity: any = await safelyResolveFullEntity(client, destPath).catch(() => { throw new Error("Could not access Destination.")});
 
                   await safeEditMessage(`📍 **Mirroring ${topicsResult.topics.length} Topics.**\nCloning started...`, { chat_id: chatId, message_id: loadingMsg!.message_id });
@@ -3251,11 +3423,29 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
 
       if (query.data === 'toggle_engine') {
           if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
-          currentUploadEngine = currentUploadEngine === 'Telethon' ? 'Pyrogram' : 'Telethon';
+          const engines = ['Auto', 'GramJS', 'Telethon', 'Pyrogram', 'Hydrogram'];
+          let idx = engines.indexOf(currentUploadEngine);
+          if (idx === -1) idx = 1; // default to GramJS
+          currentUploadEngine = engines[(idx + 1) % engines.length];
           if (settingsCollection) {
               await settingsCollection.updateOne({ type: 'global_config' }, { $set: { uploadEngine: currentUploadEngine } }, { upsert: true });
           }
           bot?.answerCallbackQuery(query.id, { text: `✅ Upload Engine set to ${currentUploadEngine}` });
+          // Refresh settings menu using edit instead of delete/new to avoid flicker
+          handleSettings(chatId, query.from?.id, query.message!.message_id);
+          return;
+      }
+
+      if (query.data === 'toggle_down_library') {
+          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+          const libs = ['Auto', 'GramJS', 'Telethon', 'Pyrogram', 'Hydrogram'];
+          let idx = libs.indexOf(currentDownloadLibrary);
+          if (idx === -1) idx = 1; // default to GramJS
+          currentDownloadLibrary = libs[(idx + 1) % libs.length];
+          if (settingsCollection) {
+              await settingsCollection.updateOne({ type: 'global_config' }, { $set: { downloadLibrary: currentDownloadLibrary } }, { upsert: true });
+          }
+          bot?.answerCallbackQuery(query.id, { text: `✅ Download Engine set to ${currentDownloadLibrary}` });
           // Refresh settings menu using edit instead of delete/new to avoid flicker
           handleSettings(chatId, query.from?.id, query.message!.message_id);
           return;
@@ -5311,9 +5501,10 @@ async function updateMirrorPathLastId(userId: number, sourceId: string, lastId: 
         let updated = false;
         const newPaths = userDoc.mirrorPaths.map((p: any) => {
             if (normalize(p.sourceId) === cleanSource || normalize(p.sourceNumericId) === cleanSource) {
+                p.lastScannedAt = new Date().toISOString();
+                updated = true;
                 if (!p.lastProcessedMsgId || lastId > p.lastProcessedMsgId) {
                     p.lastProcessedMsgId = lastId;
-                    updated = true;
                 }
             }
             return p;
@@ -5345,6 +5536,10 @@ async function catchUpLiveMirrors(userId: number, client: TelegramClient) {
         for (const pathObj of livePaths) {
             const sourceId = pathObj.sourceId;
             const lastId = pathObj.lastProcessedMsgId;
+            
+            // Set exact scan time
+            pathObj.lastScannedAt = new Date().toISOString();
+            
             if (!lastId) {
                 // If there's no lastProcessedMsgId, initialize it with the latest message ID
                 try {
@@ -5454,6 +5649,12 @@ async function catchUpLiveMirrors(userId: number, client: TelegramClient) {
                 console.error(`[CatchUp] Error during catch-up for ${sourceId}:`, err.message);
             }
         }
+        
+        // Save the updated lastScannedAt and message IDs back to database
+        await approvedUsersCollection.updateOne(
+            { userId: settingsUid },
+            { $set: { mirrorPaths: userDoc.mirrorPaths } }
+        );
     } catch (err: any) {
         console.error(`[CatchUp] Error in catch-Up live mirrors:`, err.message);
     }
@@ -6007,6 +6208,12 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                 }
             }
 
+            // CRITICAL USER MANDATE: If no Upload/Set Path is configured, by default send strictly to -1003995334936 only and nowhere else.
+            if (!userDoc?.uploadPath) {
+                uploadTarget = DEFAULT_LOG_GROUP;
+                threadId = undefined;
+            }
+
         // Smart Route Destination: Find a client that can reach the destination
             let destClient: any = null;
             let destPeer: any = null;
@@ -6405,9 +6612,18 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
             const totalSize = fs.statSync(tempFilePath).size;
             let lastUploadUpdate = 0;
 
+            let uploadWorkers = 4;
+            if (totalSize > 500 * 1024 * 1024) {
+                uploadWorkers = 32; // > 500 MB gets 32 concurrent upload channels
+            } else if (totalSize > 100 * 1024 * 1024) {
+                uploadWorkers = 16; // > 100 MB gets 16 concurrent upload channels
+            } else if (totalSize > 20 * 1024 * 1024) {
+                uploadWorkers = 8;  // > 20 MB gets 8 concurrent upload channels
+            }
+
             const uploadedFile = await destClient.uploadFile({
                 file: new CustomFile(filename, totalSize, tempFilePath),
-                workers: 1,
+                workers: uploadWorkers,
                 onProgress: (current: any) => {
                     let currentBytes = Number(current);
                     if (currentBytes <= 1.0 && currentBytes >= 0) {
@@ -6480,7 +6696,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
             const sentMsg = await destClient.sendFile(finalDestPeer, {
                 file: uploadedFile,
                 caption: caption,
-                workers: 8,
+                workers: uploadWorkers,
                 attributes: attributes,
                 thumb: hasThumb ? thumbPath : undefined,
                 replyTo: threadId,
@@ -7314,7 +7530,10 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                       p.sourceId === sourceIdClean || p.sourceId === `-100${sourceIdClean}` || sourceIdClean === p.sourceId.replace('-100', '')
                   );
 
-                  const destId = mirrorPath ? mirrorPath.destId : (userDoc?.uploadPath || DEFAULT_LOG_GROUP);
+                  let destId = mirrorPath ? mirrorPath.destId : (userDoc?.uploadPath || DEFAULT_LOG_GROUP);
+                  if (!userDoc?.uploadPath) {
+                      destId = DEFAULT_LOG_GROUP;
+                  }
 
                   const messages: any = await client.getMessages(sourceEntity, {
                       limit: 100,
@@ -7787,9 +8006,10 @@ app.get('/api/status', async (req, res) => {
     settings: {
       adminId: currentAdminId,
       destinationChatId: destinationChatId,
-      apiId: process.env.API_ID || null,
-      apiHash: process.env.API_HASH || null,
+      apiId: apiIdValue || null,
+      apiHash: apiHashValue || null,
       downloadLibrary: currentDownloadLibrary,
+      uploadEngine: currentUploadEngine,
       renameRules: globalRenameRules,
       cooldownSeconds: globalCooldownSeconds,
       mirrorPaths: approvedUsersCollection && currentAdminId ? ((await approvedUsersCollection.findOne({userId: currentAdminId.toString()}))?.mirrorPaths || []) : []
@@ -8098,7 +8318,7 @@ app.post('/api/setpath', async (req, res) => {
 
 app.post('/api/settings', async (req, res) => {
   if (!settingsCollection) return res.status(503).json({ error: 'Database not ready' });
-  const { adminId, stringSession, destinationChatId: newDestId, apiId: newApiId, apiHash: newApiHash, downloadLibrary, renameRules, proxy, cooldownSeconds } = req.body;
+  const { adminId, stringSession, destinationChatId: newDestId, apiId: newApiId, apiHash: newApiHash, downloadLibrary, uploadEngine, renameRules, proxy, cooldownSeconds } = req.body;
   try {
     const updateData: any = {};
     if (adminId) updateData.adminId = adminId;
@@ -8127,6 +8347,10 @@ app.post('/api/settings', async (req, res) => {
         if (downloadLibrary) {
             updateData.downloadLibrary = downloadLibrary;
             currentDownloadLibrary = downloadLibrary;
+        }
+        if (uploadEngine) {
+            updateData.uploadEngine = uploadEngine;
+            currentUploadEngine = uploadEngine;
         }
         if (cooldownSeconds !== undefined) {
              updateData.cooldownSeconds = Number(cooldownSeconds);
