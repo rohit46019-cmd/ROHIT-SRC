@@ -3454,7 +3454,7 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                   catchUpLiveMirrors(parseInt(settingsUid), client).then(() => {
                       safeSendMessage(chatId, `✅ Scan completed for ${paths[index].sourceId}`);
                   }).catch(e => {
-                      console.error(e);
+                      console.error(e.message || e);
                       safeSendMessage(chatId, `❌ Scan failed for ${paths[index].sourceId}`);
                   });
               }
@@ -6697,7 +6697,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                         throw new Error(`Cannot access the channel. The channel may be private, restricted, or the Userbot is not a member.`);
                     }
                     if (isTimeoutErr) {
-                        throw new Error(`TIMEOUT`);
+                        throw new Error(`Telegram API Timeout`);
                     }
                     throw err;
                 }
@@ -8509,8 +8509,8 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
 
-    bot.on('error', (error) => {
-      console.error('Bot Critical Error:', error);
+    bot.on('error', (error: any) => {
+      console.error('Bot Critical Error:', error.message || error);
       botStatus = 'Error';
     });
 
