@@ -7389,7 +7389,10 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
             const linkData = getLinkData(link);
             
             const { client: sourceClient, peer: resolvedSourcePeer } = await getBestClientForLinkData(linkData, userId, statusMsgId, chatId);
-            if (!sourceClient) throw new Error("No active Userbot session to access source.");
+            if (!sourceClient) {
+                await safeEditMessage("❌ **No active Userbot session has access to this source!**\n\nPlease /login with an account that is a member of this channel, or ensure your currently logged-in account has access.", { chat_id: chatId, message_id: statusMsgId });
+                return false;
+            }
             
             let userDoc: any = null;
             if (approvedUsersCollection) {
@@ -7867,7 +7870,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                         };
                     }
 
-                    if (now - lastDownloadUpdate > 1000 || currentBytes === totalBytes) {
+                    if (now - lastDownloadUpdate > 5000 || currentBytes === totalBytes) {
                         lastDownloadUpdate = now;
                         const isPaused = taskControlMap.get(jobKey)?.isPaused || false;
                         safeEditMessage(createProgressBar(totalBytes, currentBytes, "Downloading", downloadStartTime, pathDisplay), { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown', reply_markup: createProgressMarkup(jobKey, isPaused) }).catch(() => {});
