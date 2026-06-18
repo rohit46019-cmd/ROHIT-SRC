@@ -1,0 +1,66 @@
+const userActionStates: Record<number, { 
+      const actionCount = Object.keys(userActionStates).length;
+        for (const key in userActionStates) delete userActionStates[key as any];
+        userActionStates[fromId] = { type: 'batch_start' };
+          userActionStates[query.from.id] = { 
+          const state = userActionStates[query.from.id];
+          userActionStates[query.from.id] = { 
+          userActionStates[query.from.id] = { 
+      const state = userActionStates[query.from.id];
+      const state = userActionStates[query.from.id];
+      const state = userActionStates[query.from.id];
+      const state = userActionStates[query.from.id];
+      const state = userActionStates[query.from.id];
+              delete userActionStates[query.from.id];
+          userActionStates[query.from.id] = { type: 'add_blocked_topic' };
+          userActionStates[query.from.id] = { type: 'full_mirror_group' };
+          userActionStates[query.from.id] = { type: 'topic_clone_dest_select' };
+              delete userActionStates[query.from.id];
+          userActionStates[query.from.id] = { type: 'mirror_path_add_source' };
+          const state = userActionStates[query.from.id];
+          delete userActionStates[query.from.id];
+          const state = userActionStates[query.from.id];
+          const state = userActionStates[query.from.id];
+          delete userActionStates[query.from.id];
+          const state = userActionStates[query.from.id];
+              delete userActionStates[fromId];
+          const state = userActionStates[query.from.id];
+          const state = userActionStates[query.from.id];
+              delete userActionStates[fromId];
+          userActionStates[query.from.id] = { type: 'set_path' };
+          userActionStates[query.from.id] = { type: 'set_api_id' };
+          userActionStates[query.from.id] = { type: 'set_api_hash' };
+          userActionStates[query.from.id] = { type: 'set_thumb' };
+          userActionStates[query.from.id] = { type: 'set_cap' };
+          userActionStates[query.from.id] = { type: 'add_rename_rule' };
+          userActionStates[query.from.id] = { type: 'set_cooldown_secs' };
+              const state = userActionStates[query.from.id];
+          userActionStates[query.from.id] = { type: 'set_concurrency_val' };
+            userActionStates[fromId] = { type: 'mirror_target' };
+        const actionsCleared = Object.keys(userActionStates).length;
+        for (const key in userActionStates) delete userActionStates[Number(key)];
+            userActionStates[fromId] = { type: 'set_jump_to_path' };
+                userActionStates[fromId] = { type: 'enter_manual_specific_topic' };
+          userActionStates[fromId] = { type: 'set_path' };
+      if (fromId && userActionStates[fromId]) {
+          const state = userActionStates[fromId];
+              delete userActionStates[fromId];
+              delete userActionStates[fromId];
+              delete userActionStates[fromId];
+              delete userActionStates[fromId];
+                  delete userActionStates[fromId];
+              delete userActionStates[fromId];
+              delete userActionStates[fromId];
+              delete userActionStates[fromId];
+              delete userActionStates[fromId];
+      if (fromId && userActionStates[fromId]) {
+          const state = userActionStates[fromId];
+              delete userActionStates[fromId];
+                  delete userActionStates[fromId];
+                  delete userActionStates[fromId];
+                      delete userActionStates[fromId];
+                  delete userActionStates[fromId];
+              delete userActionStates[fromId];
+              delete userActionStates[fromId];
+                  delete userActionStates[fromId];
+      if (fromId && !userActionStates[fromId] && !loginStates[fromId] && text) {

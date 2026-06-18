@@ -56,7 +56,7 @@
               kb.push([{ text: `➕ Enter New Source ID`, callback_data: `clonesource_new` }]);
                   { text: item.dest.groupName + (item.dest.destThreadId ? ` (Topic ${item.dest.destThreadId})` : ''), callback_data: `lm_dest_${item.originalIndex}` },
                   { text: '🗑', callback_data: `del_saved_dest:${item.originalIndex}` }
-          kb.push([{ text: '❌ Cancel', callback_data: 'start_back' }]);
+          kb.push([{ text: '🔙 Back', callback_data: 'start_back' }]);
                           { text: '🔄 Get Another Anime (Ek Aur Bhejo)', callback_data: 'send_anime_photo' }
                           { text: '⬅️ Back to Menu', callback_data: 'menu_back' }
                           inline_keyboard: [[{ text: '⬅️ Back to Menu', callback_data: 'menu_back' }]]

@@ -1,0 +1,168 @@
+async function saveRecentSource(userId: number, sourceId: string, sourceName: string) {
+        let recent = userDoc?.recentSources || [];
+            { $set: { recentSources: recent } }
+    const isSourceForum = (sourceEntity as any).forum;
+    if (isSourceForum) {
+        if (isSourceForum && isDestForum && (m as any).replyTo) {
+    pendingSourceId?: string,
+    pendingSourceName?: string,
+    cloneSourceGroupId?: string,
+    pendingSourceIdForDirectClone?: string
+              pendingSourceIdForDirectClone: sourceId 
+          await safeEditMessage(`🔗 **Source Selected!**\n\nNow select the **Destination Group** to clone to:`, {
+          if (!state || state.type !== 'topic_clone_dest_select' || !state.pendingSourceIdForDirectClone) {
+          const sourceId = state.pendingSourceIdForDirectClone;
+          state.cloneSourceGroupId = sourceId;
+          await saveRecentSource(query.from.id, sourceId, groupName);
+              pendingSourceId: sourceId,
+              pendingSourceName: groupName
+          await safeEditMessage(`✅ **Source Selected: ${groupName}**\n\n**Select Destination Group for Live Mirror:**`, {
+          await saveRecentSource(query.from.id, sourceId, groupName);
+              pendingSourceId: sourceId,
+              pendingSourceName: groupName
+          await safeEditMessage(`✅ **Source Selected: ${groupName}**\n\n**Select Destination Group for Full Mirror:**`, {
+          await safeEditMessage(`🔗 **Destination Selected: ${groupName}**\n\nNow send the **Source Group Link/ID** to mirror from:`, {
+      const recentSources = userDoc?.recentSources || [];
+      if (recentSources.length > 0) {
+          recentSources.forEach((s: any) => {
+          kb.push([{ text: `➕ Enter New Source ID`, callback_data: `clonesource_new` }]);
+          await safeEditMessage(`🔗 **Destination Selected: ${groupName}**\n\n2. Select or enter the **Source Group** to clone from:`, {
+          await safeEditMessage(`🔗 **Destination Selected: ${groupName}**\n\n2. Now send the **Source Group Link/ID** to clone from:`, {
+          const recentSources = userDoc?.recentSources || [];
+          if (recentSources.length > 0) {
+              recentSources.forEach((s: any) => {
+              kb.push([{ text: `➕ Enter New Source ID`, callback_data: `clonesource_new` }]);
+              await safeEditMessage(`🔗 **Destination Selected: ${groupName}**\n\n2. Select or enter the **Source Group** to clone from:`, {
+              await safeEditMessage(`🔗 **Destination Selected: ${groupName}**\n\n2. Now send the **Source Group Link/ID** to clone from:`, {
+          await safeEditMessage("🔗 **Please send the Source Group ID or Link to clone from:**", { chat_id: chatId, message_id: query.message!.message_id });
+          state.cloneSourceGroupId = sourceId;
+          await saveRecentSource(query.from.id, sourceId, groupName);
+          await safeEditMessage(`✅ **Source Selected: ${groupName}**\n\n3. Please enter the **Topic ID** of the topic you want to clone now.`, {
+          await safeEditMessage("🔗 **Please send the Source Group ID or Link:**", { chat_id: chatId, message_id: query.message!.message_id });
+          state.pendingSourceId = sourceId;
+          state.pendingSourceName = groupName;
+          await saveRecentSource(query.from.id, sourceId, groupName);
+          await safeEditMessage(`✅ **Source Selected: ${groupName}**\n\n**Select Destination Group for Live Mirror:**`, {
+                      if (session.sourceId) text += `└ **Source:** \`${session.sourceId}\`\n`;
+                      if (session.sourceId) text += `└ **Source:** \`${session.sourceId}\`\n`;
+          safeSendMessage(chatId, "🔄 **Full Group Mirror**\n\n1. Please send the **Source Group/Channel ID or Link** you want to completely mirror.", {
+          const recent = userDoc?.recentSources || [];
+              kb.push([{ text: `➕ Enter New Source ID`, callback_data: `mirrorsource_new` }]);
+              safeSendMessage(chatId, "🔗 **New Live Mirror Setup**\n\n🎯 Select or Enter the **Source Group**:", {
+              safeSendMessage(chatId, "🔗 **New Live Mirror Setup**\n\n1. Please send the **Source Group ID** or **Link** you want to auto-mirror content FROM.", {
+          const sourceId = state.pendingSourceId!;
+          const sourceName = state.pendingSourceName || 'Source Group';
+              safeSendMessage(chatId, `✅ **Live Mirror Path Setup Finished!**\n\n**Source:** \`${sourceName}\` (\`${sourceId}\`)\n**Destination:** ${destDisplay}\n⚡ **Live Status:** 🟢 Live ON (Auto-mirroring active!)${initialLastId > 0 ? `\n📥 **Starting from post ID:** \`${initialLastId}\`` : ''}`, { parse_mode: 'Markdown' });
+          const sourceId = state.pendingSourceId!;
+          await safeEditMessage(`🔄 **Full Mirror Options**\n\nWould you like to also auto-enable **Live Mirroring** for this setup once started?\n\n**Source:** \`${sourceId}\`\n**Destination:** ${destDisplay}\n\n*If you choose YES, we will queue the full history copy and also automatically register this channel/group to mirror future new posts in real-time!*`, {
+          const sourceId = state.pendingSourceId!;
+          const statusMsg = await safeSendMessage(chatId, `📂 **Starting Full Mirror...**\nSource Group: \`${sourceId}\`\nFetching history, this may take a moment depending on the group size.`);
+              const isSourceForum = (sourceEntity as any).forum;
+              if (isSourceForum) {
+                  if (isSourceForum && isDestForum && (m as any).replyTo) {
+                  const sourceName = (sourceEntity as any).title || 'Source Group';
+                      liveMirrorSuccessInfo = `\n\n⚡ **Live Mirror registered too!**\n└ **Source:** \`${sourceName}\`\n└ **Destination:** \`${destDisplay}\`\n└ **Status:** 🟢 Live ON (Future posts will auto-mirror starting from ID \`${latestMsgId}\`)`;
+              const loadingMsg = await safeSendMessage(chatId, "📂 **Scanning Source Topics...**");
+                      throw new Error("Could not access Source.");
+                      throw new Error("No topics found. Source group must be a Forum.");
+                  const sourceName = state.pendingSourceName || 'Source Group';
+                  await safeEditMessage(`✅ **Source Selected: ${sourceName}**\n\n**Select Destination Group for Live Mirror:**`, {
+                  const sourceId = state.pendingSourceId!;
+                  await safeEditMessage(`✅ **Source Selected: Source** (\`${sourceId}\`)\n\n**Select Destination Group for Full Mirror:**`, {
+        const cleanSource = normalize(sourceId);
+            if (normalize(p.sourceId) === cleanSource || normalize(p.sourceNumericId) === cleanSource) {
+                console.log(`[Watcher] Match found! Source: ${match.sourceId} (Topic: ${topicName}) -> Dest: ${match.destId}`);
+            const { client: sourceClient, peer: resolvedSourcePeer } = await getBestClientForLinkData(linkData, userId, statusMsgId, chatId);
+            const sourcePeer = resolvedSourcePeer || await safelyResolveEntity(sourceClient, linkData.channelId);
+                    const destSourcePeer = (destClient === sourceClient) ? sourcePeer : await safelyResolveEntity(destClient, linkData.channelId).catch(() => null);
+                    if (destSourcePeer) {
+                        const destMessages = await destClient.getMessages(destSourcePeer, { ids: [linkData.msgId] });
+                    let finalSourcePeer = (destClient === sourceClient) ? sourcePeer : await safelyResolveEntity(destClient, linkData.channelId).catch(() => null);
+                    if (!finalSourcePeer) {
+                        finalSourcePeer = sourcePeer;
+                    if (finalSourcePeer && targetPeer) {
+                            fromPeer: finalSourcePeer,
+                        console.log(`[Debug] Direct forward skipped: finalSourcePeer or targetPeer missing.`);
+            await safeEditMessage(`📥 **Downloading via Source Account...**`, { chat_id: chatId, message_id: statusMsgId });
+                            const targetSourcePeer = resolvedSourcePeer || await safelyResolveEntity(sourceClient, linkData.channelId).catch(() => null);
+                            if (targetSourcePeer) {
+                                const refetchedMsgs = await sourceClient.getMessages(targetSourcePeer, { ids: [linkData.msgId] });
+                      const recentSources = userDoc?.recentSources || [];
+                      if (recentSources.length > 0) {
+                          recentSources.forEach((s: any) => {
+                          kb.push([{ text: `➕ Enter New Source ID`, callback_data: `clonesource_new` }]);
+                          await safeSendMessage(chatId, `✅ **Destination Saved:** **${destTitle}** (\`${resolvedDestId}\`)\n\n2. Select or enter the **Source Group** to clone from:`, {
+                          await safeSendMessage(chatId, `✅ **Destination Saved:** **${destTitle}** (\`${resolvedDestId}\`)\n\n2. Now send the **Source Group Link/ID** or forward a message to clone from:`, {
+                      safeSendMessage(chatId, `✅ **Mirror Path Saved!**\n\n**Source:** \`${sourceId}\`\n**Destination:** \`${destDisplay}\`\n\n_Anything mirrored from this source will now go to this destination._`, { parse_mode: 'Markdown' });
+                          safeSendMessage(fromId, `✅ **New Mirror Mapping:**\nSource: \`${sourceId}\`\nDest: \`${destDisplay}\``, { parse_mode: 'Markdown' });
+                  let groupName = "Source Group";
+                  state.cloneSourceGroupId = sourceId;
+                  await saveRecentSource(fromId, sourceId, groupName);
+                  safeSendMessage(chatId, `✅ **Source Saved:** **${groupName}** (\`${sourceId}\`)\n\n3. Please enter the **Topic ID** of the topic you want to clone now:`, {
+                  safeSendMessage(chatId, "❌ **Invalid Source ID or Link.**\nPlease forward a message or send a valid Group/Channel ID/Link.");
+                  state.pendingSourceId = sourceId;
+                  let groupName = "Source Group";
+                  state.pendingSourceName = groupName;
+                  await saveRecentSource(fromId, sourceId, groupName);
+                  safeSendMessage(chatId, `✅ **Source ID Recognized:** \`${sourceId}\`\n\n**Select Destination Group for Live Mirror:**`, {
+                  safeSendMessage(chatId, "❌ **Invalid Source.**\nPlease forward a message or send a valid ID/Link.");
+                  state.cloneSourceGroupId = sourceId;
+                  let groupName = "Source Group";
+                  await saveRecentSource(fromId, sourceId, groupName);
+                  safeSendMessage(chatId, `✅ **Source Recognized: ${groupName}** (\`${sourceId}\`)\n\n2. Please enter the **Topic ID** of the topic you want to clone now.`, {
+                  safeSendMessage(chatId, "❌ **Invalid Source ID or Link.**\nPlease forward a message or send a valid Group/Channel ID/Link.");
+                  safeSendMessage(chatId, "❌ **Invalid Source.**\nPlease forward a message or send a valid Group/Channel ID/Link.");
+              state.pendingSourceId = sourceId;
+              let groupName = "Source Group";
+              await saveRecentSource(fromId, sourceId, groupName);
+              safeSendMessage(chatId, `✅ **Source Selected: ${groupName}** (\`${sourceId}\`)\n\n**Select Destination Group for Full Mirror:**`, {
+              const sourceGroupId = state.cloneSourceGroupId!;
+              await safeSendMessage(chatId, `📂 **Starting Specific Topic Clone...**\nSource: \`${sourceGroupId}\`\nTopic ID: \`${topicId}\`\nDest: \`${destGroupId}\``);
+                  const realSourceId = (sourceEntity as any).id?.toString() || sourceGroupId;
+                  const resolvedSourceId = realSourceId.startsWith('-100') ? realSourceId : "-100" + realSourceId;
+                  const sourceTitle = (sourceEntity as any).title || "Source Group";
+                      !(p.sourceId === resolvedSourceId && p.destId === resolvedDestId && p.destThreadId === Number(topicId))
+                      sourceId: resolvedSourceId, 
+                      sourceNumericId: resolvedSourceId,
+                      if (p.sourceId === resolvedSourceId && p.destId === resolvedDestId && p.destThreadId === Number(topicId)) {
+                  const sourceIdClean = resolvedSourceId.replace('-100', '');
+                          sourceGroupId: resolvedSourceId,
+      // Direct Source Group ID detection & saving when no other state is active
+          let isPotentialSource = false;
+          let parsedSourceId = cleanText;
+              isPotentialSource = true;
+              isPotentialSource = true;
+              isPotentialSource = true;
+              parsedSourceId = '-100' + cleanText;
+              isPotentialSource = true;
+                  isPotentialSource = true;
+                  parsedSourceId = '@' + usernameMatch[1];
+                  isPotentialSource = true;
+                  parsedSourceId = '-100' + privateGroupIdMatch[1];
+          if (isPotentialSource) {
+              const statusMsg = await safeSendMessage(chatId, `🔍 **Verifying and saving source ID:** \`${parsedSourceId}\`...`);
+                  const sourceEntity = await safelyResolveFullEntity(client, parsedSourceId);
+                  const realSourceId = (sourceEntity as any).id?.toString() || parsedSourceId;
+                  const resolvedSourceId = realSourceId.startsWith('-100') ? realSourceId : (realSourceId.startsWith('-') ? realSourceId : "-100" + realSourceId);
+                  const groupName = (sourceEntity as any).title || parsedSourceId;
+                  await saveRecentSource(fromId, resolvedSourceId, groupName);
+                          { text: '🔄 Live Mirror', callback_data: `mirrorsource_direct_${resolvedSourceId}` },
+                          { text: '⚡ Full Mirror', callback_data: `fullmirror_direct_${resolvedSourceId}` }
+                          { text: '📂 Clone Topics', callback_data: `clonesource_direct_${resolvedSourceId}` }
+                  await safeEditMessage(`✅ **Source Group Saved successfully!**\n\n📌 Title: **${groupName}**\n📍 ID: \`${resolvedSourceId}\`\n\nThis source group has been added to your saved sources. Select an action below to configure it:`, {
+              let resolvedSourceId = "";
+                      resolvedSourceId = chatEntityId.startsWith('-100') ? chatEntityId : (chatEntityId.startsWith('-') ? chatEntityId : "-100" + chatEntityId);
+              if (resolvedSourceId) {
+                  await saveRecentSource(fromId, resolvedSourceId, chatTitle);
+                          { text: '🔄 Live Mirror', callback_data: `mirrorsource_direct_${resolvedSourceId}` },
+                          { text: '⚡ Full Mirror', callback_data: `fullmirror_direct_${resolvedSourceId}` }
+                          { text: '📂 Clone Topics', callback_data: `clonesource_direct_${resolvedSourceId}` }
+                  await safeEditMessage(`✅ **Successfully Joined Private Channel/Group and Saved!**\n\n📌 Title: **${chatTitle}**\n📍 ID: \`${resolvedSourceId}\`\n\nThis source has been saved to your recent sources! Select an action to configure it:`, {
+                          let resolvedSourceId = "";
+                                  resolvedSourceId = chatEntityId.startsWith('-100') ? chatEntityId : (chatEntityId.startsWith('-') ? chatEntityId : "-100" + chatEntityId);
+                          if (resolvedSourceId) {
+                              await saveRecentSource(fromId, resolvedSourceId, chatTitle);
+                                      { text: '🔄 Live Mirror', callback_data: `mirrorsource_direct_${resolvedSourceId}` },
+                                      { text: '⚡ Full Mirror', callback_data: `fullmirror_direct_${resolvedSourceId}` }
+                                      { text: '📂 Clone Topics', callback_data: `clonesource_direct_${resolvedSourceId}` }
+                              await safeEditMessage(`ℹ️ **Already a member!** Saved to your recent sources:\n\n📌 Title: **${chatTitle}**\n📍 ID: \`${resolvedSourceId}\`\n\nSelect an action to configure it:`, {

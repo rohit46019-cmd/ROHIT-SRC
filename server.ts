@@ -5,7 +5,7 @@ import TelegramBot from 'node-telegram-bot-api';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 import { MongoClient } from 'mongodb';
-import { TelegramClient, Api, helpers } from 'telegram';
+import { TelegramClient, Api, helpers, utils } from 'telegram';
 import { StringSession } from 'telegram/sessions';
 import bigInt from 'big-integer';
 import { NewMessage } from 'telegram/events';
@@ -113,6 +113,8 @@ let mirroredMessagesCollection: any = null;
 let queuedTasksCollection: any = null;
 let failedTasksCollection: any = null;
 let fullMirrorSessionsCollection: any = null;
+let fileCacheCollection: any = null;
+let globalCachedFilesTopicId: number | null = null;
 
 // Global Settings State
 let currentAdminId = process.env.ADMIN_ID;
@@ -328,6 +330,113 @@ let isQueuePaused = false;
 let nextTaskRunAt: number | null = null;
 let runNextTask: () => Promise<void>;
 
+function getFileUniqueKey(msg: any): string | null {
+    if (!msg || !msg.media) return null;
+    let docId: string | null = null;
+    let size = 0;
+    let name = "file";
+    
+    if (msg.media instanceof Api.MessageMediaDocument && msg.media.document instanceof Api.Document) {
+        const doc = msg.media.document;
+        docId = doc.id ? doc.id.toString() : null;
+        size = Number(doc.size || 0);
+        const attr = doc.attributes.find((a: any) => a instanceof Api.DocumentAttributeFilename);
+        if (attr && (attr as any).fileName) {
+            name = (attr as any).fileName;
+        }
+    } else if (msg.media instanceof Api.MessageMediaPhoto && msg.media.photo instanceof Api.Photo) {
+        const photo = msg.media.photo;
+        docId = photo.id ? photo.id.toString() : null;
+        const largest = photo.sizes.reduce((prev: any, current: any) => {
+            const prevSize = prev.size || (prev.sizes && prev.sizes[0]) || 0;
+            const curSize = current.size || (current.sizes && current.sizes[0]) || 0;
+            return (curSize > prevSize) ? current : prev;
+        });
+        if (largest && (largest as any).size) size = (largest as any).size;
+        name = "photo.jpg";
+    }
+    
+    if (docId) {
+        return `doc_id_${docId}`;
+    }
+    if (size > 0) {
+        return `size_name_${size}_${name}`;
+    }
+    return null;
+}
+
+async function getOrCreateCachedFilesTopicId(client: any): Promise<number | undefined> {
+    if (globalCachedFilesTopicId !== null) {
+        return globalCachedFilesTopicId === -1 ? undefined : globalCachedFilesTopicId;
+    }
+    
+    if (settingsCollection) {
+        try {
+            const doc = await settingsCollection.findOne({ type: 'cached_files_topic' });
+            if (doc && doc.topicId !== undefined && doc.topicId !== null) {
+                globalCachedFilesTopicId = Number(doc.topicId);
+                return globalCachedFilesTopicId === -1 ? undefined : globalCachedFilesTopicId;
+            }
+        } catch (e) {
+            console.warn("[CacheLog] Error reading cached topic from DB:", e);
+        }
+    }
+    
+    try {
+        const logPeer = await safelyResolveEntity(client, DEFAULT_LOG_GROUP);
+        if (logPeer) {
+            console.log("[CacheLog] Creating Saved Files Cache topic in DEFAULT_LOG_GROUP...");
+            const result = await client.invoke(new Api.channels.CreateForumTopic({
+                channel: logPeer,
+                title: "📁 Saved Files Cache",
+                randomId: helpers.generateRandomLong(true)
+            }));
+            
+            let topicId: number | undefined;
+            if (result && result.updates) {
+                for (const update of result.updates) {
+                    if (update instanceof Api.UpdateNewMessage && update.message && (update.message as any).id) {
+                        topicId = (update.message as any).id;
+                        break;
+                    }
+                }
+            }
+            if (!topicId && result && result.updates) {
+                for (const update of result.updates) {
+                    if (update instanceof Api.UpdateMessageID && update.id) {
+                        topicId = update.id;
+                        break;
+                    }
+                }
+            }
+            if (topicId) {
+                globalCachedFilesTopicId = topicId;
+                if (settingsCollection) {
+                    await settingsCollection.updateOne(
+                        { type: 'cached_files_topic' },
+                        { $set: { topicId } },
+                        { upsert: true }
+                    ).catch(() => {});
+                }
+                console.log(`[CacheLog] Created new topic "📁 Saved Files Cache" with ThreadID: ${topicId}`);
+                return topicId;
+            }
+        }
+    } catch (e: any) {
+        const errStr = String(e?.message || e);
+        console.log(`[CacheLog] Log Group does not support forum topics (${errStr}). Falling back to main group directly.`);
+        globalCachedFilesTopicId = -1;
+        if (settingsCollection) {
+            await settingsCollection.updateOne(
+                { type: 'cached_files_topic' },
+                { $set: { topicId: -1 } },
+                { upsert: true }
+            ).catch(() => {});
+        }
+    }
+    return undefined;
+}
+
 async function resumeDownloadFile(
     client: any,
     msg: any,
@@ -358,33 +467,33 @@ async function resumeDownloadFile(
         } catch (e) {}
     }
 
-    let downloadWorkers = 1;
-    if (totalSize > 500 * 1024 * 1024) {
-        downloadWorkers = 4; // > 500 MB gets 4 workers max
-    } else if (totalSize > 100 * 1024 * 1024) {
-        downloadWorkers = 3;
-    } else if (totalSize > 20 * 1024 * 1024) {
+    let downloadWorkers = 4;
+    let partSizeKb = 512;
+
+    if (totalSize > 500 * 1024 * 1024) { // > 500 MB
+        downloadWorkers = 8;
+    } else if (totalSize > 100 * 1024 * 1024) { // > 100 MB
+        downloadWorkers = 6;
+    } else if (totalSize > 10 * 1024 * 1024) { // > 10 MB
+        downloadWorkers = 4;
+    } else {
         downloadWorkers = 2;
     }
 
     let lastProgressTime = Date.now();
     const DOWNLOAD_STALL_TIMEOUT = 180000;
-
-    let stallInterval: NodeJS.Timeout | null = null;
     let isFinished = false;
 
+    let stallInterval: NodeJS.Timeout | null = null;
     try {
         const downloadPromise = client.downloadMedia(msg, {
             outputFile: tempFilePath,
             workers: downloadWorkers,
+            partSizeKb: partSizeKb,
             progressCallback: async (downloaded: any, total: any) => {
                 const taskState = taskControlMap.get(jobKey);
-                if (taskState && taskState.isPaused) {
-                    throw new Error("DOWNLOAD_PAUSED");
-                }
-                if (taskState && taskState.isSkipped) {
-                    throw new Error("DOWNLOAD_SKIPPED");
-                }
+                if (taskState && taskState.isPaused) throw new Error("DOWNLOAD_PAUSED");
+                if (taskState && taskState.isSkipped) throw new Error("DOWNLOAD_SKIPPED");
                 
                 lastProgressTime = Date.now();
                 await onProgress(Number(downloaded), Number(total || totalSize || 0));
@@ -398,33 +507,21 @@ async function resumeDownloadFile(
                     return;
                 }
                 const taskState = taskControlMap.get(jobKey);
-                
-                if (taskState && taskState.isSkipped) {
-                    if (stallInterval) clearInterval(stallInterval);
-                    reject(new Error("DOWNLOAD_SKIPPED"));
-                    return;
-                }
-                
-                // If paused, don't count towards stall timeout
+                if (taskState && taskState.isSkipped) return reject(new Error("DOWNLOAD_SKIPPED"));
                 if (taskState && taskState.isPaused) {
                     lastProgressTime = Date.now();
                     return;
                 }
-                
                 if (Date.now() - lastProgressTime > DOWNLOAD_STALL_TIMEOUT) {
-                    if (stallInterval) clearInterval(stallInterval);
-                    console.warn(`[Download monitor] Stall detected! No chunk received for ${DOWNLOAD_STALL_TIMEOUT}ms. Rejecting download...`);
-                    reject(new Error("DOWNLOAD_TIMEOUT_STALLED"));
+                    return reject(new Error("DOWNLOAD_TIMEOUT_STALLED"));
                 }
-            }, 5000); // Check every 5 seconds
+            }, 5000);
         });
 
         await Promise.race([downloadPromise, monitorPromise]);
         isFinished = true;
     } finally {
-        if (stallInterval) {
-            clearInterval(stallInterval);
-        }
+        if (stallInterval) clearInterval(stallInterval);
     }
 }
 
@@ -536,6 +633,8 @@ const safeBotCall = async (method: string, ...args: any[]) => {
                                      msgLower.includes("there is no text in the message") ||
                                      msgLower.includes("message can't be edited") ||
                                      msgLower.includes("chat not found") ||
+                                     msgLower.includes("message to delete not found") ||
+                                     msgLower.includes("inline keyboard expected") ||
                                      msgLower.includes("message to edit not found");
             
             if (!isExpectedSilent) {
@@ -1348,7 +1447,7 @@ async function safelyResolveFullEntity(client: TelegramClient, entity: any): Pro
 const adminActiveSession = new Map<number, number>(); // adminTelegramId -> activeUserbotUserId
 
 const userActionStates: Record<number, { 
-    type: 'batch_start' | 'batch_end' | 'mirror_target' | 'set_thumb' | 'set_cap' | 'set_path' | 'mirror_choice' | 'set_mirror_source' | 'enter_topic_id' | 'mirror_path_add_source' | 'mirror_path_await_dest' | 'topic_clone_group' | 'topic_clone_topic_id' | 'add_rename_rule' | 'set_api_id' | 'set_api_hash' | 'full_mirror_group' | 'full_mirror_dest_select' | 'live_mirror_dest_select' | 'set_cooldown_secs' | 'set_concurrency_val' | 'topic_clone_dest_select' | 'enter_clone_dest_id' | 'set_jump_to_path' | 'add_blocked_topic', 
+    type: 'batch_start' | 'batch_end' | 'mirror_target' | 'set_thumb' | 'set_cap' | 'set_path' | 'mirror_choice' | 'set_mirror_source' | 'enter_topic_id' | 'mirror_path_add_source' | 'mirror_path_await_dest' | 'topic_clone_group' | 'topic_clone_topic_id' | 'add_rename_rule' | 'set_api_id' | 'set_api_hash' | 'full_mirror_group' | 'full_mirror_dest_select' | 'live_mirror_dest_select' | 'set_cooldown_secs' | 'set_concurrency_val' | 'topic_clone_dest_select' | 'enter_clone_dest_id' | 'set_jump_to_path' | 'add_blocked_topic' | 'enter_manual_specific_topic', 
     startLink?: string,
     mirrorTarget?: any,
     pendingMirrorDest?: string,
@@ -1356,7 +1455,8 @@ const userActionStates: Record<number, {
     pendingSourceId?: string,
     pendingSourceName?: string,
     cloneSourceGroupId?: string,
-    pendingCloneDest?: string
+    pendingCloneDest?: string,
+    pendingSourceIdForDirectClone?: string
 }> = {};
 
 // User Sessions Management and watchdog
@@ -1439,6 +1539,7 @@ if (mongoUri) {
       queuedTasksCollection = db.collection('queued_tasks');
       failedTasksCollection = db.collection('failed_tasks');
       fullMirrorSessionsCollection = db.collection('full_mirror_sessions');
+      fileCacheCollection = db.collection('file_cache');
 
       // Load approved users into cache
       const users = await approvedUsersCollection.find({}).toArray();
@@ -1457,7 +1558,7 @@ if (mongoUri) {
 
       // Load persistent queued tasks
       try {
-          const dbTasks = await queuedTasksCollection.find({}).sort({ createdAt: 1 }).toArray();
+          const dbTasks = await queuedTasksCollection.find({}).sort({ createdAt: 1, _id: 1 }).toArray();
           if (dbTasks && dbTasks.length > 0) {
               console.log(`[Init] Found ${dbTasks.length} queued tasks in DB. Restoring to task queue...`);
               for (const dbTask of dbTasks) {
@@ -1655,6 +1756,9 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
       client?: TelegramClient;
       resolvePhoneCode?: (code: string) => void;
       resolvePassword?: (password: string) => void;
+      hasErrorOtp?: boolean;
+      hasError2Fa?: boolean;
+      lastErrorMsg?: string;
     }> = {};
 
     if (token) {
@@ -1685,8 +1789,29 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
         });
 
         // Security Interceptor to ignore all non-admin messages globally
+        const globalProcessedUpdateKeys = new Set<string>();
+
         const originalProcessUpdate = bot.processUpdate.bind(bot);
         bot.processUpdate = (update: TelegramBot.Update) => {
+            // Deduplicate at the root level for ALL incoming updates (commands, callbacks, etc.)
+            let updateKey = '';
+            if (update.message) {
+                updateKey = `msg_${update.message.chat.id}_${update.message.message_id}`;
+            } else if (update.callback_query) {
+                updateKey = `cbq_${update.callback_query.id}`;
+            }
+            
+            if (updateKey) {
+                if (globalProcessedUpdateKeys.has(updateKey)) {
+                    console.log(`[Deduplicator] Ignored duplicate update globally for key: ${updateKey}`);
+                    return;
+                }
+                globalProcessedUpdateKeys.add(updateKey);
+                setTimeout(() => {
+                    globalProcessedUpdateKeys.delete(updateKey);
+                }, 5 * 60 * 1000);
+            }
+
             const fromId = update.message?.from?.id || update.callback_query?.from?.id;
             // Ignore if fromId is present but they are not an admin
             if (fromId && !isAdmin(fromId)) {
@@ -1697,15 +1822,17 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
 
         // Commands List for Bot Menu
         bot.setMyCommands([
-          { command: 'start', description: 'Start the bot' },
-          { command: 'batch', description: 'Download multiple links' },
-          { command: 'settings', description: 'Show bot settings' },
-          { command: 'cancel', description: 'Stop current task' },
-          { command: 'jumptopath', description: 'Directly set upload destination ID/Username' },
-          { command: 'setpath', description: 'Set upload destination Topic/Group' },
-          { command: 'setmirror', description: 'Configure a new auto-mirror path' },
-          { command: 'mirror', description: 'Clone group/topic content' },
-          { command: 'ping', description: 'Check bot latency' },
+          { command: 'start', description: '🚀 Start the bot' },
+          { command: 'batch', description: '📥 Download multiple links' },
+          { command: 'forward', description: '⏩ Forward messages in batch' },
+          { command: 'settings', description: '⚙️ Show bot settings' },
+          { command: 'cancel', description: '🛑 Stop current task' },
+          { command: 'jumptopath', description: '📍 Set upload destination ID' },
+          { command: 'setpath', description: '📂 Set upload destination' },
+          { command: 'setspecifictopic', description: '📌 Save destination topic' },
+          { command: 'setmirror', description: '🔗 Configure auto-mirror' },
+          { command: 'mirror', description: '🔄 Clone group/topic content' },
+          { command: 'ping', description: '⏱ Check bot latency' },
           { command: 'status', description: 'Show queue and database status' },
           { command: 'login', description: 'Log in with Telegram credentials' },
           { command: 'logout', description: 'Revoke session and clear data' },
@@ -2224,6 +2351,18 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
         }
     };
 
+    const handleForward = async (chatId: number, fromId: number | undefined) => {
+      try {
+        if (!isAdmin(fromId) || !fromId) throw new Error("Restricted: Admin access required.");
+        
+        userActionStates[fromId] = { type: 'forward_start_link' };
+        
+        safeSendMessage(chatId, "🚀 **Batch Forward Started**\n\nSend the **Starting Link** now.");
+      } catch (err: any) {
+        safeSendMessage(chatId, `❌ **Error:** ${err.message}`);
+      }
+    };
+
     const handleBatch = async (chatId: number, fromId: number | undefined, messageId?: number) => {
       try {
         if (!isAdmin(fromId) || !fromId) throw new Error("Restricted: Admin access required.");
@@ -2243,6 +2382,49 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
       } catch (err: any) {
         safeSendMessage(chatId, `❌ **Error:** ${err.message}`);
       }
+    };
+
+    const handleBatchForward = async (chatId: number, fromId: number, startLink: string, endLink: string) => {
+        const parseLink = (link: string) => {
+            const match = link.match(/t\.me\/(?:c\/)?([a-zA-Z0-9_-]+)\/(\d+)/i);
+            if (!match) throw new Error("Invalid link format");
+            let chatId = match[1];
+            if (/^\d+$/.test(chatId)) chatId = '-100' + chatId;
+            return { chatId, msgId: parseInt(match[2]) };
+        };
+
+        const start = parseLink(startLink);
+        const end = parseLink(endLink);
+        
+        if (start.chatId !== end.chatId) throw new Error("Links must be from the same chat");
+        
+        const contextUid = Number(await resolveSettingsUserId(fromId));
+        const client = await getConnectedUserbotClient(contextUid);
+        if (!client) throw new Error("Userbot Session Required.");
+        
+        const userDoc = await approvedUsersCollection.findOne({ userId: contextUid.toString() });
+        const destChatId = userDoc?.uploadPath;
+        if (!destChatId) throw new Error("Destination path not set. Use /setpath");
+        
+        for (let i = start.msgId; i <= end.msgId; i++) {
+            try {
+                await client.forwardMessages(destChatId, {
+                    messages: [i],
+                    fromPeer: start.chatId,
+                    dropAuthor: true 
+                });
+            } catch (e: any) {
+                if (e.seconds) {
+                    console.log(`[FloodWait] Waiting ${e.seconds} seconds.`);
+                    await new Promise(r => setTimeout(r, (e.seconds + 1) * 1000));
+                    i--; // Retry this message
+                } else {
+                    console.log(`[Individual Forward Error] Msg ${i} failed: ${e.message}`);
+                }
+            }
+            await new Promise(r => setTimeout(r, 600));
+        }
+        safeSendMessage(chatId, "✅ **Batch Forward Complete!**");
     };
 
     const handleMirror = async (chatId: number, fromId: number | undefined, messageId?: number) => {
@@ -2287,6 +2469,10 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
         handleStartMessage(msg);
     });
 
+    bot.onText(/\/forward/, (msg) => {
+        handleForward(msg.chat.id, msg.from?.id);
+    });
+
     if (!(bot as any)._isPatchedForAnswer) {
         const originalAnswer = bot.answerCallbackQuery.bind(bot);
         (bot as any).answerCallbackQuery = async function(...args: any[]) {
@@ -2325,6 +2511,205 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
       );
       if (!needsCustomAlert && isAdmin(query.from.id)) {
           bot?.answerCallbackQuery(query.id).catch(() => {});
+      }
+
+      if (query.data?.startsWith('clonesource_direct_')) {
+          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+          const sourceId = query.data.replace('clonesource_direct_', '');
+          
+          const settingsUid = await resolveSettingsUserId(query.from.id);
+          const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
+          const savedDestinations = userDoc?.savedDestinations || [];
+          
+          if (savedDestinations.length === 0) {
+              return bot?.answerCallbackQuery(query.id, { text: '❌ No Saved Destinations. Use /setmirror in target group first.', show_alert: true });
+          }
+          
+          userActionStates[query.from.id] = { 
+              type: 'topic_clone_dest_select',
+              pendingSourceIdForDirectClone: sourceId 
+          };
+          
+          const uniqueDestinations: { dest: any, originalIndex: number }[] = [];
+          const seen = new Set();
+          savedDestinations.forEach((d: any, originalIndex: number) => {
+              if (d && d.destId && !seen.has(d.destId)) {
+                  seen.add(d.destId);
+                  uniqueDestinations.push({ dest: d, originalIndex });
+              }
+          });
+          const kb = uniqueDestinations.map((item) => {
+              return [
+                  { text: item.dest.groupName + (item.dest.destThreadId ? ` (Topic ${item.dest.destThreadId})` : ''), callback_data: `tc_dest_direct_${item.originalIndex}` }
+              ];
+          });
+          kb.push([{ text: '🔙 Back', callback_data: 'start_back' }]);
+          kb.push([{ text: '➕ Enter New Group ID', callback_data: 'clonedest_new' }]);
+          
+          await safeEditMessage(`🔗 **Source Selected!**\n\nNow select the **Destination Group** to clone to:`, {
+              chat_id: chatId,
+              message_id: query.message!.message_id,
+              reply_markup: { inline_keyboard: kb }
+          });
+          bot?.answerCallbackQuery(query.id).catch(() => {});
+          return;
+      }
+
+      if (query.data?.startsWith('tc_dest_direct_')) {
+          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+          const state = userActionStates[query.from.id];
+          if (!state || state.type !== 'topic_clone_dest_select' || !state.pendingSourceIdForDirectClone) {
+              return bot?.answerCallbackQuery(query.id, { text: '❌ Session expired.', show_alert: true });
+          }
+          
+          const idx = parseInt(query.data.split('_')[3]);
+          const settingsUid = await resolveSettingsUserId(query.from.id);
+          const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
+          const dest = (userDoc?.savedDestinations || [])[idx];
+          if (!dest) {
+              return bot?.answerCallbackQuery(query.id, { text: '❌ Destination not found.', show_alert: true });
+          }
+          
+          const sourceId = state.pendingSourceIdForDirectClone;
+          state.type = 'topic_clone_topic_id';
+          state.cloneSourceGroupId = sourceId;
+          state.pendingCloneDest = dest.destId;
+          
+          await saveRecentDestination(query.from.id, dest.destId, dest.groupName);
+          
+          await safeEditMessage(`✅ **Destination Selected: ${dest.groupName}**\n\n📌 Please enter the **Topic ID** of the topic you want to clone now.`, {
+              chat_id: chatId,
+              message_id: query.message!.message_id,
+              reply_markup: { force_reply: true }
+          });
+          bot?.answerCallbackQuery(query.id).catch(() => {});
+          return;
+      }
+
+      if (query.data?.startsWith('mirrorsource_direct_')) {
+          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+          const sourceId = query.data.replace('mirrorsource_direct_', '');
+          
+          let groupName = sourceId;
+          try {
+              const tgClient = await getConnectedUserbotClient(query.from.id);
+              const entity = await tgClient.getEntity(sourceId);
+              groupName = (entity as any).title || groupName;
+          } catch(e) { console.error("Error resolving source name", e); }
+          
+          await saveRecentSource(query.from.id, sourceId, groupName);
+          
+          const settingsUid = await resolveSettingsUserId(query.from.id);
+          const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
+          const savedDestinations = userDoc?.savedDestinations || [];
+          
+          if (savedDestinations.length === 0) {
+              return bot?.answerCallbackQuery(query.id, { text: '❌ No Saved Destinations. Use /setmirror in target group first.', show_alert: true });
+          }
+          
+          userActionStates[query.from.id] = { 
+              type: 'live_mirror_dest_select',
+              pendingSourceId: sourceId,
+              pendingSourceName: groupName
+          };
+          
+          const uniqueDestinations: { dest: any, originalIndex: number }[] = [];
+          const seen = new Set();
+          savedDestinations.forEach((d: any, originalIndex: number) => {
+              if (d && d.destId && !seen.has(d.destId)) {
+                  seen.add(d.destId);
+                  uniqueDestinations.push({ dest: d, originalIndex });
+              }
+          });
+          const kb = uniqueDestinations.map((item) => {
+              return [
+                  { text: item.dest.groupName + (item.dest.destThreadId ? ` (Topic ${item.dest.destThreadId})` : ''), callback_data: `lm_dest_${item.originalIndex}` },
+                  { text: '🗑', callback_data: `del_saved_dest:${item.originalIndex}` }
+              ];
+          });
+          kb.push([{ text: '🔙 Back', callback_data: 'start_back' }]);
+          
+          await safeEditMessage(`✅ **Source Selected: ${groupName}**\n\n**Select Destination Group for Live Mirror:**`, {
+              chat_id: chatId,
+              message_id: query.message!.message_id,
+              reply_markup: { inline_keyboard: kb }
+          });
+          bot?.answerCallbackQuery(query.id).catch(() => {});
+          return;
+      }
+
+      if (query.data?.startsWith('fullmirror_direct_')) {
+          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+          const sourceId = query.data.replace('fullmirror_direct_', '');
+          
+          let groupName = sourceId;
+          try {
+              const tgClient = await getConnectedUserbotClient(query.from.id);
+              const entity = await tgClient.getEntity(sourceId);
+              groupName = (entity as any).title || groupName;
+          } catch(e) { console.error("Error resolving source name", e); }
+          
+          await saveRecentSource(query.from.id, sourceId, groupName);
+          
+          const settingsUid = await resolveSettingsUserId(query.from.id);
+          const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
+          const savedDestinations = userDoc?.savedDestinations || [];
+          
+          if (savedDestinations.length === 0) {
+              return bot?.answerCallbackQuery(query.id, { text: '❌ No Saved Destinations. Use /setmirror in target group first.', show_alert: true });
+          }
+          
+          userActionStates[query.from.id] = { 
+              type: 'full_mirror_dest_select',
+              pendingSourceId: sourceId,
+              pendingSourceName: groupName
+          };
+          
+          const uniqueDestinations: { dest: any, originalIndex: number }[] = [];
+          const seen = new Set();
+          savedDestinations.forEach((d: any, originalIndex: number) => {
+              if (d && d.destId && !seen.has(d.destId)) {
+                  seen.add(d.destId);
+                  uniqueDestinations.push({ dest: d, originalIndex });
+              }
+          });
+          const kb = uniqueDestinations.map((item) => {
+              return [
+                  { text: item.dest.groupName + (item.dest.destThreadId ? ` (Topic ${item.dest.destThreadId})` : ''), callback_data: `fm_dest_${item.originalIndex}` },
+                  { text: '🗑', callback_data: `del_saved_dest:${item.originalIndex}` }
+              ];
+          });
+          kb.push([{ text: '🔙 Back', callback_data: 'start_back' }]);
+          
+          await safeEditMessage(`✅ **Source Selected: ${groupName}**\n\n**Select Destination Group for Full Mirror:**`, {
+              chat_id: chatId,
+              message_id: query.message!.message_id,
+              reply_markup: { inline_keyboard: kb }
+          });
+          bot?.answerCallbackQuery(query.id).catch(() => {});
+          return;
+      }
+
+      if (query.data === 'clonesource_new') {
+          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+          userActionStates[query.from.id] = { type: 'set_source_id' };
+          await safeEditMessage(`➕ **Enter New Source ID**\n\nPlease send the **Source ID** (e.g., \`-100xxxxxxxxxx\` or \`@channelname\`).`, {
+              chat_id: chatId,
+              message_id: query.message!.message_id
+          });
+          bot?.answerCallbackQuery(query.id).catch(() => {});
+          return;
+      }
+
+      if (query.data === 'clonedest_new') {
+          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+          userActionStates[query.from.id] = { type: 'set_dest_id' };
+          await safeEditMessage(`➕ **Enter New Destination ID**\n\nPlease send the **Destination ID** (e.g., \`-100xxxxxxxxxx\` or \`@channelname\`).`, {
+              chat_id: chatId,
+              message_id: query.message!.message_id
+          });
+          bot?.answerCallbackQuery(query.id).catch(() => {});
+          return;
       }
 
       if (query.data === 'request_access') {
@@ -2421,6 +2806,55 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
           
           state.type = 'mirror_path_add_source';
           await safeEditMessage(`🔗 **Destination Selected: ${groupName}**\n\nNow send the **Source Group Link/ID** to mirror from:`, {
+              chat_id: chatId,
+              message_id: query.message!.message_id,
+              reply_markup: { force_reply: true }
+          });
+      }
+      bot?.answerCallbackQuery(query.id);
+      return;
+  }
+
+  // Handle interactive topic clone destination registered selection
+  if (query.data?.startsWith('tc_dest_')) {
+      if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+      const state = userActionStates[query.from.id];
+      if (!state || state.type !== 'topic_clone_dest_select') {
+          return bot?.answerCallbackQuery(query.id, { text: '❌ Session expired.', show_alert: true });
+      }
+
+      const idx = parseInt(query.data.split('_')[2]);
+      const settingsUid = await resolveSettingsUserId(query.from.id);
+      const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
+      const dest = (userDoc?.savedDestinations || [])[idx];
+      if (!dest) {
+          return bot?.answerCallbackQuery(query.id, { text: '❌ Destination not found.', show_alert: true });
+      }
+
+      // Direct selection: dest.destId is the ID
+      state.pendingCloneDest = dest.destId;
+      
+      let groupName = dest.groupName;
+      await saveRecentDestination(query.from.id, dest.destId, groupName);
+      
+      const recentSources = userDoc?.recentSources || [];
+      let kb: any[] = [];
+      if (recentSources.length > 0) {
+          recentSources.forEach((s: any) => {
+              kb.push([{ text: `📥 ${s.sourceName}`, callback_data: `clonesource_${s.sourceId}` }]);
+          });
+          kb.push([{ text: `➕ Enter New Source ID`, callback_data: `clonesource_new` }]);
+      }
+      
+      state.type = 'topic_clone_group';
+      if (kb.length > 0) {
+          await safeEditMessage(`🔗 **Destination Selected: ${groupName}**\n\n2. Select or enter the **Source Group** to clone from:`, {
+              chat_id: chatId,
+              message_id: query.message!.message_id,
+              reply_markup: { inline_keyboard: kb }
+          });
+      } else {
+          await safeEditMessage(`🔗 **Destination Selected: ${groupName}**\n\n2. Now send the **Source Group Link/ID** to clone from:`, {
               chat_id: chatId,
               message_id: query.message!.message_id,
               reply_markup: { force_reply: true }
@@ -2557,14 +2991,21 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
           }
 
           state.type = 'live_mirror_dest_select';
-          const uniqueDestinations = [...new Map(savedDestinations.map((d: any) => [d.destId, d])).values()];
-          const kb = uniqueDestinations.map((d: any, idx: number) => {
+          const uniqueDestinations: { dest: any, originalIndex: number }[] = [];
+          const seen = new Set();
+          savedDestinations.forEach((d: any, originalIndex: number) => {
+              if (d && d.destId && !seen.has(d.destId)) {
+                  seen.add(d.destId);
+                  uniqueDestinations.push({ dest: d, originalIndex });
+              }
+          });
+          const kb = uniqueDestinations.map((item) => {
               return [
-                  { text: d.groupName + (d.destThreadId ? ` (Topic ${d.destThreadId})` : ''), callback_data: `lm_dest_${idx}` },
-                  { text: '🗑', callback_data: `del_saved_dest:${idx}` }
+                  { text: item.dest.groupName + (item.dest.destThreadId ? ` (Topic ${item.dest.destThreadId})` : ''), callback_data: `lm_dest_${item.originalIndex}` },
+                  { text: '🗑', callback_data: `del_saved_dest:${item.originalIndex}` }
               ];
           });
-          kb.push([{ text: '❌ Cancel', callback_data: 'start_back' }]);
+          kb.push([{ text: '🔙 Back', callback_data: 'start_back' }]);
 
           await safeEditMessage(`✅ **Source Selected: ${groupName}**\n\n**Select Destination Group for Live Mirror:**`, {
               chat_id: chatId,
@@ -2912,15 +3353,38 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
           
           const settingsUid = await resolveSettingsUserId(query.from.id);
           const userDoc = await approvedUsersCollection.findOne({ userId: settingsUid });
-          const recent = userDoc?.recentDestinations || [];
+          const savedDestinations = userDoc?.savedDestinations || [];
           
-          let keyboard: any[] = [];
-          recent.forEach((r: any) => {
-              keyboard.push([{ text: `📂 ${r.groupName}`, callback_data: `clonedest_${r.destId}` }]);
+          if (savedDestinations.length === 0) {
+              delete userActionStates[query.from.id];
+              return safeEditMessage("❌ **No Saved Destinations.**\nPlease add a destination by going to your destination group and typing `/setspecifictopic` or `/setmirror` first.", {
+                  chat_id: chatId,
+                  message_id: query.message!.message_id,
+                  reply_markup: {
+                      inline_keyboard: [[{ text: '⬅️ Back to Menu', callback_data: 'mirror_cmd' }]]
+                  }
+              });
+          }
+
+          // Deduplicate based on destId for display but remember the original indices
+          const uniqueDestinations: { dest: any, originalIndex: number }[] = [];
+          const seen = new Set();
+          savedDestinations.forEach((d: any, originalIndex: number) => {
+              if (d && d.destId && !seen.has(d.destId)) {
+                  seen.add(d.destId);
+                  uniqueDestinations.push({ dest: d, originalIndex });
+              }
           });
-          keyboard.push([{ text: `➕ Enter New Group ID`, callback_data: `clonedest_new` }]);
+          const kb = uniqueDestinations.map((item) => {
+              return [
+                  { text: item.dest.groupName + (item.dest.destThreadId ? ` (Topic ${item.dest.destThreadId})` : ''), callback_data: `tc_dest_${item.originalIndex}` },
+                  { text: '🗑', callback_data: `del_saved_dest:${item.originalIndex}` }
+              ];
+          });
+          kb.push([{ text: '➕ Enter New Group ID', callback_data: `clonedest_new` }]);
+          kb.push([{ text: '❌ Cancel', callback_data: 'mirror_cmd' }]);
           
-          safeEditMessage("🎯 **Clone Specific Topic**\n\n1. Select Destination Group:", { chat_id: chatId, message_id: query.message!.message_id, reply_markup: { inline_keyboard: keyboard } });
+          safeEditMessage("🎯 **Clone Specific Topic**\n\n1. Select Destination Group:", { chat_id: chatId, message_id: query.message!.message_id, reply_markup: { inline_keyboard: kb } });
           bot?.answerCallbackQuery(query.id);
           return;
       }
@@ -3693,12 +4157,147 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
 
       if (query.data === 'set_path_cmd') {
           if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+          const settingsUid = await resolveSettingsUserId(query.from.id);
+          const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
+          const savedDestinations = userDoc?.savedDestinations || [];
+
+          const text = `📍 **𝗨𝗽𝗹𝗼𝗮𝗱 𝗗𝗲𝘀𝘁𝗶𝗻𝗮𝘁𝗶𝗼𝗻 𝗦𝗲𝘁𝘁𝗶𝗻𝗴𝘀**\n\n` +
+                       `Current active destination: \`${userDoc?.uploadGroupName || userDoc?.uploadPath || 'Log Group'}\`\n\n` +
+                       `Choose an option below:\n\n` +
+                       `• **Select saved destination:** Pick from previously saved group list with group name.\n` +
+                       `• **Input new destination:** Forward a message or send a Telegram link to register a new path.`;
+
+          const markup = {
+              inline_keyboard: [
+                  [
+                      { text: `📋 Saved Destinations (${savedDestinations.length})`, callback_data: 'list_saved_dests_cmd' }
+                  ],
+                  [
+                      { text: '✏️ Input New Destination', callback_data: 'input_new_path_cmd' }
+                  ],
+                  [
+                      { text: '⬅️ Back to Settings', callback_data: 'bot_settings' }
+                  ]
+              ]
+          };
+
+          await safeEditMessage(text, { chat_id: chatId, message_id: query.message!.message_id, parse_mode: 'Markdown', reply_markup: markup });
+          bot?.answerCallbackQuery(query.id);
+          return;
+      }
+
+      if (query.data === 'input_new_path_cmd') {
+          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
           userActionStates[query.from.id] = { type: 'set_path' };
           safeSendMessage(chatId, "📍 **Set Custom Destination**\n\nPlease forward any message from target **Group/Channel** here, or send its **Public Link**.\n\n_Bot will upload files to this location instead of your private DM._", { 
               parse_mode: 'Markdown',
               reply_markup: { force_reply: true }
           });
           bot?.answerCallbackQuery(query.id);
+          return;
+      }
+
+      if (query.data === 'list_saved_dests_cmd') {
+          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+          const settingsUid = await resolveSettingsUserId(query.from.id);
+          const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
+          const savedDestinations = userDoc?.savedDestinations || [];
+
+          let text = `📋 **𝗦𝗮𝘃𝗲𝗱 𝗨𝗽𝗹𝗼𝗮𝗱 𝗗𝗲𝘀𝘁𝗶𝗻𝗮𝘁𝗶𝗼𝗻𝘀**\n\n` +
+                     `Select any target group below to make it your **Active Upload Destination**:\n\n`;
+
+          const markup: any = { inline_keyboard: [] };
+          if (savedDestinations.length === 0) {
+              text += `_No saved destinations found. Use /setspecifictopic or /setmirror in any group to save it first._`;
+          } else {
+              // De-duplicate if needed
+              const uniqueDestinations = [...new Map(savedDestinations.map((d: any) => [`${d.destId}_${d.destThreadId || ''}`, d])).values()];
+              uniqueDestinations.forEach((d: any, idx: number) => {
+                  const label = `${d.groupName}${d.destThreadId ? ` (Topic ${d.destThreadId})` : ''}`;
+                  text += `• **${label}** (\`${d.destId}\`)\n`;
+                  markup.inline_keyboard.push([
+                      { text: `🎯 Set ${d.groupName}`, callback_data: `set_active_dest_idx:${idx}` },
+                      { text: '🗑️ Delete', callback_data: `del_saved_dest_from_list:${idx}` }
+                  ]);
+              });
+          }
+
+          markup.inline_keyboard.push([{ text: '⬅️ Back', callback_data: 'set_path_cmd' }]);
+
+          await safeEditMessage(text, { chat_id: chatId, message_id: query.message!.message_id, parse_mode: 'Markdown', reply_markup: markup });
+          bot?.answerCallbackQuery(query.id);
+          return;
+      }
+
+      if (query.data?.startsWith('set_active_dest_idx:')) {
+          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+          const idx = parseInt(query.data.split(':')[1]);
+          const settingsUid = await resolveSettingsUserId(query.from.id);
+          const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
+          const savedDestinations = userDoc?.savedDestinations || [];
+          const dest = savedDestinations[idx];
+
+          if (dest) {
+              const adminIdStr = query.from.id.toString();
+              const update = { 
+                  $set: { 
+                      uploadPath: dest.destId, 
+                      uploadGroupName: dest.groupName, 
+                      uploadTopicId: dest.destThreadId || null, 
+                      uploadTopicName: dest.destThreadId ? `Topic ${dest.destThreadId}` : '' 
+                  } 
+              };
+              if (approvedUsersCollection) {
+                  await approvedUsersCollection.updateOne({ userId: adminIdStr }, update);
+                  if (settingsUid !== adminIdStr) {
+                      await approvedUsersCollection.updateOne({ userId: settingsUid }, update);
+                  }
+              }
+              bot?.answerCallbackQuery(query.id, { text: `🎯 Active path set to: ${dest.groupName}`, show_alert: true });
+              
+              // Go back to Settings
+              handleSettings(chatId, query.from?.id, query.message!.message_id);
+          } else {
+              bot?.answerCallbackQuery(query.id, { text: '❌ Destination not found.', show_alert: true });
+          }
+          return;
+      }
+
+      if (query.data?.startsWith('del_saved_dest_from_list:')) {
+          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+          const index = parseInt(query.data.split(':')[1]);
+          const settingsUid = await resolveSettingsUserId(query.from.id);
+          const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
+          const savedDestinations = userDoc?.savedDestinations || [];
+          
+          if (savedDestinations[index]) {
+              savedDestinations.splice(index, 1);
+              await approvedUsersCollection?.updateOne({ userId: settingsUid }, { $set: { savedDestinations: savedDestinations } });
+              bot?.answerCallbackQuery(query.id, { text: '✅ Destination Deleted', show_alert: true });
+              
+              let text = `📋 **𝗦𝗮𝘃𝗲𝗱 𝗨𝗽𝗹𝗼𝗮𝗱 𝗗𝗲𝘀𝘁𝗶𝗻𝗮𝘁𝗶𝗼𝗻𝘀**\n\n` +
+                         `Select any target group below to make it your **Active Upload Destination**:\n\n`;
+
+              const markup: any = { inline_keyboard: [] };
+              if (savedDestinations.length === 0) {
+                  markup.inline_keyboard.push([{ text: '⬅️ Back', callback_data: 'set_path_cmd' }]);
+                  await safeEditMessage(text + `_No saved destinations found. Use /setspecifictopic or /setmirror in any group to save it first._`, { chat_id: chatId, message_id: query.message!.message_id, parse_mode: 'Markdown', reply_markup: markup });
+              } else {
+                  const uniqueDestinations = [...new Map(savedDestinations.map((d: any) => [`${d.destId}_${d.destThreadId || ''}`, d])).values()];
+                  uniqueDestinations.forEach((d: any, idx: number) => {
+                      const label = `${d.groupName}${d.destThreadId ? ` (Topic ${d.destThreadId})` : ''}`;
+                      text += `• **${label}** (\`${d.destId}\`)\n`;
+                      markup.inline_keyboard.push([
+                          { text: `🎯 Set ${d.groupName}`, callback_data: `set_active_dest_idx:${idx}` },
+                          { text: '🗑️ Delete', callback_data: `del_saved_dest_from_list:${idx}` }
+                      ]);
+                  });
+                  markup.inline_keyboard.push([{ text: '⬅️ Back', callback_data: 'set_path_cmd' }]);
+                  await safeEditMessage(text, { chat_id: chatId, message_id: query.message!.message_id, parse_mode: 'Markdown', reply_markup: markup });
+              }
+          } else {
+              bot?.answerCallbackQuery(query.id, { text: '❌ Destination not found', show_alert: true });
+          }
           return;
       }
 
@@ -4073,8 +4672,80 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
               savedDestinations.splice(index, 1);
               await approvedUsersCollection?.updateOne({ userId: settingsUid }, { $set: { savedDestinations: savedDestinations } });
               bot?.answerCallbackQuery(query.id, { text: '✅ Destination Deleted', show_alert: true });
-              // We need to re-render, but this flow is triggered from inside the selection menu.
-              // For now, answering the callback is sufficient; the user can just select again or cancel.                
+              
+              const state = userActionStates[query.from.id];
+              
+              // Dynamic Re-rendering
+              if (state?.type === 'topic_clone_dest_select') {
+                  const uniqueDestinations: { dest: any, originalIndex: number }[] = [];
+                  const seen = new Set();
+                  savedDestinations.forEach((d: any, originalIndex: number) => {
+                      if (d && d.destId && !seen.has(d.destId)) {
+                          seen.add(d.destId);
+                          uniqueDestinations.push({ dest: d, originalIndex });
+                      }
+                  });
+                  const kb = uniqueDestinations.map((item) => {
+                      return [
+                          { text: item.dest.groupName + (item.dest.destThreadId ? ` (Topic ${item.dest.destThreadId})` : ''), callback_data: `tc_dest_${item.originalIndex}` },
+                          { text: '🗑', callback_data: `del_saved_dest:${item.originalIndex}` }
+                      ];
+                  });
+                  kb.push([{ text: '➕ Enter New Group ID', callback_data: `clonedest_new` }]);
+                  kb.push([{ text: '❌ Cancel', callback_data: 'mirror_cmd' }]);
+
+                  await safeEditMessage("🎯 **Clone Specific Topic**\n\n1. Select Destination Group (Deleted destination removed):", {
+                      chat_id: chatId,
+                      message_id: query.message!.message_id,
+                      reply_markup: { inline_keyboard: kb }
+                  }).catch(() => {});
+              } else if (state?.type === 'live_mirror_dest_select') {
+                  const sourceName = state.pendingSourceName || 'Source Group';
+                  const uniqueDestinations: { dest: any, originalIndex: number }[] = [];
+                  const seen = new Set();
+                  savedDestinations.forEach((d: any, originalIndex: number) => {
+                      if (d && d.destId && !seen.has(d.destId)) {
+                          seen.add(d.destId);
+                          uniqueDestinations.push({ dest: d, originalIndex });
+                      }
+                  });
+                  const kb = uniqueDestinations.map((item) => {
+                      return [
+                          { text: item.dest.groupName + (item.dest.destThreadId ? ` (Topic ${item.dest.destThreadId})` : ''), callback_data: `lm_dest_${item.originalIndex}` },
+                          { text: '🗑', callback_data: `del_saved_dest:${item.originalIndex}` }
+                      ];
+                  });
+                  kb.push([{ text: '❌ Cancel', callback_data: 'start_back' }]);
+
+                  await safeEditMessage(`✅ **Source Selected: ${sourceName}**\n\n**Select Destination Group for Live Mirror:**`, {
+                      chat_id: chatId,
+                      message_id: query.message!.message_id,
+                      reply_markup: { inline_keyboard: kb }
+                  }).catch(() => {});
+              } else if (state?.type === 'full_mirror_dest_select') {
+                  const sourceId = state.pendingSourceId!;
+                  const uniqueDestinations: { dest: any, originalIndex: number }[] = [];
+                  const seen = new Set();
+                  savedDestinations.forEach((d: any, originalIndex: number) => {
+                      if (d && d.destId && !seen.has(d.destId)) {
+                          seen.add(d.destId);
+                          uniqueDestinations.push({ dest: d, originalIndex });
+                      }
+                  });
+                  const kb = uniqueDestinations.map((item) => {
+                      return [
+                          { text: item.dest.groupName + (item.dest.destThreadId ? ` (Topic ${item.dest.destThreadId})` : ''), callback_data: `fm_dest_${item.originalIndex}` },
+                          { text: '🗑', callback_data: `del_saved_dest:${item.originalIndex}` }
+                      ];
+                  });
+                  kb.push([{ text: '❌ Cancel', callback_data: 'start_back' }]);
+
+                  await safeEditMessage(`✅ **Source Selected: Source** (\`${sourceId}\`)\n\n**Select Destination Group for Full Mirror:**`, {
+                      chat_id: chatId,
+                      message_id: query.message!.message_id,
+                      reply_markup: { inline_keyboard: kb }
+                  }).catch(() => {});
+              }
           } else {
               bot?.answerCallbackQuery(query.id, { text: '❌ Destination not found', show_alert: true });
           }
@@ -4702,6 +5373,119 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
     bot.onText(/\/setmirror/, (msg) => handleSetMirror(msg.chat.id, msg.from?.id, msg));
     bot.onText(/\/sync/, (msg) => handleSync(msg.chat.id, msg.from?.id));
     
+    bot.onText(/\/setspecifictopic(?:@\w+)?(?:\s+(.+))?/, async (msg, match) => {
+        const fromId = msg.from?.id;
+        const chatId = msg.chat.id;
+        if (!fromId || !isAdmin(fromId)) return;
+
+        const args = match?.[1]?.trim() || '';
+
+        if (msg.chat.type === 'private') {
+            if (!args) {
+                userActionStates[fromId] = { type: 'enter_manual_specific_topic' };
+                return safeSendMessage(chatId, "📍 **Manual Specific Topic / Destination Setup**\n\nPlease send the **Group ID**, optional **Topic ID** and optional **Group Name**.\n\nForm: `<GroupId> [TopicId] [GroupName]`\nExample with topic: `-1001844729124 12 My Cool Group`\nExample without topic: `-1001844729124 My Cool Group`\n\n🛑 _Type /cancel to cancel this request._", { parse_mode: 'Markdown' });
+            }
+
+            const parts = args.split(/\s+/);
+            const rawGroupId = parts[0];
+            if (!rawGroupId.startsWith('-') && !/^\d+$/.test(rawGroupId)) {
+                return safeSendMessage(chatId, "❌ **Invalid Group ID.** It should typically start with `-` (e.g. `-100xxxxxxxxxx`).");
+            }
+
+            let topicId: number | null = null;
+            let groupName = '';
+            let namePartStartIdx = 1;
+
+            if (parts.length > 1) {
+                const secondPart = parts[1];
+                if (/^\d+$/.test(secondPart)) {
+                    topicId = parseInt(secondPart);
+                    namePartStartIdx = 2;
+                }
+            }
+            groupName = parts.slice(namePartStartIdx).join(' ').trim();
+            if (!groupName) {
+                groupName = `Manual Group ${rawGroupId}`;
+            }
+
+            if (approvedUsersCollection) {
+                const settingsUid = await resolveSettingsUserId(fromId);
+                const userDoc = await approvedUsersCollection.findOne({ userId: settingsUid });
+                const savedDestinations = userDoc?.savedDestinations || [];
+
+                const filtered = savedDestinations.filter((d: any) => !(d.destId === rawGroupId && d.destThreadId === topicId));
+                filtered.push({
+                    destId: rawGroupId,
+                    destThreadId: topicId,
+                    groupName,
+                    topicName: topicId ? `Topic ${topicId}` : 'General',
+                    createdAt: new Date()
+                });
+
+                const finalDest = filtered.slice(-20);
+                await approvedUsersCollection.updateOne(
+                    { userId: settingsUid },
+                    { $set: { savedDestinations: finalDest } }
+                );
+
+                const destDisplay = topicId ? `${groupName} (Topic: ${topicId})` : groupName;
+                const privateConfirm = `✅ **Specific Destination Stored Successfully!**\n\n📁 Destination: \`${destDisplay}\`\n📍 ID: \`${rawGroupId}\` ${topicId ? `(Topic: \`${topicId}\`)` : ''}\n\nThis target group has been saved to your **Saved Destinations** list!`;
+                await safeSendMessage(chatId, privateConfirm, { parse_mode: 'Markdown' });
+
+                // Try to send a confirmation directly to that group if the bot is present!
+                try {
+                    const notifyOptions: any = { parse_mode: 'Markdown' };
+                    if (topicId) notifyOptions.message_thread_id = topicId;
+                    await safeSendMessage(Number(rawGroupId), `✅ **Specific Destination Registered!**\n\nThis group has been registered as an upload destination inside the bot for admin/user configuration.`, notifyOptions);
+                } catch (e) {
+                    console.log("[setspecifictopic] Could not send direct notification to manually added group (expected if bot has not joined yet):", e);
+                }
+            }
+        } else {
+            // Inside a group or channel
+            const groupTitle = args || msg.chat.title || 'Group';
+            const topicId = msg.message_thread_id || null;
+            const destId = chatId.toString();
+
+            if (approvedUsersCollection) {
+                const settingsUid = await resolveSettingsUserId(fromId);
+                const userDoc = await approvedUsersCollection.findOne({ userId: settingsUid });
+                const savedDestinations = userDoc?.savedDestinations || [];
+
+                const filtered = savedDestinations.filter((d: any) => !(d.destId === destId && d.destThreadId === topicId));
+                filtered.push({
+                    destId,
+                    destThreadId: topicId,
+                    groupName: groupTitle,
+                    topicName: topicId ? `Topic ${topicId}` : 'General',
+                    createdAt: new Date()
+                });
+
+                const finalDest = filtered.slice(-20);
+                await approvedUsersCollection.updateOne(
+                    { userId: settingsUid },
+                    { $set: { savedDestinations: finalDest } }
+                );
+
+                const destDisplay = topicId ? `${groupTitle} (Topic: ${topicId})` : groupTitle;
+                const confirmMsg = `✅ **Specific Destination Stored Successfully!**\n\n📁 Destination: \`${destDisplay}\`\n📍 ID: \`${destId}\` ${topicId ? `(Topic: \`${topicId}\`)` : ''}\n\nThis target group has been saved to your **Saved Destinations** list!`;
+                
+                // 1. Send inside the Destination Group itself
+                await safeSendMessage(chatId, confirmMsg, { 
+                    parse_mode: 'Markdown',
+                    reply_to_message_id: msg.message_id 
+                });
+
+                // 2. Send inside User/Admin's Private Bot DM
+                if (fromId.toString() !== chatId.toString()) {
+                    await safeSendMessage(fromId, `📁 **New Upload Destination Registered from Group:**\n\n🎯 **${destDisplay}** with ID \`${destId}\` has been added to your **Saved Destinations** list.\n\nYou can select it as your active destination anytime from the Settings panel!`, {
+                        parse_mode: 'Markdown'
+                    }).catch(() => {});
+                }
+            }
+        }
+    });
+    
     bot.onText(/\/pausequeue/, async (msg) => {
         const fromId = msg.from?.id;
         const chatId = msg.chat.id;
@@ -5005,6 +5789,7 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
           `• \`/status\` 📊 - Shows ongoing download/upload transfer progress and active mirror tasks.\n` +
           `• \`/dashboard\` 📈 - Displays general transfer statistics: data volumes, success/failure counts.\n` +
           `• \`/setmirror\` 📍 - Establishes a live mirroring channel or destination path directly inside a group/channel.\n` +
+          `• \`/setspecifictopic\` 📁 - Saves a target destination group or topic with custom group name.\n` +
           `• \`/setpath\` 🛣 - Sets the default global destination channel/group link or ID.\n` +
           `• \`/clearmirrorhistory\` 🗑 - Clears the database of downloaded message histories so you can re-mirror identical posts.\n` +
           `• \`/setcooldown\` ⏳ - Adjusts the delay interval between successive mirrored messages.\n` +
@@ -5328,7 +6113,8 @@ dbEnqueueTasks = async function(tasks: Task[]) {
     }
     if (queuedTasksCollection) {
         try {
-            const docs = tasks.map(t => ({
+            const now = Date.now();
+            const docs = tasks.map((t, index) => ({
                 id: t.id,
                 chatId: t.chatId,
                 userId: t.userId,
@@ -5341,7 +6127,7 @@ dbEnqueueTasks = async function(tasks: Task[]) {
                 isMirror: t.isMirror,
                 fullMirrorSessionId: t.fullMirrorSessionId,
                 topicCloneSessionId: t.topicCloneSessionId,
-                createdAt: new Date()
+                createdAt: new Date(now + index)
             }));
             await queuedTasksCollection.insertMany(docs);
         } catch (err) {
@@ -5687,38 +6473,55 @@ runNextTask = async () => {
                 finalDone = true;
             }
         } catch (taskErr: any) {
-            console.error(`[Queue] processTask failed or threw natively:`, taskErr);
+            const isSkip = taskErr.message?.includes("DOWNLOAD_SKIPPED");
+            if (!isSkip) {
+                console.error(`[Queue] processTask failed or threw natively:`, taskErr);
+            } else {
+                console.log(`[Queue] Task skipped gracefully: ${task.link}`);
+            }
             
             if (taskErr.message.includes("FloodWait")) {
-                console.log(`[Queue] Task paused due to flood wait. Re-queueing at the end.`);
-                taskQueue.push(task); // Re-queue at the end
-                await safeEditMessage(`⚠️ **Task Paused (FloodWait):** Telegram Bot currently under heavy abuse. Waiting... \n\n🔗 **Link:** ${task.link}`, { chat_id: task.chatId, message_id: statusMsgId });
+                let waitMs = 30000; // Default 30s
+                const match = taskErr.message.match(/wait of (\d+) seconds/i) || taskErr.message.match(/(\d+) seconds/i);
+                if (match && match[1]) {
+                    waitMs = (parseInt(match[1]) + 5) * 1000;
+                }
+                console.log(`[Queue] Task paused due to flood wait. Re-queueing at the front. Waiting ${waitMs}ms.`);
+                taskQueue.unshift(task); // Re-queue at the front to maintain order
+                await safeEditMessage(`⚠️ **Task Paused (FloodWait):** Telegram Bot currently under heavy abuse. Waiting ${Math.ceil(waitMs / 1000)} seconds... \n\n🔗 **Link:** ${task.link}`, { chat_id: task.chatId, message_id: statusMsgId });
+                await sleep(waitMs);
                 return;
             }
 
             task.retries = (task.retries || 0) + 1;
-            const isSkip = taskErr.message?.includes("DOWNLOAD_SKIPPED");
+            // isSkip is already declared above in the catch block
             const isPermissionError = taskErr.message?.includes("Userbot session does not have access");
             if (task.retries <= 3 && !isSkip && !isPermissionError) {
                 console.log(`[Queue] Retrying task (Retry ${task.retries}/3)`);
                 taskQueue.unshift(task); // Re-queue at the front
                 dbRequeueFrontTask(task).catch(e => console.error("[Queue DB] requeue front error on retry:", e));
                 await safeEditMessage(`⚠️ **Task Error:** ${taskErr.message}\nRetrying (${task.retries}/3)...\n\n🔗 **Link:** ${task.link}`, { chat_id: task.chatId, message_id: statusMsgId });
+                if (taskErr.message?.includes('Timeout')) {
+                    await sleep(3000); // Give MTProto more time
+                }
             } else {
                 // Final failure
                 const failReason = isSkip ? "Task skipped by user choice" : (taskErr.message || "Max retries reached");
                 await safeEditMessage(isSkip ? `⏭️ **Task Skipped:** ${failReason}\n\n🔗 **Link:** ${task.link}` : `❌ **Task Failed:** ${taskErr.message} (Max retries reached)\n\n🔗 **Link:** ${task.link}`, { chat_id: task.chatId, message_id: statusMsgId });
-                await saveFailedTask(task, failReason);
+                
+                if (!isSkip) {
+                    await saveFailedTask(task, failReason);
+                }
 
-                // Add to in-memory logs as 'Failed'
+                // Add to in-memory logs
                 const cleanLink = task.link.trim();
                 const destTargetStr = task.overrideTargetId ? task.overrideTargetId.toString() : 'Default';
                 inMemoryMirrorLogs.unshift({
                     link: cleanLink,
                     destId: destTargetStr,
                     mirroredAt: new Date().toISOString(),
-                    status: 'Failed',
-                    info: taskErr.message || "Max retries reached"
+                    status: isSkip ? 'Skipped' : 'Failed',
+                    info: failReason
                 });
                 if (inMemoryMirrorLogs.length > 500) inMemoryMirrorLogs.pop();
                 finalDone = true;
@@ -5921,6 +6724,38 @@ async function catchUpLiveMirrors(userId: number, client: TelegramClient) {
                             continue;
                         }
 
+                        // Verify topic alignment if this is a topic-specific mirror path
+                        if (pathObj.topicName && pathObj.topicName !== 'General') {
+                            const replyTo = m.replyTo;
+                            const sourceTopicId = replyTo ? (replyTo.replyToTopId || replyTo.replyToMsgId) : undefined;
+                            let msgTopicName = 'General';
+                            
+                            if (sourceTopicId) {
+                                const sourceIdStr = sourceId.toString().replace('-100', '');
+                                if (!sourceTopicCache.has(sourceIdStr)) sourceTopicCache.set(sourceIdStr, new Map());
+                                const chatTopicCache = sourceTopicCache.get(sourceIdStr)!;
+                                if (chatTopicCache.has(sourceTopicId)) {
+                                    msgTopicName = chatTopicCache.get(sourceTopicId)!;
+                                } else {
+                                    try {
+                                        const topicsResult: any = await client.invoke(new Api.channels.GetForumTopics({
+                                            channel: sourceEntity,
+                                            limit: 500
+                                        }));
+                                        const foundTopic = topicsResult.topics?.find((t: any) => t.id === sourceTopicId);
+                                        if (foundTopic) {
+                                            msgTopicName = foundTopic.title;
+                                            chatTopicCache.set(sourceTopicId, msgTopicName);
+                                        }
+                                    } catch(e) {}
+                                }
+                            }
+
+                            if (msgTopicName.trim().toLowerCase() !== pathObj.topicName.trim().toLowerCase()) {
+                                continue;
+                            }
+                        }
+
                         const destId = pathObj.destId;
                         let destTopicId = pathObj.destThreadId ? Number(pathObj.destThreadId) : undefined;
 
@@ -6026,7 +6861,7 @@ startAutoMirrorWatcher = async (userId: number, client: TelegramClient) => {
 
             // 1. Match by Normalized Chat ID
             const cleanChatId = chatIdRaw;
-            let match = paths.find((p: any) => 
+            let matchingPaths = paths.filter((p: any) => 
                 p.isLive === true && (
                     normalize(p.sourceId) === cleanChatId || 
                     normalize(p.sourceNumericId) === cleanChatId
@@ -6034,12 +6869,12 @@ startAutoMirrorWatcher = async (userId: number, client: TelegramClient) => {
             );
 
             // 2. Fallback: match by Username if not matched yet
-            if (!match) {
+            if (matchingPaths.length === 0) {
                 try {
                     const chatEntity = await message.getChat();
                     if (chatEntity && chatEntity.username) {
                         const currentUsername = chatEntity.username.toLowerCase();
-                        match = paths.find((p: any) => 
+                        matchingPaths = paths.filter((p: any) => 
                             p.isLive === true && (
                                 (p.sourceUsername && p.sourceUsername.toLowerCase() === currentUsername) ||
                                 (p.sourceId && p.sourceId.replace('@', '').toLowerCase() === currentUsername)
@@ -6049,8 +6884,7 @@ startAutoMirrorWatcher = async (userId: number, client: TelegramClient) => {
                 } catch (e) {}
             }
 
-            if (match) {
-                console.log(`[Watcher] Match found! Source: ${match.sourceId} -> Dest: ${match.destId}`);
+            if (matchingPaths.length > 0) {
                 let topicName = 'General';
                 
                 // Proactively handle Topic Creation service messages
@@ -6105,6 +6939,20 @@ startAutoMirrorWatcher = async (userId: number, client: TelegramClient) => {
                         }
                     }
                 }
+
+                // Select the best matching path from matchingPaths based on topicName
+                let match = matchingPaths.find((p: any) => p.topicName && p.topicName.trim().toLowerCase() === topicName.trim().toLowerCase());
+                if (!match) {
+                    // Fallback to general/full mirror path
+                    match = matchingPaths.find((p: any) => !p.topicName || p.topicName === 'General');
+                }
+
+                if (!match) {
+                    console.log(`[Watcher] No matching path/topic mirror config found for topic "${topicName}" in source ${chatIdRaw}`);
+                    return;
+                }
+
+                console.log(`[Watcher] Match found! Source: ${match.sourceId} (Topic: ${topicName}) -> Dest: ${match.destId}`);
 
                 const destId = match.destId;
                 let destTopicId = match.destThreadId ? Number(match.destThreadId) : undefined;
@@ -6294,12 +7142,33 @@ getConnectedUserbotClient = async (userId: number) => {
                     if (approvedUsersCollection) {
                         await approvedUsersCollection.updateOne({ userId: lookupId.toString() }, { $unset: { stringSession: "" } });
                     }
+                    await client.disconnect().catch(() => {});
+                    return null;
                 }
+                
+                if (meErr.message?.includes('AUTH_KEY_DUPLICATED')) {
+                    userSessions.delete(lookupId);
+                    if (approvedUsersCollection) {
+                        await approvedUsersCollection.updateOne({ userId: lookupId.toString() }, { $unset: { stringSession: "" } });
+                    }
+                    await client.disconnect().catch(() => {});
+                    console.error(`Session key duplicated for ${lookupId}. Cleared session.`);
+                    return null;
+                }
+                
                 await client.disconnect().catch(() => {});
                 return null;
             }
         } catch (err: any) {
             console.error(`Userbot Client failed for user ${lookupId}:`, err);
+            if (err.message?.includes('AUTH_KEY_DUPLICATED') || (err as any).errorMessage === 'AUTH_KEY_DUPLICATED') {
+                userSessions.delete(lookupId);
+                if (approvedUsersCollection) {
+                    await approvedUsersCollection.updateOne({ userId: lookupId.toString() }, { $unset: { stringSession: "" } });
+                }
+                console.error(`Session key duplicated for ${lookupId} in watchdog. Cleared session.`);
+                return null;
+            }
             return null;
         }
     })();
@@ -6352,6 +7221,17 @@ createProgressBar = (total: number, current: number, label: string, startTime: n
         return `${hours}h ${mins}m`;
     };
 
+    const formatElapsed = (seconds: number) => {
+        if (seconds <= 0) return "0s";
+        if (seconds < 60) return `${Math.floor(seconds)}s`;
+        const totalMins = Math.floor(seconds / 60);
+        const secs = Math.floor(seconds % 60);
+        if (totalMins < 60) return `${totalMins}m ${secs}s`;
+        const hours = Math.floor(totalMins / 60);
+        const mins = totalMins % 60;
+        return `${hours}h ${mins}m`;
+    };
+
     const icon = label === "Downloading" ? "⬇️" : "⬆️";
     const meta = label === "Downloading" ? "Server ⟿ Bot" : "Bot ⟿ Your Chat";
 
@@ -6361,7 +7241,7 @@ createProgressBar = (total: number, current: number, label: string, startTime: n
            `╠══════════════════════╣\n` +
            `║ 📦 𝗦𝗶𝘇𝗲   : ${formatBytes(current)} / ${formatBytes(total)}\n` +
            `║ ⚡ 𝗦𝗽𝗲𝗲𝗱  : ${formatBytes(speed)}/s\n` +
-           `║ ⏳ 𝗘𝗧𝗔    : ${formatTime(eta)}\n` +
+           `║ ⏳ 𝗘𝗧𝗔    : ${formatTime(eta)} (Elapsed: ${formatElapsed(elapsed)})\n` +
            `╠══════════════════════╣\n` +
            `║ 🚀 𝗠𝗼𝗱𝗲   : ${currentUploadEngine}\n` +
            `║ 🛰 𝗥𝗼𝘂𝘁𝗲  : ${meta}\n` +
@@ -6705,6 +7585,8 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
 
             if (!msg || !(msg instanceof Api.Message)) throw new Error("Content not found. The Userbot session used does not have access to this message. Please switch to an account that is a member of the source channel, or verify the link.");
 
+            let fileKey: string | null = null;
+
             // Advanced Topic Blocking logic for all MIRROR modes
             if (isMirror) {
                 const settingsUid = await resolveSettingsUserId(userId);
@@ -6763,9 +7645,40 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                             randomId: [helpers.generateRandomLong(true)]
                         }));
                         console.log(`[Debug] Direct forward successful.`);
-                        await safeEditMessage(`🎯 **Success! (Direct Forward)**\n\n🔗 **Link:** ${link}`, { chat_id: chatId, message_id: statusMsgId });
+                        
+                        let sentMsgId = 0;
+                        if (forwardResult && forwardResult.updates) {
+                            for (const upd of forwardResult.updates) {
+                                if (upd instanceof Api.UpdateNewMessage && upd.message && (upd.message as any).id) {
+                                    sentMsgId = (upd.message as any).id;
+                                    break;
+                                }
+                            }
+                        }
+
+                        let uploadedLink = "";
+                        if (sentMsgId) {
+                            try {
+                                const entity = await destClient.getEntity(targetPeer);
+                                const channelId = entity.id.toString().replace("-100", "");
+                                uploadedLink = `https://t.me/c/${channelId}/${sentMsgId}`;
+                            } catch (e) {}
+                        }
+
+                        const kb: any[] = [];
+                        const row: any[] = [];
+                        if (link && link.startsWith("http")) row.push({ text: "⏪ Source", url: link });
+                        if (uploadedLink) row.push({ text: "📤 Upload", url: uploadedLink });
+                        if (row.length > 0) kb.push(row);
+
+                        await safeEditMessage(`🎯 **Success! (Direct Forward)**`, { 
+                            chat_id: chatId, 
+                            message_id: statusMsgId,
+                            reply_markup: kb.length > 0 ? { inline_keyboard: kb } : undefined
+                        });
                         await recordSuccessfulMirror();
                         return true;
+
                     } else {
                         console.log(`[Debug] Direct forward skipped: finalSourcePeer or targetPeer missing.`);
                     }
@@ -6778,15 +7691,100 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
 
             if (!msg.media || msg.media instanceof Api.MessageMediaWebPage) {
                 await destClient.sendMessage(finalDestPeer, { message: applyRenameRules(msg.message || "", customRules), replyTo: threadId });
-                await safeEditMessage(`🎯 **Success!**\n\n🔗 **Link:** ${link}`, { chat_id: chatId, message_id: statusMsgId });
+                
+                const kb: any[] = [];
+                const row: any[] = [];
+                if (link && link.startsWith("http")) row.push({ text: "⏪ Source", url: link });
+                // We don't have the uploaded file link easily here, so we will omit it for now or use a placeholder if appropriate, 
+                // but user asked for "upload wale me kha tumne us file ko upload Kiya uska link hoga"
+                // Given the current structure, omitting it or handling it later might be best if it's too complex.
+                
+                if (row.length > 0) kb.push(row);
+                
+                await safeEditMessage(`🎯 **Success!**`, { 
+                    chat_id: chatId, 
+                    message_id: statusMsgId,
+                    reply_markup: kb.length > 0 ? { inline_keyboard: kb } : undefined
+                });
                 await recordSuccessfulMirror();
                 return true;
+
             }
 
             if (!(msg.media instanceof Api.MessageMediaDocument) && !(msg.media instanceof Api.MessageMediaPhoto)) {
                 // If it is another type of media (e.g. Geo, Contact, Poll), forward it or throw a better error.
                 throw new Error(`Unsupported media type: ${msg.media.className}`);
             }
+
+            // --- Cache Interception start ---
+            fileKey = getFileUniqueKey(msg);
+            let cachedFileRecord: any = null;
+            if (fileKey && fileCacheCollection) {
+                try {
+                    cachedFileRecord = await fileCacheCollection.findOne({ fileKey });
+                } catch (ce) {
+                    console.error("[Cache] Failed to query cache database:", ce);
+                }
+            }
+
+            if (cachedFileRecord) {
+                console.log(`[Cache] Matching file found in cache:`, cachedFileRecord);
+                await safeEditMessage(`⚡ **Cached file found! Forwarding directly...**`, { chat_id: chatId, message_id: statusMsgId });
+                
+                try {
+                    const defaultLogPeer = await safelyResolveEntity(destClient, DEFAULT_LOG_GROUP);
+                    const targetPeer = finalDestPeer || await safelyResolveEntity(destClient, uploadTarget);
+                    
+                    if (defaultLogPeer && targetPeer) {
+                        const forwardResult = await destClient.invoke(new Api.messages.ForwardMessages({
+                            fromPeer: defaultLogPeer,
+                            id: [Number(cachedFileRecord.savedMsgId)],
+                            toPeer: targetPeer,
+                            dropAuthor: true,
+                            topMsgId: threadId,
+                            randomId: [helpers.generateRandomLong(true)]
+                        }));
+                        
+                        let sentMsgId: number | undefined;
+                        if (forwardResult && forwardResult.updates) {
+                            for (const upd of forwardResult.updates) {
+                                if (upd instanceof Api.UpdateNewMessage && upd.message && (upd.message as any).id) {
+                                    sentMsgId = (upd.message as any).id;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        let uploadedLink = "";
+                        if (sentMsgId) {
+                            try {
+                                const entity = await destClient.getEntity(targetPeer);
+                                const channelId = entity.id.toString().replace("-100", "");
+                                uploadedLink = `https://t.me/c/${channelId}/${sentMsgId}`;
+                            } catch (e) {}
+                        }
+                        
+                        let message = `┏━━━━━━━━━━━━━━━━━━━━━━┓\n┃ 🎯 𝗦𝘂𝗰𝗰𝗲𝘀𝘀𝗳𝘂𝗹𝗹𝘆 𝗠𝗶𝗿𝗿𝗼𝗿𝗲𝗱! ┃\n┣━━━━━━━━━━━━━━━━━━━━━━┫\n┃ ⚡ (Cache Hit - Forwarded) ┃\n┗━━━━━━━━━━━━━━━━━━━━━━┛`;
+                        const kb: any[] = [];
+                        const row: any[] = [];
+                        if (link && link.startsWith("http")) {
+                            row.push({ text: "🔗 𝗦𝗼𝘂𝗿𝗰𝗲", url: link });
+                        }
+                        if (uploadedLink) {
+                            row.push({ text: "📥 𝗗𝗼𝘄𝗻𝗹𝗼𝗮𝗱", url: uploadedLink });
+                        }
+                        if (row.length > 0) kb.push(row);
+                        
+                        await safeEditMessage(message, { chat_id: chatId, message_id: statusMsgId, reply_markup: kb.length > 0 ? { inline_keyboard: kb } : undefined });
+                        await recordSuccessfulMirror();
+                        return true;
+                    }
+                } catch (forwardErr) {
+                    console.error("[Cache] Forward from cache failed. Retrying with full download/upload flow...", forwardErr);
+                    // Falls back to standard download flow if forward fails
+                }
+            }
+            // --- Cache Interception end ---
 
             await safeEditMessage(`📥 **Downloading via Source Account...**`, { chat_id: chatId, message_id: statusMsgId });
             
@@ -6869,7 +7867,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                         };
                     }
 
-                    if (now - lastDownloadUpdate > 5000 || currentBytes === totalBytes) {
+                    if (now - lastDownloadUpdate > 1000 || currentBytes === totalBytes) {
                         lastDownloadUpdate = now;
                         const isPaused = taskControlMap.get(jobKey)?.isPaused || false;
                         safeEditMessage(createProgressBar(totalBytes, currentBytes, "Downloading", downloadStartTime, pathDisplay), { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown', reply_markup: createProgressMarkup(jobKey, isPaused) }).catch(() => {});
@@ -6977,13 +7975,15 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
             const totalSize = fs.statSync(tempFilePath).size;
             let lastUploadUpdate = 0;
 
-            let uploadWorkers = 1;
-            if (totalSize > 500 * 1024 * 1024) {
-                uploadWorkers = 4;
+            let uploadWorkers = 4;
+            if (totalSize > 1000 * 1024 * 1024) { // > 1GB
+                uploadWorkers = 16;
+            } else if (totalSize > 500 * 1024 * 1024) { // > 500 MB
+                uploadWorkers = 10;
             } else if (totalSize > 100 * 1024 * 1024) {
-                uploadWorkers = 3;
+                uploadWorkers = 8;
             } else if (totalSize > 20 * 1024 * 1024) {
-                uploadWorkers = 2;
+                uploadWorkers = 4;
             }
 
             let uploadDone = false;
@@ -7020,7 +8020,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                                 };
                             }
         
-                            if (now - lastUploadUpdate > 5000 || currentBytes === totalSize) {
+                            if (now - lastUploadUpdate > 1000 || currentBytes === totalSize) {
                                 lastUploadUpdate = now;
                                 const text = createProgressBar(Number(totalSize), currentBytes, "Uploading", uploadStartTime, pathDisplay);
                                 safeEditMessage(text, { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown' }).catch(() => {});
@@ -7073,6 +8073,51 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                         replyTo: threadId,
                     } as any);
 
+                    // --- Save Copy to Saved Files Cache topic in DEFAULT_LOG_GROUP start ---
+                    let savedLogMsg: any = null;
+                    try {
+                        const logGroupPeer = await safelyResolveEntity(destClient, DEFAULT_LOG_GROUP);
+                        if (logGroupPeer) {
+                            const cachedTopicId = await getOrCreateCachedFilesTopicId(destClient);
+                            console.log(`[CacheLog] Saving copy of file to DEFAULT_LOG_GROUP under topic/thread ${cachedTopicId}`);
+                            
+                            savedLogMsg = await destClient.sendFile(logGroupPeer, {
+                                file: uploadedFile,
+                                caption: caption,
+                                workers: uploadWorkers,
+                                attributes: attributes,
+                                thumb: hasThumb ? thumbPath : undefined,
+                                replyTo: cachedTopicId
+                            } as any);
+                        }
+                    } catch (logErr) {
+                        console.error("[CacheLog] Failed to save copy of file to DEFAULT_LOG_GROUP:", logErr);
+                    }
+
+                    if (savedLogMsg && fileKey && fileCacheCollection) {
+                        try {
+                            await fileCacheCollection.updateOne(
+                                { fileKey },
+                                {
+                                    $set: {
+                                        fileKey,
+                                        fileName: filename,
+                                        totalSize: totalSize,
+                                        savedMsgId: savedLogMsg.id,
+                                        savedChatId: DEFAULT_LOG_GROUP,
+                                        sourceLink: link,
+                                        cachedAt: new Date()
+                                    }
+                                },
+                                { upsert: true }
+                            );
+                            console.log(`[CacheLog] File successfully registered in file_cache collection under fileKey: ${fileKey}`);
+                        } catch (dbErr) {
+                            console.error("[CacheLog] Failed to insert file cache record to MongoDB:", dbErr);
+                        }
+                    }
+                    // --- Save Copy to Saved Files Cache topic in DEFAULT_LOG_GROUP end ---
+
                     uploadDone = true;
                 } catch (err: any) {
                     const errStr = (err.message || "").toUpperCase();
@@ -7114,7 +8159,12 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
             await recordSuccessfulMirror();
             return true;
         } catch (err: any) {
-            console.error("Link Process Error:", err);
+            const isSkip = err.message?.includes("DOWNLOAD_SKIPPED");
+            if (!isSkip) {
+                console.error("Link Process Error:", err);
+            } else {
+                console.log("[Process] Task was skipped gracefully by user choice.");
+            }
             let errMsg = err.message || "";
             if (err.errorMessage === 'CHANNEL_INVALID' || errMsg.includes("CHANNEL_INVALID")) errMsg = "Channel not found. Ensure Userbot is a member of BOTH chats.";
             else if (errMsg.includes("Content not found") || errMsg.includes("PEER_ID_INVALID") || errMsg.includes("USER_NOT_PARTICIPANT")) {
@@ -7138,17 +8188,6 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
       const chatId = msg.chat.id;
       const fromId = msg.from?.id;
       const text = msg.text;
-
-      // Deduplicate messages within a sliding window
-      const msgKey = `${chatId}:${msg.message_id}`;
-      if (processedMessageKeys.has(msgKey)) {
-        console.log(`[Deduplicator] Ignored duplicate message update for key: ${msgKey}`);
-        return;
-      }
-      processedMessageKeys.add(msgKey);
-      setTimeout(() => {
-        processedMessageKeys.delete(msgKey);
-      }, 5 * 60 * 1000);
 
       console.log(`[Message Handler] Received message from ${fromId}: ${text || 'No text'}`);
 
@@ -7204,6 +8243,24 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
           const state = userActionStates[fromId];
 
           console.log(`[Message Handler] State type for ${fromId}: ${state.type}`);
+          if (state.type === 'forward_start_link') {
+              userActionStates[fromId].startLink = msg.text;
+              userActionStates[fromId].type = 'forward_end_link';
+              bot.sendMessage(chatId, "✅ Starting link saved.\n\nNow send the **Ending Link**.");
+              return;
+          }
+          if (state.type === 'forward_end_link') {
+              const startLink = userActionStates[fromId].startLink;
+              const endLink = msg.text!;
+              delete userActionStates[fromId];
+              
+              bot.sendMessage(chatId, "⏳ **Processing batch forward...**\n\nThis might take a while.");
+              handleBatchForward(chatId, fromId, startLink, endLink).catch(err => {
+                  safeSendMessage(chatId, `❌ **Forwarding Error:** ${err.message}`);
+              });
+              return;
+          }
+
           if (state.type === 'add_blocked_topic') {
               const textInput = msg.text || '';
               delete userActionStates[fromId];
@@ -7238,6 +8295,88 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                   safeSendMessage(chatId, `❌ **Invalid input.** Blocked topic name cannot be empty.`);
               }
               await showBlockedTopicsPanel(chatId, fromId);
+              return;
+          }
+
+          if (state.type === 'set_source_id') {
+              const textInput = msg.text || '';
+              delete userActionStates[fromId];
+              await saveRecentSource(fromId, textInput, textInput);
+              safeSendMessage(chatId, `✅ **Source ID Saved:** \`${textInput}\``);
+              return;
+          }
+          if (state.type === 'set_dest_id') {
+              const textInput = msg.text || '';
+              delete userActionStates[fromId];
+              await saveRecentDestination(fromId, textInput, "Manual Destination");
+              safeSendMessage(chatId, `✅ **Destination ID Saved:** \`${textInput}\``);
+              return;
+          }
+
+          if (state.type === 'enter_manual_specific_topic') {
+              const textInput = msg.text || '';
+              delete userActionStates[fromId];
+              const cleaned = textInput.trim();
+              if (!cleaned) {
+                  safeSendMessage(chatId, "❌ **Operation canceled or empty input.**");
+                  return;
+              }
+              const parts = cleaned.split(/\s+/);
+              const rawGroupId = parts[0];
+              if (!rawGroupId.startsWith('-') && !/^\d+$/.test(rawGroupId)) {
+                  safeSendMessage(chatId, "❌ **Invalid Group ID.** It should typically start with `-` (e.g. `-100xxxxxxxxxx`).");
+                  return;
+              }
+
+              let topicId: number | null = null;
+              let groupName = '';
+              let namePartStartIdx = 1;
+
+              if (parts.length > 1) {
+                  const secondPart = parts[1];
+                  if (/^\d+$/.test(secondPart)) {
+                      topicId = parseInt(secondPart);
+                      namePartStartIdx = 2;
+                  }
+              }
+
+              groupName = parts.slice(namePartStartIdx).join(' ').trim();
+              if (!groupName) {
+                  groupName = `Manual Group ${rawGroupId}`;
+              }
+
+              if (approvedUsersCollection) {
+                  const settingsUid = await resolveSettingsUserId(fromId);
+                  const userDoc = await approvedUsersCollection.findOne({ userId: settingsUid });
+                  const savedDestinations = userDoc?.savedDestinations || [];
+
+                  const filtered = savedDestinations.filter((d: any) => !(d.destId === rawGroupId && d.destThreadId === topicId));
+                  filtered.push({
+                      destId: rawGroupId,
+                      destThreadId: topicId,
+                      groupName,
+                      topicName: topicId ? `Topic ${topicId}` : 'General',
+                      createdAt: new Date()
+                  });
+
+                  const finalDest = filtered.slice(-20);
+                  await approvedUsersCollection.updateOne(
+                      { userId: settingsUid },
+                      { $set: { savedDestinations: finalDest } }
+                  );
+
+                  const destDisplay = topicId ? `${groupName} (Topic: ${topicId})` : groupName;
+                  await safeSendMessage(chatId, `✅ **Specific Destination Stored Successfully!**\n\n📁 Destination: \`${destDisplay}\`\n📍 ID: \`${rawGroupId}\` ${topicId ? `(Topic: \`${topicId}\`)` : ''}\n\nThis target group has been saved to your **Saved Destinations** list!`, { parse_mode: 'Markdown' });
+
+                  // Try to send a confirmation directly to that group if the bot is present!
+                  try {
+                      const notifyOptions: any = { parse_mode: 'Markdown' };
+                      if (topicId) notifyOptions.message_thread_id = topicId;
+                      await safeSendMessage(Number(rawGroupId), `✅ **Specific Destination Registered!**\n\nThis group has been registered as an upload destination inside the bot for admin/user configuration.`, notifyOptions);
+                  } catch (e) {
+                      console.log("[setspecifictopic] Could not send direct notification to manually added group in state handler (expected if bot has not joined yet):", e);
+                  }
+              }
               return;
           }
 
@@ -7754,12 +8893,19 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                   state.pendingSourceName = groupName;
                   await saveRecentSource(fromId, sourceId, groupName);
 
-                  const uniqueDestinations = [...new Map(savedDestinations.map((d: any) => [d.destId, d])).values()];
-               const kb = uniqueDestinations.map((d: any, idx: number) => {
-                       return [
-                           { text: d.groupName + (d.destThreadId ? ` (Topic ${d.destThreadId})` : ''), callback_data: `lm_dest_${idx}` },
-                           { text: '🗑', callback_data: `del_saved_dest:${idx}` }
-                       ];
+                  const uniqueDestinations: { dest: any, originalIndex: number }[] = [];
+                  const seen = new Set();
+                  savedDestinations.forEach((d: any, originalIndex: number) => {
+                      if (d && d.destId && !seen.has(d.destId)) {
+                          seen.add(d.destId);
+                          uniqueDestinations.push({ dest: d, originalIndex });
+                      }
+                  });
+                  const kb = uniqueDestinations.map((item) => {
+                      return [
+                          { text: item.dest.groupName + (item.dest.destThreadId ? ` (Topic ${item.dest.destThreadId})` : ''), callback_data: `lm_dest_${item.originalIndex}` },
+                          { text: '🗑', callback_data: `del_saved_dest:${item.originalIndex}` }
+                      ];
                   });
                   kb.push([{ text: '❌ Cancel', callback_data: 'start_back' }]);
 
@@ -7871,13 +9017,20 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
               }
               await saveRecentSource(fromId, sourceId, groupName);
 
-              // Deduplicate based on destId for display
-              const uniqueDestinations = [...new Map(savedDestinations.map((d: any) => [d.destId, d])).values()];
+              // Deduplicate based on destId for display but remember the original indices
+              const uniqueDestinations: { dest: any, originalIndex: number }[] = [];
+              const seen = new Set();
+              savedDestinations.forEach((d: any, originalIndex: number) => {
+                  if (d && d.destId && !seen.has(d.destId)) {
+                      seen.add(d.destId);
+                      uniqueDestinations.push({ dest: d, originalIndex });
+                  }
+              });
 
-              const kb = uniqueDestinations.map((d: any, idx: number) => {
+              const kb = uniqueDestinations.map((item) => {
                   return [
-                      { text: d.groupName + (d.destThreadId ? ` (Topic ${d.destThreadId})` : ''), callback_data: `fm_dest_${idx}` },
-                      { text: '🗑', callback_data: `del_saved_dest:${idx}` }
+                      { text: item.dest.groupName + (item.dest.destThreadId ? ` (Topic ${item.dest.destThreadId})` : ''), callback_data: `fm_dest_${item.originalIndex}` },
+                      { text: '🗑', callback_data: `del_saved_dest:${item.originalIndex}` }
                   ];
               });
               kb.push([{ text: '❌ Cancel', callback_data: 'start_back' }]);
@@ -8251,7 +9404,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
             delete state.resolvePhoneCode;
             // Simulate realistic human typing delay (2s to 4.5s)
             await sleep(Math.random() * 2500 + 2000);
-            return resolve(val);
+            return resolve(val.replace(/[^a-zA-Z0-9]/g, ''));
         }
 
         if (state.resolvePassword) {
@@ -8321,30 +9474,58 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                     phoneCode: async () => {
                         console.log(`[Login] Requested phone code for ${fromId}`);
                         await sleep(1000);
-                        safeSendMessage(chatId, `📧 **Received!** \n\nTelegram has just sent a login code directly to your other device.\n\nPlease type it here so I can confirm it's you.`, { 
-                            parse_mode: 'Markdown', reply_markup: { force_reply: true } 
-                        });
+                        if (state.hasErrorOtp) {
+                            safeSendMessage(chatId, `❌ **Incorrect or Expired Code.**\n\nPlease check your other Telegram app and type the new code carefully with spaces.\n\nExample: \`1 2 3 4 5\``, { 
+                                parse_mode: 'Markdown', reply_markup: { force_reply: true } 
+                            });
+                        } else {
+                            safeSendMessage(chatId, `📧 **Received!** \n\nTelegram has just sent a login code directly to your other device.\n\n⚠️ **Important:** Please type the code with spaces between digits (e.g., \`1 2 3 4 5\`) so Telegram doesn't block it.`, { 
+                                parse_mode: 'Markdown', reply_markup: { force_reply: true } 
+                            });
+                        }
                         return new Promise((resolve) => { 
                             console.log(`[Login] Waiting for OTP for ${fromId}`);
                             state.step = 'awaiting_otp';
                             state.resolvePhoneCode = resolve; 
+                            state.hasErrorOtp = false; // reset flag
                         });
                     },
                     password: async (hint) => {
                         console.log(`[Login] Requested 2FA password for ${fromId}`);
                         await sleep(1000);
-                        safeSendMessage(chatId, `🔐 **Almost there!**\n\nYour account has two-step verification enabled for extra protection.\n\nHint: \`${hint || 'None'}\`\n\nPlease enter your 2FA password to finish connecting:`, { 
-                            parse_mode: 'Markdown', reply_markup: { force_reply: true } 
-                        });
+                        if (state.hasError2Fa) {
+                            safeSendMessage(chatId, `❌ **Incorrect 2FA Password.**\n\nPlease try again. \nHint: \`${hint || 'None'}\``, { 
+                                parse_mode: 'Markdown', reply_markup: { force_reply: true } 
+                            });
+                        } else {
+                            safeSendMessage(chatId, `🔐 **Almost there!**\n\nYour account has two-step verification enabled for extra protection.\n\nHint: \`${hint || 'None'}\`\n\nPlease enter your 2FA password to finish connecting:`, { 
+                                parse_mode: 'Markdown', reply_markup: { force_reply: true } 
+                            });
+                        }
                         return new Promise((resolve) => { 
                             console.log(`[Login] Waiting for 2FA password for ${fromId}`);
                             state.step = 'awaiting_2fa';
                             state.resolvePassword = resolve; 
+                            state.hasError2Fa = false; // reset flag
                         });
                     },
-                    onError: (err: any) => {
-                        console.error(`[Login] Internally caught error for ${fromId}, aborting flow:`, err);
-                        throw err;
+                    onError: async (err: any) => {
+                        console.error(`[Login] Internally caught error for ${fromId}:`, err);
+                        const msg = err.message || err.errorMessage || "Unknown error";
+                        
+                        if (msg.includes("PHONE_CODE_INVALID") || msg.includes("CODE_INVALID") || msg.includes("CODE_EMPTY")) {
+                            state.hasErrorOtp = true;
+                            return false; // Tells GramJS to loop and re-prompt phoneCode!
+                        }
+                        
+                        if (msg.includes("PASSWORD_HASH_INVALID") || msg.includes("PASSWORD_EMPTY")) {
+                            state.hasError2Fa = true;
+                            return false; // Tells GramJS to loop and re-prompt password!
+                        }
+
+                        // If it's something else like EXPIRED, we can't recover easily inside GramJS loop
+                        state.lastErrorMsg = msg;
+                        return true; // Aborts start process
                     }
                 }).then(async () => {
                     const session = client.session.save() as unknown as string;
@@ -8388,12 +9569,15 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                 }).catch((err) => {
                     if (loginStates[fromId]) {
                         console.error(`[Login] Final Catch Error for ${fromId}:`, err);
-                        const cleanMsg = err.message || "Unknown error";
+                        let cleanMsg = err.message || "Unknown error";
+                        if (cleanMsg === "AUTH_USER_CANCEL" && loginStates[fromId]?.lastErrorMsg) {
+                            cleanMsg = loginStates[fromId].lastErrorMsg!;
+                        }
                         const solution = getLoginErrorSolution(cleanMsg);
                         
                         let displayMsg = cleanMsg;
                         if (cleanMsg.includes('PHONE_CODE_EXPIRED') || cleanMsg.includes('AUTH_KEY_UNREGISTERED')) {
-                            displayMsg = "The authentication code has expired or is invalid. Please type /login again to request a new one.";
+                            displayMsg = "The authentication code has expired. Please type /login again to request a new one.";
                         } else if (cleanMsg.includes('SESSION_PASSWORD_NEEDED')) {
                             displayMsg = "2FA Password is required on your Telegram account.";
                         }
@@ -8411,6 +9595,80 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
         }
       }
 
+      // Direct Source Group ID detection & saving when no other state is active
+      if (fromId && !userActionStates[fromId] && !loginStates[fromId] && text) {
+          const cleanText = text.trim();
+          let isPotentialSource = false;
+          let parsedSourceId = cleanText;
+
+          if (/^-100\d+$/.test(cleanText)) {
+              isPotentialSource = true;
+          } else if (/^-\d+$/.test(cleanText)) {
+              isPotentialSource = true;
+          } else if (/^\d{8,15}$/.test(cleanText)) {
+              isPotentialSource = true;
+              parsedSourceId = '-100' + cleanText;
+          } else if (/^@[a-zA-Z0-9_]{5,32}$/.test(cleanText)) {
+              isPotentialSource = true;
+          } else if (/^https?:\/\/t\.me\/([a-zA-Z0-9_]{5,32})\/?$/.test(cleanText)) {
+              const usernameMatch = cleanText.match(/^https?:\/\/t\.me\/([a-zA-Z0-9_]{5,32})\/?$/);
+              if (usernameMatch) {
+                  isPotentialSource = true;
+                  parsedSourceId = '@' + usernameMatch[1];
+              }
+          } else if (/^https?:\/\/t\.me\/c\/(\d+)\/?$/.test(cleanText)) {
+              const privateGroupIdMatch = cleanText.match(/^https?:\/\/t\.me\/c\/(\d+)\/?$/);
+              if (privateGroupIdMatch) {
+                  isPotentialSource = true;
+                  parsedSourceId = '-100' + privateGroupIdMatch[1];
+              }
+          }
+
+          if (isPotentialSource) {
+              if (!isAdmin(fromId)) return;
+              
+              const statusMsg = await safeSendMessage(chatId, `🔍 **Verifying and saving source ID:** \`${parsedSourceId}\`...`);
+              try {
+                  const targetUid = Number(await resolveSettingsUserId(fromId));
+                  const client = await getConnectedUserbotClient(targetUid);
+                  if (!client) throw new Error("No active Userbot session found. Please login first via /login.");
+                  
+                  const sourceEntity = await safelyResolveFullEntity(client, parsedSourceId);
+                  const realSourceId = (sourceEntity as any).id?.toString() || parsedSourceId;
+                  const resolvedSourceId = realSourceId.startsWith('-100') ? realSourceId : (realSourceId.startsWith('-') ? realSourceId : "-100" + realSourceId);
+                  const groupName = (sourceEntity as any).title || parsedSourceId;
+                  
+                  await saveRecentSource(fromId, resolvedSourceId, groupName);
+                  
+                  const inlineKeyboard = [
+                      [
+                          { text: '🔄 Live Mirror', callback_data: `mirrorsource_direct_${resolvedSourceId}` },
+                          { text: '⚡ Full Mirror', callback_data: `fullmirror_direct_${resolvedSourceId}` }
+                      ],
+                      [
+                          { text: '📂 Clone Topics', callback_data: `clonesource_direct_${resolvedSourceId}` }
+                      ],
+                      [
+                          { text: '❌ Cancel', callback_data: 'cancel_cmd' }
+                      ]
+                  ];
+
+                  await safeEditMessage(`✅ **Source Group Saved successfully!**\n\n📌 Title: **${groupName}**\n📍 ID: \`${resolvedSourceId}\`\n\nThis source group has been added to your saved sources. Select an action below to configure it:`, {
+                      chat_id: chatId,
+                      message_id: statusMsg?.message_id || 0,
+                      reply_markup: { inline_keyboard: inlineKeyboard }
+                  });
+              } catch (e: any) {
+                  const errMsg = e.message || "Unknown error";
+                  await safeEditMessage(`❌ **Failed to verify/save source group:** ${errMsg}\n\nPlease ensure the Userbot session is active and has access to this chat.`, {
+                      chat_id: chatId,
+                      message_id: statusMsg?.message_id || 0
+                  });
+              }
+              return;
+          }
+      }
+
       // Invite link autodetection & join (Resolves t.me/joinchat/... and t.me/+...)
       const inviteHashMatch = text.match(/(?:https?:\/\/)?t\.me\/(?:joinchat\/|\+)([a-zA-Z0-9_\-]+)/);
       if (inviteHashMatch) {
@@ -8425,13 +9683,84 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
               
               const res = await client.invoke(new Api.messages.ImportChatInvite({ hash: inviteHash }));
               let chatTitle = "Private Chat";
+              let resolvedSourceId = "";
               if (res && res.chats && res.chats.length > 0) {
-                  chatTitle = res.chats[0].title || chatTitle;
+                  const firstChat = res.chats[0];
+                  chatTitle = firstChat.title || chatTitle;
+                  const chatEntityId = firstChat.id?.toString();
+                  if (chatEntityId) {
+                      resolvedSourceId = chatEntityId.startsWith('-100') ? chatEntityId : (chatEntityId.startsWith('-') ? chatEntityId : "-100" + chatEntityId);
+                  }
               }
-              await safeEditMessage(`✅ **Successfully Joined Private Channel/Group!**\n\n📌 Title: **${chatTitle}**\n👤 Userbot ID: **${targetUid}**\n\nYou can now copy links from this channel and paste them here to download/mirror.`, { chat_id: chatId, message_id: statusMsg?.message_id || 0 });
+              
+              if (resolvedSourceId) {
+                  await saveRecentSource(fromId, resolvedSourceId, chatTitle);
+                  
+                  const inlineKeyboard = [
+                      [
+                          { text: '🔄 Live Mirror', callback_data: `mirrorsource_direct_${resolvedSourceId}` },
+                          { text: '⚡ Full Mirror', callback_data: `fullmirror_direct_${resolvedSourceId}` }
+                      ],
+                      [
+                          { text: '📂 Clone Topics', callback_data: `clonesource_direct_${resolvedSourceId}` }
+                      ],
+                      [
+                          { text: '❌ Cancel', callback_data: 'cancel_cmd' }
+                      ]
+                  ];
+
+                  await safeEditMessage(`✅ **Successfully Joined Private Channel/Group and Saved!**\n\n📌 Title: **${chatTitle}**\n📍 ID: \`${resolvedSourceId}\`\n\nThis source has been saved to your recent sources! Select an action to configure it:`, {
+                      chat_id: chatId,
+                      message_id: statusMsg?.message_id || 0,
+                      reply_markup: { inline_keyboard: inlineKeyboard }
+                  });
+              } else {
+                  await safeEditMessage(`✅ **Successfully Joined Private Channel/Group!**\n\n📌 Title: **${chatTitle}**\n👤 Userbot ID: **${targetUid}**\n\nYou can now copy links from this channel and paste them here to download/mirror.`, { chat_id: chatId, message_id: statusMsg?.message_id || 0 });
+              }
           } catch (e: any) {
               let errMsg = e.message || "Unknown error";
               if (errMsg.includes("USER_ALREADY_PARTICIPANT")) {
+                  // Resolve entity of existing chat to save it anyway
+                  try {
+                      const targetUid = Number(await resolveSettingsUserId(fromId));
+                      const client = await getConnectedUserbotClient(targetUid);
+                      if (client) {
+                          const inviteInfo: any = await client.invoke(new Api.messages.CheckChatInvite({ hash: inviteHash }));
+                          let resolvedSourceId = "";
+                          let chatTitle = "Private Chat";
+                          if (inviteInfo && inviteInfo.chat) {
+                              chatTitle = inviteInfo.chat.title || chatTitle;
+                              const chatEntityId = inviteInfo.chat.id?.toString();
+                              if (chatEntityId) {
+                                  resolvedSourceId = chatEntityId.startsWith('-100') ? chatEntityId : (chatEntityId.startsWith('-') ? chatEntityId : "-100" + chatEntityId);
+                              }
+                          }
+                          
+                          if (resolvedSourceId) {
+                              await saveRecentSource(fromId, resolvedSourceId, chatTitle);
+                              const inlineKeyboard = [
+                                  [
+                                      { text: '🔄 Live Mirror', callback_data: `mirrorsource_direct_${resolvedSourceId}` },
+                                      { text: '⚡ Full Mirror', callback_data: `fullmirror_direct_${resolvedSourceId}` }
+                                  ],
+                                  [
+                                      { text: '📂 Clone Topics', callback_data: `clonesource_direct_${resolvedSourceId}` }
+                                  ],
+                                  [
+                                      { text: '❌ Cancel', callback_data: 'cancel_cmd' }
+                                  ]
+                              ];
+                              await safeEditMessage(`ℹ️ **Already a member!** Saved to your recent sources:\n\n📌 Title: **${chatTitle}**\n📍 ID: \`${resolvedSourceId}\`\n\nSelect an action to configure it:`, {
+                                  chat_id: chatId,
+                                  message_id: statusMsg?.message_id || 0,
+                                  reply_markup: { inline_keyboard: inlineKeyboard }
+                              });
+                              return;
+                          }
+                      }
+                  } catch (resolveErr) {
+                      console.error("Failed to check chat invite on participant error", resolveErr);
+                  }
                   await safeEditMessage(`ℹ️ **Already a member!** Your active Userbot is already a participant of this channel/group.`, { chat_id: chatId, message_id: statusMsg?.message_id || 0 });
               } else if (errMsg.includes("INVITE_HASH_EXPIRED")) {
                   await safeEditMessage(`❌ **Failed to join:** The invite link has expired or is invalid.`, { chat_id: chatId, message_id: statusMsg?.message_id || 0 });

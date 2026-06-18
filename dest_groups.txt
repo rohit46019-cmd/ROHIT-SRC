@@ -1,0 +1,17 @@
+                    throw new Error("Use this command in the **Destination Group**.");
+          await safeEditMessage(`🔗 **Source Selected!**\n\nNow select the **Destination Group** to clone to:`, {
+          await safeEditMessage(`✅ **Source Selected: ${groupName}**\n\n**Select Destination Group for Live Mirror:**`, {
+          await safeEditMessage(`✅ **Source Selected: ${groupName}**\n\n**Select Destination Group for Full Mirror:**`, {
+          safeEditMessage("🔗 **Please send the Destination Group ID or Link:**", { chat_id: chatId, message_id: query.message!.message_id });
+          safeEditMessage("🔗 **Please send the Destination Group ID or Link:**", { chat_id: chatId, message_id: query.message!.message_id });
+          await safeEditMessage(`✅ **Source Selected: ${groupName}**\n\n**Select Destination Group for Live Mirror:**`, {
+          safeEditMessage("🎯 **Clone Specific Topic**\n\n1. Select Destination Group:", { chat_id: chatId, message_id: query.message!.message_id, reply_markup: { inline_keyboard: kb } });
+                  await safeEditMessage("🎯 **Clone Specific Topic**\n\n1. Select Destination Group (Deleted destination removed):", {
+                  await safeEditMessage(`✅ **Source Selected: ${sourceName}**\n\n**Select Destination Group for Live Mirror:**`, {
+                  await safeEditMessage(`✅ **Source Selected: Source** (\`${sourceId}\`)\n\n**Select Destination Group for Full Mirror:**`, {
+            // 1. Prompt for Destination Group Selection
+            safeSendMessage(chatId, "🎯 **Select Destination Group for Mirroring:**", {
+                // 1. Send inside the Destination Group itself
+                  safeSendMessage(chatId, `✅ **Source ID Recognized:** \`${sourceId}\`\n\n**Select Destination Group for Live Mirror:**`, {
+              safeSendMessage(chatId, `✅ **Source Selected: ${groupName}** (\`${sourceId}\`)\n\n**Select Destination Group for Full Mirror:**`, {
+                  const destTitle = (destEntity as any).title || "Destination Group";

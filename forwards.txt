@@ -1,0 +1,49 @@
+4110:          safeSendMessage(chatId, "📍 **Set Custom Destination**\n\nPlease forward any message from target **Group/Channel** here, or send its **Public Link**.\n\n_Bot will upload files to this location instead of your private DM._", { 
+6386:                success = true; // Act as success so that it iterates forward cleanly without errors
+7529:            // Attempt direct forward first as requested by user
+7531:            if (msg.noforwards || (msg as any).noforwards) {
+7532:                console.log(`[Debug] Direct forward not possible: Message noforwards flag is set.`);
+7537:                    if (chatEntity && (chatEntity.noforwards || (chatEntity as any).noforwards)) {
+7538:                        console.log(`[Debug] Direct forward not possible: Chat content protection is enabled.`);
+7542:                    console.warn(`Failed to inspect chat entity for restricted forwarding check:`, chatError);
+7547:                console.log(`[Debug] Attempting direct forward for msg ${linkData.msgId}`);
+7548:                await safeEditMessage("🚀 **Attempting direct forward...**", { chat_id: chatId, message_id: statusMsgId });
+7565:                        console.log(`[Debug] Direct forward successful.`);
+7574:                        console.log(`[Debug] Direct forward skipped: finalSourcePeer or targetPeer missing.`);
+7577:                    console.log(`[Debug] Direct forward attempt failed: ${e.message || e}. Falling back to download/upload flow.`);
+7580:                console.log(`[Debug] Skipped direct forward because forwarding is restricted/not possible.`);
+7595:                // If it is another type of media (e.g. Geo, Contact, Poll), forward it or throw a better error.
+7619:                        const forwardResult = await destClient.invoke(new Api.messages.ForwardMessages({
+7629:                        if (forwardResult && forwardResult.updates) {
+7630:                            for (const upd of forwardResult.updates) {
+7662:                } catch (forwardErr) {
+7663:                    console.error("[Cache] Forward from cache failed. Retrying with full download/upload flow...", forwardErr);
+7664:                    // Falls back to standard download flow if forward fails
+8108:          bot.sendMessage(chatId, "📍 **Set Custom Destination**\n\nPlease forward any message from target **Group/Channel** here, or send its **Public Link**.\n\n_Bot will upload files to this location instead of your private DM._", { 
+8496:              if (msg.forward_from_chat) {
+8497:                  targetId = msg.forward_from_chat.id.toString();
+8532:                  safeSendMessage(chatId, "❌ **Invalid Input.**\nPlease forward a message or send a valid Group/Channel link.");
+8574:                          await safeSendMessage(chatId, `✅ **Destination Saved:** **${destTitle}** (\`${resolvedDestId}\`)\n\n2. Now send the **Source Group Link/ID** or forward a message to clone from:`, {
+8595:              if (msg.forward_from_chat) {
+8596:                  sourceId = msg.forward_from_chat.id.toString();
+8639:                  safeSendMessage(chatId, "❌ **Invalid Input.**\nPlease forward a message or send a valid ID/Link.");
+8648:              if (msg.forward_from_chat) {
+8649:                  sourceId = msg.forward_from_chat.id.toString();
+8664:                  if (msg.forward_from_chat && msg.forward_from_chat.title) {
+8665:                      groupName = msg.forward_from_chat.title;
+8692:                  safeSendMessage(chatId, "❌ **Invalid Source ID or Link.**\nPlease forward a message or send a valid Group/Channel ID/Link.");
+8701:              if (msg.forward_from_chat) {
+8702:                  sourceId = msg.forward_from_chat.id.toString();
+8724:                  if (msg.forward_from_chat && msg.forward_from_chat.title) {
+8725:                      groupName = msg.forward_from_chat.title;
+8766:                  safeSendMessage(chatId, "❌ **Invalid Source.**\nPlease forward a message or send a valid ID/Link.");
+8775:              if (msg.forward_from_chat) {
+8776:                  sourceId = msg.forward_from_chat.id.toString();
+8792:                  if (msg.forward_from_chat && msg.forward_from_chat.title) {
+8793:                      groupName = msg.forward_from_chat.title;
+8812:                  safeSendMessage(chatId, "❌ **Invalid Source ID or Link.**\nPlease forward a message or send a valid Group/Channel ID/Link.");
+8821:              if (msg.forward_from_chat) {
+8822:                  sourceId = msg.forward_from_chat.id.toString();
+8834:                  safeSendMessage(chatId, "❌ **Invalid Source.**\nPlease forward a message or send a valid Group/Channel ID/Link.");
+8851:              if (msg.forward_from_chat && msg.forward_from_chat.title) {
+8852:                  groupName = msg.forward_from_chat.title;
