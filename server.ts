@@ -666,7 +666,7 @@ const safeSendMessage = async (chatId: number, text: string, options: any = {}) 
     return await safeBotCall('sendMessage', chatId, safeText, options);
 };
 
-const safeEditMessage = async (text: string, options: { chat_id: number, message_id: number, parse_mode?: any, disable_web_page_preview?: boolean, reply_markup?: any }) => {
+const safeEditMessage = async (text: string, options: { chat_id: number, message_id: number, parse_mode?: any, disable_web_page_preview?: boolean, reply_markup?: any, noFallbackOnFailure?: boolean }) => {
     if (!options.message_id || options.message_id === 0) return;
     const safeText = ensureSafeMessageLength(text);
     
@@ -682,6 +682,8 @@ const safeEditMessage = async (text: string, options: { chat_id: number, message
         reply_markup: options.reply_markup
     });
     if (resCaption) return resCaption;
+
+    if (options.noFallbackOnFailure) return null;
 
     // 3. Ultimate Fallback: Delete and send new text message
     try {
@@ -1800,7 +1802,7 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
       lastErrorMsg?: string;
     }> = {};
 
-    if (token) {
+    if (false) {
       try {
         bot = new TelegramBot(token, { 
           polling: {
@@ -7338,7 +7340,9 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                     try {
                         await client.invoke(new Api.channels.JoinChannel({ channel: linkData.channelId }));
                         entity = await safelyResolveEntity(client, linkData.channelId).catch(() => null);
-                    } catch (joinErr) {}
+                    } catch (joinErr) {
+                        console.error(`[JoinChannel] Error joining ${linkData.channelId}:`, joinErr);
+                    }
                 }
                 if (entity) {
                     const msgs = await client.getMessages(entity, { ids: [linkData.msgId] });
@@ -7359,7 +7363,9 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                     try {
                         await otherClient.invoke(new Api.channels.JoinChannel({ channel: linkData.channelId }));
                         entity = await safelyResolveEntity(otherClient, linkData.channelId).catch(() => null);
-                    } catch (joinErr) {}
+                    } catch (joinErr) {
+                        console.error(`[JoinChannel] Error joining ${linkData.channelId}:`, joinErr);
+                    }
                 }
                 if (entity) {
                     const msgs = await otherClient.getMessages(entity, { ids: [linkData.msgId] });
@@ -7600,10 +7606,10 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                 }
             };
 
-            await safeEditMessage("🔍 **Locating content...**", { chat_id: chatId, message_id: statusMsgId });
+            await safeEditMessage("🔍 **Locating content...**", { chat_id: chatId, message_id: statusMsgId, noFallbackOnFailure: true });
             const sourcePeer = resolvedSourcePeer || await safelyResolveEntity(sourceClient, linkData.channelId);
 
-            await safeEditMessage("📥 **Retrieving content...**", { chat_id: chatId, message_id: statusMsgId });
+            await safeEditMessage("📥 **Retrieving content...**", { chat_id: chatId, message_id: statusMsgId, noFallbackOnFailure: true });
             
             let msg: any;
             let retryCount = 0;
@@ -7639,7 +7645,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                     
                     if (isInvalidErr && retryCount < maxRetries) {
                         retryCount++;
-                        await safeEditMessage(`🔄 **Retrying content access (${retryCount}/${maxRetries})...**`, { chat_id: chatId, message_id: statusMsgId });
+                        await safeEditMessage(`🔄 **Retrying content access (${retryCount}/${maxRetries})...**`, { chat_id: chatId, message_id: statusMsgId, noFallbackOnFailure: true });
                         await sleep(2000);
                         continue;
                     }
@@ -7804,7 +7810,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
 
             if (cachedFileRecord) {
                 console.log(`[Cache] Matching file found in cache:`, cachedFileRecord);
-                await safeEditMessage(`⚡ **Cached file found! Forwarding directly...**`, { chat_id: chatId, message_id: statusMsgId });
+                await safeEditMessage(`⚡ **Cached file found! Forwarding directly...**`, { chat_id: chatId, message_id: statusMsgId, noFallbackOnFailure: true });
                 
                 try {
                     const defaultLogPeer = await safelyResolveEntity(destClient, DEFAULT_LOG_GROUP);
@@ -7867,7 +7873,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
             // --- Cache Interception end ---
 
             if (forwardAttempted) return true;
-            await safeEditMessage(`📥 **Downloading via Source Account...**`, { chat_id: chatId, message_id: statusMsgId });
+            await safeEditMessage(`📥 **Downloading via Source Account...**`, { chat_id: chatId, message_id: statusMsgId, noFallbackOnFailure: true });
             
             console.log(`[Debug] Downloading message. msg: ${JSON.stringify(msg, (key, value) => (typeof value === 'bigint' ? value.toString() : value), 2)}`);                
             let filename = "file";
@@ -9915,7 +9921,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
         'EHOSTUNREACH'
       ];
       
-      if (silentErrors.some(msg => error.message?.includes(msg))) {
+      if (silentErrors.some(msg => error.message?.includes(msg) || error.toString().includes(msg))) {
         return;
       }
       console.error('Bot Polling Error:', error.message);
@@ -10445,7 +10451,42 @@ async function startCacheCleanup() {
   });
 }
 
+let isInitializing = false;
+async function initBot() {
+    if (bot || isInitializing) return;
+    isInitializing = true;
+    if (token) {
+        try {
+            bot = new TelegramBot(token, { 
+                request: {
+                    url: "https://api.telegram.org",
+                    timeout: 120000,
+                    agentOptions: {
+                        keepAlive: true,
+                        keepAliveMsecs: 10000
+                    }
+                } as any
+            });
+            bot.startPolling({
+                params: {
+                    timeout: 30
+                }
+            });
+            botStatus = 'Running';
+            console.log('Bot initialized successfully');
+        } catch (err: any) {
+            console.error('Failed to init bot:', err);
+            if (err.message && (err.message.includes('401') || err.message.includes('Unauthorized'))) {
+                console.error('CRITICAL: Telegram Bot Token is invalid (401 Unauthorized). Please check your TELEGRAM_BOT_TOKEN.');
+            }
+        } finally {
+            isInitializing = false;
+        }
+    }
+}
+
 async function startServer() {
+  await initBot();
   await startCacheCleanup();
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
