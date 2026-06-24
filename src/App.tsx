@@ -489,10 +489,10 @@ export default function App() {
           <button 
             disabled={queueActionLoading}
             onClick={() => handleQueueAction(data?.isQueuePaused ? 'resume' : 'pause')}
-            className={`flex items-center gap-2 px-4 py-3 rounded-xl border text-xs font-bold uppercase tracking-wider transition-all disabled:opacity-50 ${
+            className={`flex items-center gap-2 px-4 py-3 rounded-xl border text-xs font-bold uppercase tracking-wider transition-all disabled:opacity-50 shadow-md ${
               data?.isQueuePaused 
-                ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20' 
-                : 'bg-amber-500/10 border-amber-500/20 text-amber-500 hover:bg-amber-500/20'
+                ? 'bg-emerald-500 hover:bg-emerald-600 text-white border-emerald-600' 
+                : 'bg-amber-500 hover:bg-amber-600 text-white border-amber-600'
             }`}
           >
             {data?.isQueuePaused ? <Play size={14} /> : <Pause size={14} />}
@@ -506,7 +506,7 @@ export default function App() {
                 handleQueueAction('clear');
               }
             }}
-            className="flex items-center gap-2 px-4 py-3 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20 text-rose-400 rounded-xl text-xs font-bold uppercase tracking-wider transition-all disabled:opacity-50"
+            className="flex items-center gap-2 px-4 py-3 bg-rose-500 hover:bg-rose-600 text-white border border-rose-600 rounded-xl text-xs font-bold uppercase tracking-wider transition-all disabled:opacity-50 shadow-md"
           >
             <Trash size={14} />
             Wipe Cache Queue ({data?.queueSize || 0})
@@ -529,7 +529,7 @@ export default function App() {
                 placeholder="e.g. https://t.me/c/123456789/402"
                 value={singleTaskLink}
                 onChange={(e) => setSingleTaskLink(e.target.value)}
-                className="w-full bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-800 rounded-xl px-3.5 py-2.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-sky-500/50 transition-all font-mono"
+                className="w-full max-w-sm bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-800 rounded-full px-3.5 py-1.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-sky-500/50 transition-all font-mono"
               />
             </div>
             <div className="flex items-center justify-between gap-3">
@@ -545,7 +545,7 @@ export default function App() {
               <button 
                 type="submit"
                 disabled={submittingSingleTask || !singleTaskLink}
-                className="px-4 py-2 bg-sky-500 hover:bg-sky-600 text-white font-bold text-[10px] uppercase tracking-wider rounded-xl transition-all disabled:opacity-50"
+                className="px-6 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs uppercase tracking-wider rounded-full transition-all disabled:opacity-50 shadow-md"
               >
                 {submittingSingleTask ? 'Processing...' : 'Queue Link'}
               </button>
@@ -568,7 +568,7 @@ export default function App() {
                   placeholder="https://t.me/c/.../1"
                   value={batchStartLink}
                   onChange={(e) => setBatchStartLink(e.target.value)}
-                  className="w-full bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-800 rounded-xl p-2.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500/50 transition-all font-mono"
+                  className="w-full max-w-sm bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-800 rounded-full px-3 py-1.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500/50 transition-all font-mono"
                 />
               </div>
               <div>
@@ -578,7 +578,7 @@ export default function App() {
                   placeholder="https://t.me/c/.../50"
                   value={batchEndLink}
                   onChange={(e) => setBatchEndLink(e.target.value)}
-                  className="w-full bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-800 rounded-xl p-2.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500/50 transition-all font-mono"
+                  className="w-full max-w-sm bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-800 rounded-full px-3 py-1.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500/50 transition-all font-mono"
                 />
               </div>
             </div>
@@ -595,7 +595,7 @@ export default function App() {
               <button 
                 type="submit"
                 disabled={submittingBatchTask || !batchStartLink || !batchEndLink}
-                className="px-4 py-2 bg-indigo-500 hover:bg-indigo-600 text-white font-bold text-[10px] uppercase tracking-wider rounded-xl transition-all disabled:opacity-50"
+                className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs uppercase tracking-wider rounded-full transition-all disabled:opacity-50 shadow-md"
               >
                 {submittingBatchTask ? 'Processing...' : 'Start Web Batch'}
               </button>
@@ -665,8 +665,8 @@ export default function App() {
                         <span className="text-emerald-400">{job.progress.speed || '0 KB/s'}</span>
                         <span className="text-slate-400">ETA: {job.progress.eta || 'N/A'}</span>
                       </div>
-                      <div className="h-2 bg-slate-200 dark:bg-slate-700 rounded-full overflow-hidden">
-                        <div className="h-full bg-emerald-500" style={{ width: `${job.progress.percent || 0}%` }}></div>
+                      <div className="h-2.5 bg-slate-200 dark:bg-slate-800 rounded-full overflow-hidden shadow-inner">
+                        <motion.div initial={{ width: 0 }} animate={{ width: `${job.progress.percent || 0}%` }} className="h-full bg-emerald-500 rounded-full" />
                       </div>
                       <div className="flex justify-between items-center text-[9px] text-slate-400 font-bold">
                         <span>{Math.round(job.progress.percent || 0)}% Completed</span>

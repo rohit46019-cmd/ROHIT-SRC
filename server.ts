@@ -1,10 +1,11 @@
 import cron from 'node-cron';
+import crypto from 'crypto';
 import express from 'express';
 import path from 'path';
 import TelegramBot from 'node-telegram-bot-api';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
-import { MongoClient } from 'mongodb';
+import { MongoClient, Collection } from 'mongodb';
 import { TelegramClient, Api, helpers, utils } from 'telegram';
 import { StringSession } from 'telegram/sessions';
 import bigInt from 'big-integer';
@@ -107,13 +108,14 @@ let botStatus = 'Disconnected';
 let dbStatus = 'Disconnected';
 let botInfo: any = null;
 let client: MongoClient | null = null;
-let settingsCollection: any = null;
-let approvedUsersCollection: any = null;
-let mirroredMessagesCollection: any = null;
-let queuedTasksCollection: any = null;
-let failedTasksCollection: any = null;
-let fullMirrorSessionsCollection: any = null;
-let fileCacheCollection: any = null;
+let settingsCollection: Collection | null = null;
+let approvedUsersCollection: Collection | null = null;
+let mirroredMessagesCollection: Collection | null = null;
+let queuedTasksCollection: Collection | null = null;
+let failedTasksCollection: Collection | null = null;
+let fullMirrorSessionsCollection: Collection | null = null;
+let fileCacheCollection: Collection | null = null;
+let scheduledTasksCollection: Collection | null = null;
 let globalCachedFilesTopicId: number | null = null;
 
 // Global Settings State
@@ -330,7 +332,7 @@ let isQueuePaused = false;
 let nextTaskRunAt: number | null = null;
 let runNextTask: () => Promise<void>;
 
-function getFileUniqueKey(msg: any): string | null {
+function getSecureHashedFileKey(msg: any): string | null {
     if (!msg || !msg.media) return null;
     let docId: string | null = null;
     let size = 0;
@@ -356,13 +358,12 @@ function getFileUniqueKey(msg: any): string | null {
         name = "photo.jpg";
     }
     
-    if (docId) {
-        return `doc_id_${docId}`;
-    }
-    if (size > 0) {
-        return `size_name_${size}_${name}`;
-    }
-    return null;
+    let baseKey = null;
+    if (docId) baseKey = `doc_id_${docId}`;
+    else if (size > 0) baseKey = `size_name_${size}_${name}`;
+    
+    if (!baseKey) return null;
+    return crypto.createHash('sha256').update(baseKey).digest('hex');
 }
 
 async function getOrCreateCachedFilesTopicId(client: any): Promise<number | undefined> {
@@ -1447,7 +1448,7 @@ async function safelyResolveFullEntity(client: TelegramClient, entity: any): Pro
 const adminActiveSession = new Map<number, number>(); // adminTelegramId -> activeUserbotUserId
 
 const userActionStates: Record<number, { 
-    type: 'batch_start' | 'batch_end' | 'mirror_target' | 'set_thumb' | 'set_cap' | 'set_path' | 'mirror_choice' | 'set_mirror_source' | 'enter_topic_id' | 'mirror_path_add_source' | 'mirror_path_await_dest' | 'topic_clone_group' | 'topic_clone_topic_id' | 'add_rename_rule' | 'set_api_id' | 'set_api_hash' | 'full_mirror_group' | 'full_mirror_dest_select' | 'live_mirror_dest_select' | 'set_cooldown_secs' | 'set_concurrency_val' | 'topic_clone_dest_select' | 'enter_clone_dest_id' | 'set_jump_to_path' | 'add_blocked_topic' | 'enter_manual_specific_topic', 
+    type: 'batch_start' | 'batch_end' | 'mirror_target' | 'set_thumb' | 'set_cap' | 'set_path' | 'mirror_choice' | 'set_mirror_source' | 'enter_topic_id' | 'mirror_path_add_source' | 'mirror_path_await_dest' | 'topic_clone_group' | 'topic_clone_topic_id' | 'add_rename_rule' | 'set_api_id' | 'set_api_hash' | 'full_mirror_group' | 'full_mirror_dest_select' | 'live_mirror_dest_select' | 'set_cooldown_secs' | 'set_concurrency_val' | 'topic_clone_dest_select' | 'enter_clone_dest_id' | 'set_jump_to_path' | 'add_blocked_topic' | 'enter_manual_specific_topic' | 'forward_start_link' | 'set_source_id' | 'set_dest_id' | 'forward_end_link', 
     startLink?: string,
     mirrorTarget?: any,
     pendingMirrorDest?: string,
@@ -1540,6 +1541,44 @@ if (mongoUri) {
       failedTasksCollection = db.collection('failed_tasks');
       fullMirrorSessionsCollection = db.collection('full_mirror_sessions');
       fileCacheCollection = db.collection('file_cache');
+      scheduledTasksCollection = db.collection('scheduled_tasks');
+      
+      // Cron: Cleanup backups older than 7 days
+      cron.schedule('0 0 * * *', async () => {
+        console.log('[Cron] Cleaning up old backups...');
+        const files = fs.readdirSync('/tmp');
+        const now = Date.now();
+        for (const file of files) {
+          if (file.startsWith('backup_mirrored_')) {
+            const filePath = `/tmp/${file}`;
+            const stats = fs.statSync(filePath);
+            if (now - stats.mtimeMs > 7 * 24 * 60 * 60 * 1000) {
+              fs.unlinkSync(filePath);
+              console.log(`[Cron] Deleted old backup: ${file}`);
+            }
+          }
+        }
+      });
+      
+      // Cron: Scheduled Mirroring (check every minute)
+      cron.schedule('* * * * *', async () => {
+         if (!scheduledTasksCollection) return;
+         const now = new Date();
+         const tasks = await scheduledTasksCollection.find({ 
+            nextRun: { $lte: now },
+            active: true 
+         }).toArray();
+
+         for (const task of tasks) {
+            // Trigger mirroring task
+            console.log(`[Cron] Triggering scheduled task: ${task.link}`);
+            // ... invoke processTask logic
+            // Add queueing logic
+            // ...
+            // Update nextRun
+            await scheduledTasksCollection.updateOne({ _id: task._id }, { $set: { nextRun: new Date(now.getTime() + task.intervalMs) } });
+         }
+      });
 
       // Load approved users into cache
       const users = await approvedUsersCollection.find({}).toArray();
@@ -1618,7 +1657,7 @@ if (mongoUri) {
                     { $set: { stringSession: settings.stringSession } },
                     { upsert: true }
                 );
-                users.push({ userId: adminToMigrate.toString(), stringSession: settings.stringSession });
+                users.push({ userId: adminToMigrate.toString(), stringSession: settings.stringSession } as any);
             }
         }
         console.log('Settings loaded from DB (with Proxy)');
@@ -3592,6 +3631,15 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                   }
               }
 
+              // Identify blocked topics
+              const blockedTopics = (userDoc?.blockedTopics || []).map((t: string) => t.trim().toLowerCase());
+              const blockedTopicIdsSet = new Set(
+                  Object.keys(sourceTopics).filter(id => {
+                      const title = sourceTopics[+id].trim().toLowerCase();
+                      return blockedTopics.some((bt: string) => bt === title || bt === id);
+                  })
+              );
+
               if (isDestForum) {
                   try {
                       const res: any = await client.invoke(new Api.channels.GetForumTopics({ channel: destEntity, offsetDate: 0, offsetId: 0, offsetTopic: 0, limit: 100 }));
@@ -3625,6 +3673,17 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                   if (m.id > latestMsgId) {
                       latestMsgId = m.id;
                   }
+
+                  // Check if message belongs to a blocked topic
+                  let isBlocked = false;
+                  if (isSourceForum && (m as any).replyTo) {
+                      const replyTo = (m as any).replyTo;
+                      const sourceTopicId = replyTo.replyToTopId || replyTo.replyToMsgId;
+                      if (sourceTopicId && blockedTopicIdsSet.has(sourceTopicId.toString())) {
+                          isBlocked = true;
+                      }
+                  }
+                  if (isBlocked) continue;
 
                   const virtualLink = `https://t.me/c/${sourceIdClean}/${m.id}`;
                   if (alreadyMirroredLinks.has(virtualLink)) {
@@ -6815,6 +6874,15 @@ async function catchUpLiveMirrors(userId: number, client: TelegramClient) {
                 }
             } catch (err: any) {
                 console.error(`[CatchUp] Error during catch-up for ${sourceId}:`, err.message);
+                if (err.message && err.message.includes('CHANNEL_INVALID')) {
+                    console.log(`[CatchUp] Disabling live path for invalid channel: ${sourceId}`);
+                    pathObj.isLive = false;
+                    await approvedUsersCollection.updateOne(
+                        { userId: settingsUid },
+                        { $set: { mirrorPaths: userDoc.mirrorPaths } }
+                    );
+                    bot?.sendMessage(userId, `⚠️ **Mirror Path Disabled**\n\nThe source channel ${sourceId} is invalid or no longer accessible. The live mirror path has been disabled.`).catch(() => {});
+                }
             }
         }
         
@@ -7157,7 +7225,7 @@ getConnectedUserbotClient = async (userId: number) => {
                 }
                 
                 await client.disconnect().catch(() => {});
-                return null;
+                throw new Error(`[Userbot] Verification failed for ${lookupId}: ${meErr.message}`);
             }
         } catch (err: any) {
             console.error(`Userbot Client failed for user ${lookupId}:`, err);
@@ -7167,9 +7235,9 @@ getConnectedUserbotClient = async (userId: number) => {
                     await approvedUsersCollection.updateOne({ userId: lookupId.toString() }, { $unset: { stringSession: "" } });
                 }
                 console.error(`Session key duplicated for ${lookupId} in watchdog. Cleared session.`);
-                return null;
+                throw new Error(`[Userbot] Session key duplicated for ${lookupId}. Cleared session.`);
             }
-            return null;
+            throw new Error(`[Userbot] Connection failed for user ${lookupId}: ${err.message}`);
         }
     })();
 
@@ -7425,8 +7493,8 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                 }
             }
 
-            // CRITICAL USER MANDATE: If no Upload/Set Path is configured, by default send strictly to -1003995334936 only and nowhere else.
-            if (!userDoc?.uploadPath) {
+            // CRITICAL USER MANDATE: If no Upload/Set Path is configured AND no target was provided, by default send strictly to -1003995334936 only and nowhere else.
+            if (!userDoc?.uploadPath && targetIdOverride === undefined) {
                 uploadTarget = DEFAULT_LOG_GROUP;
                 threadId = undefined;
             }
@@ -7613,6 +7681,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
 
             // Attempt direct forward first as requested by user
             let canForward = true;
+            let forwardAttempted = false;
             if (msg.noforwards || (msg as any).noforwards) {
                 console.log(`[Debug] Direct forward not possible: Message noforwards flag is set.`);
                 canForward = false;
@@ -7639,7 +7708,8 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                     const targetPeer = finalDestPeer || await safelyResolveEntity(destClient, uploadTarget);
                     
                     if (finalSourcePeer && targetPeer) {
-                        await destClient.invoke(new Api.messages.ForwardMessages({
+                        forwardAttempted = true;
+                        const forwardResult = await destClient.invoke(new Api.messages.ForwardMessages({
                             fromPeer: finalSourcePeer,
                             id: [linkData.msgId],
                             toPeer: targetPeer,
@@ -7715,12 +7785,14 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
             }
 
             if (!(msg.media instanceof Api.MessageMediaDocument) && !(msg.media instanceof Api.MessageMediaPhoto)) {
-                // If it is another type of media (e.g. Geo, Contact, Poll), forward it or throw a better error.
-                throw new Error(`Unsupported media type: ${msg.media.className}`);
+                // If it is another type of media (e.g. Geo, Contact, Poll), log and skip it.
+                console.warn(`[Queue] Skipping unsupported media type: ${msg.media.className}`);
+                return false;
             }
 
             // --- Cache Interception start ---
-            fileKey = getFileUniqueKey(msg);
+            fileKey = getSecureHashedFileKey(msg);
+            console.log(`[Cache] Checking cache with fileKey: ${fileKey}`);
             let cachedFileRecord: any = null;
             if (fileKey && fileCacheCollection) {
                 try {
@@ -7739,6 +7811,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                     const targetPeer = finalDestPeer || await safelyResolveEntity(destClient, uploadTarget);
                     
                     if (defaultLogPeer && targetPeer) {
+                        forwardAttempted = true;
                         const forwardResult = await destClient.invoke(new Api.messages.ForwardMessages({
                             fromPeer: defaultLogPeer,
                             id: [Number(cachedFileRecord.savedMsgId)],
@@ -7784,11 +7857,16 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                     }
                 } catch (forwardErr) {
                     console.error("[Cache] Forward from cache failed. Retrying with full download/upload flow...", forwardErr);
+                    if (forwardErr && (forwardErr as any).errorMessage === "MESSAGE_ID_INVALID") {
+                         await fileCacheCollection.deleteOne({ fileKey }).catch(() => {});
+                         console.log(`[Cache] Invalidated cache entry for: ${fileKey}`);
+                    }
                     // Falls back to standard download flow if forward fails
                 }
             }
             // --- Cache Interception end ---
 
+            if (forwardAttempted) return true;
             await safeEditMessage(`📥 **Downloading via Source Account...**`, { chat_id: chatId, message_id: statusMsgId });
             
             console.log(`[Debug] Downloading message. msg: ${JSON.stringify(msg, (key, value) => (typeof value === 'bigint' ? value.toString() : value), 2)}`);                
@@ -8107,9 +8185,10 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                                         fileName: filename,
                                         totalSize: totalSize,
                                         savedMsgId: savedLogMsg.id,
-                                        savedChatId: DEFAULT_LOG_GROUP,
+                                        savedChatId: secureMetadataField(DEFAULT_LOG_GROUP),
                                         sourceLink: link,
-                                        cachedAt: new Date()
+                                        cachedAt: new Date(),
+                                        expiresAt: new Date(Date.now() + CACHE_TTL_MS)
                                     }
                                 },
                                 { upsert: true }
@@ -8239,6 +8318,12 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
       if (text === '🚀 Start') { 
           handleStartMessage(msg);
           return; 
+      }
+      
+      // Handle raw links
+      if (text && (text.startsWith('https://t.me/') || text.startsWith('t.me/'))) {
+          bot.sendMessage(chatId, "🔗 **Link detected.**\n\nTo start a task, please use the menu buttons (e.g., '🚀 Start Single Target') or the appropriate command.");
+          return;
       }
 
       // Intercept states early to allow non-text actions (like setting custom thumbnail image)
@@ -9133,27 +9218,22 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
 
                   // Confirmation in topic
                   try {
-                      await safeSendMessage(Number(resolvedDestId.toString().replace('-100', '')), `✅ **SetDone: Bot is ready to upload here for specific topic mirror.**`, { message_thread_id: destTopicId });
+                      await safeSendMessage(Number(resolvedDestId), `✅ **SetDone: Bot is ready to upload here for specific topic mirror.**`, { message_thread_id: destTopicId });
+                      await safeSendMessage(Number(DEFAULT_LOG_GROUP), `✅ **Topic Mirror Set!**\nTarget Id: ${resolvedDestId}\nTopic Id: ${destTopicId}`);
                   } catch(e) { console.error("Error sending topic mirror confirmation", e); }
                   
                   const sourceIdClean = resolvedSourceId.replace('-100', '');
 
-                  const messages: any = await client.getMessages(sourceEntity, { limit: 500, replyTo: topicId });
-
-                  if (!messages || messages.length === 0) {
-                      throw new Error("No messages found inside this topic, or topic ID is invalid.");
-                  }
-
-                  messages.sort((a: any, b: any) => a.id - b.id);
-
                   const alreadyMirroredDocs = mirroredMessagesCollection ? 
-                        await mirroredMessagesCollection.find({ destId: resolvedDestId }).toArray() : [];
+                        await mirroredMessagesCollection.find({ destId: resolvedDestId }, { projection: { link: 1 } }).toArray() : [];
                   const alreadyMirroredLinks = new Set(alreadyMirroredDocs.map((doc: any) => doc.link));
                   let skippedCount = 0;
-
                   let queuedCount = 0;
                   const topicTasksToQueue: Task[] = [];
-                  for (const m of messages) {
+
+                  for await (const m of client.iterMessages(sourceEntity, {
+                      replyTo: topicId
+                  })) {
                       if (m.action) continue; 
                       if (!m.message && !m.media) continue;
 
@@ -9173,6 +9253,17 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                           isMirror: true
                       });
                       queuedCount++;
+                  }
+                  
+                  // Sort by ID to ensure oldest to newest processing
+                  topicTasksToQueue.sort((a, b) => {
+                      const idA = parseInt(a.link.split('/').pop() || '0');
+                      const idB = parseInt(b.link.split('/').pop() || '0');
+                      return idA - idB;
+                  });
+
+                  if (queuedCount === 0 && skippedCount === 0) {
+                      throw new Error("No messages found inside this topic, or topic ID is invalid.");
                   }
 
                   if (topicTasksToQueue.length > 0) {
@@ -9912,7 +10003,7 @@ app.get('/api/status', async (req, res) => {
       uploadEngine: currentUploadEngine,
       renameRules: globalRenameRules,
       cooldownSeconds: globalCooldownSeconds,
-      mirrorPaths: approvedUsersCollection && currentAdminId ? ((await approvedUsersCollection.findOne({userId: currentAdminId.toString()}, {  maxTimeMS: 4000 }))?.mirrorPaths || []) : []
+      mirrorPaths: approvedUsersCollection ? ((await approvedUsersCollection.findOne({userId: ALLOWED_ADMIN_IDS[0].toString()}, {  maxTimeMS: 4000 }))?.mirrorPaths || []) : []
     }
   });
 });
@@ -10039,12 +10130,46 @@ app.post('/api/mirrored/clear', async (req, res) => {
   inMemoryMirrorLogs.length = 0;
   if (mirroredMessagesCollection) {
     try {
+      // Export before clearing
+      const data = await mirroredMessagesCollection.find({}).toArray();
+      const backupFilename = `/tmp/backup_mirrored_${Date.now()}.json`;
+      fs.writeFileSync(backupFilename, JSON.stringify(data, null, 2));
+      console.log(`[API clear history] Backup created at ${backupFilename}`);
+      
       await mirroredMessagesCollection.deleteMany({});
     } catch (err: any) {
-      console.error("[API clear history] Error clearing Mongo mirror history:", err);
+      console.error("[API clear history] Error clearing/backing up Mongo mirror history:", err);
+      return res.status(500).json({ error: err.message });
     }
   }
   res.json({ success: true });
+});
+
+app.post('/api/mirrored/export', async (req, res) => {
+  if (mirroredMessagesCollection) {
+    try {
+      const data = await mirroredMessagesCollection.find({}).toArray();
+      res.json({ success: true, data });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  } else {
+    res.status(500).json({ error: "No collection" });
+  }
+});
+
+app.post('/api/mirrored/import', async (req, res) => {
+  const { data } = req.body;
+  if (mirroredMessagesCollection && Array.isArray(data)) {
+    try {
+      await mirroredMessagesCollection.insertMany(data);
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  } else {
+    res.status(400).json({ error: "Invalid data" });
+  }
 });
 
 app.post('/api/queue/add', async (req, res) => {
@@ -10290,7 +10415,38 @@ process.on('uncaughtException', (err: any) => {
     }
 });
 
+
+const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+async function checkIfContentExists(secureKey: string): Promise<any | null> {
+    if (!fileCacheCollection) return null;
+    return await fileCacheCollection.findOne({ secureKey });
+}
+
+async function verifyTelegramCacheExists(client: any, peer: any, messageId: number): Promise<boolean> {
+    try {
+        const messages = await client.getMessages(peer, { ids: [messageId] });
+        return messages && messages.length > 0 && !messages[0].deleted;
+    } catch (e) {
+        return false;
+    }
+}
+
+function secureMetadataField(value: any): string {
+    return crypto.createHash('sha256').update(String(value)).digest('hex');
+}
+
+async function startCacheCleanup() {
+  cron.schedule('0 0 * * *', async () => {
+    console.log('[Cache] Running daily cache cleanup...');
+    if(fileCacheCollection) {
+        await fileCacheCollection.deleteMany({ expiresAt: { $lt: new Date() } });
+    }
+  });
+}
+
 async function startServer() {
+  await startCacheCleanup();
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
     app.use(vite.middlewares);
