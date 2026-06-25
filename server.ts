@@ -1488,7 +1488,7 @@ async function runActiveWatchdog() {
                         await Promise.race([
                             existingClient.getMe(),
                             new Promise((_, reject) => {
-                                timeoutId = setTimeout(() => reject(new Error("Heartbeat Timeout")), 10000);
+                                timeoutId = setTimeout(() => reject(new Error("Heartbeat Timeout")), 30000);
                             })
                         ]);
                         clearTimeout(timeoutId);
@@ -7125,12 +7125,6 @@ getConnectedUserbotClient = async (userId: number) => {
                 console.warn(`[getConnectedUserbotClient] Client fail for ${lookupId}: ${e.message}`);
                 userClients.delete(lookupId);
                 activeWatchers.delete(lookupId);
-                if (e.message?.includes('AUTH_KEY_UNREGISTERED')) {
-                    userSessions.delete(lookupId);
-                    if (approvedUsersCollection) {
-                         await approvedUsersCollection.updateOne({ userId: lookupId.toString() }, { $unset: { stringSession: "" } });
-                    }
-                }
             }
         }
 
@@ -9920,66 +9914,71 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
 app.use(express.json());
 
 app.get('/api/status', async (req, res) => {
-  res.json({
-    status: botStatus,
-    dbStatus: dbStatus,
-    adminConfigured: !!currentAdminId,
-    botInfo: botInfo,
-    queueSize: taskQueue.length,
-    nextTaskIn: nextTaskRunAt ? Math.max(0, Math.round((nextTaskRunAt - Date.now()) / 1000)) : 0,
-    proxy: undefined,
-    isQueuePaused: isQueuePaused,
-    activeJobs: Array.from(activeTaskJobs.values()).map(job => ({
-      link: job.link,
-      phase: job.phase,
-      progress: job.progress ? {
-        percent: job.progress.percent,
-        current: job.progress.current,
-        total: job.progress.total,
-        speed: job.progress.speed,
-        elapsed: job.progress.elapsed,
-        eta: job.progress.eta
-      } : null,
-      cooldownRemaining: job.cooldownRemaining,
-      isMirror: job.isMirror
-    })),
-    batches: Array.from(batchStatusMap.entries()).map(([batchId, info]) => {
-      const remaining = info.total - info.processed;
-      const progress = info.total > 0 ? Math.floor((info.processed / info.total) * 100) : 0;
-      return {
-        batchId,
-        total: info.total,
-        processed: info.processed,
-        success: info.success,
-        failed: info.failed,
-        currentLink: info.currentLink,
-        startTime: info.startTime,
-        progress,
-        isActive: remaining > 0
-      };
-    }),
-    taskQueue: taskQueue.map(t => ({
-      link: t.link,
-      isMirror: t.isMirror,
-      userId: t.userId
-    })),
-    config: {
-      hasToken: !!token,
-      hasMongo: !!mongoUri,
-      hasTarget: !!destinationChatId
-    },
-    settings: {
-      adminId: currentAdminId,
-      destinationChatId: destinationChatId,
-      apiId: apiIdValue || null,
-      apiHash: apiHashValue || null,
-      downloadLibrary: currentDownloadLibrary,
-      uploadEngine: currentUploadEngine,
-      renameRules: globalRenameRules,
-      cooldownSeconds: globalCooldownSeconds,
-      mirrorPaths: approvedUsersCollection ? ((await approvedUsersCollection.findOne({userId: ALLOWED_ADMIN_IDS[0].toString()}, {  maxTimeMS: 4000 }))?.mirrorPaths || []) : []
-    }
-  });
+  try {
+    res.json({
+      status: botStatus,
+      dbStatus: dbStatus,
+      adminConfigured: !!currentAdminId,
+      botInfo: botInfo,
+      queueSize: taskQueue.length,
+      nextTaskIn: nextTaskRunAt ? Math.max(0, Math.round((nextTaskRunAt - Date.now()) / 1000)) : 0,
+      proxy: undefined,
+      isQueuePaused: isQueuePaused,
+      activeJobs: Array.from(activeTaskJobs.values()).map(job => ({
+        link: job.link,
+        phase: job.phase,
+        progress: job.progress ? {
+          percent: job.progress.percent,
+          current: job.progress.current,
+          total: job.progress.total,
+          speed: job.progress.speed,
+          elapsed: job.progress.elapsed,
+          eta: job.progress.eta
+        } : null,
+        cooldownRemaining: job.cooldownRemaining,
+        isMirror: job.isMirror
+      })),
+      batches: Array.from(batchStatusMap.entries()).map(([batchId, info]) => {
+        const remaining = info.total - info.processed;
+        const progress = info.total > 0 ? Math.floor((info.processed / info.total) * 100) : 0;
+        return {
+          batchId,
+          total: info.total,
+          processed: info.processed,
+          success: info.success,
+          failed: info.failed,
+          currentLink: info.currentLink,
+          startTime: info.startTime,
+          progress,
+          isActive: remaining > 0
+        };
+      }),
+      taskQueue: taskQueue.map(t => ({
+        link: t.link,
+        isMirror: t.isMirror,
+        userId: t.userId
+      })),
+      config: {
+        hasToken: !!token,
+        hasMongo: !!mongoUri,
+        hasTarget: !!destinationChatId
+      },
+      settings: {
+        adminId: currentAdminId,
+        destinationChatId: destinationChatId,
+        apiId: apiIdValue || null,
+        apiHash: apiHashValue || null,
+        downloadLibrary: currentDownloadLibrary,
+        uploadEngine: currentUploadEngine,
+        renameRules: globalRenameRules,
+        cooldownSeconds: globalCooldownSeconds,
+        mirrorPaths: approvedUsersCollection ? ((await approvedUsersCollection.findOne({userId: ALLOWED_ADMIN_IDS[0].toString()}, {  maxTimeMS: 4000 }))?.mirrorPaths || []) : []
+      }
+    });
+  } catch (err: any) {
+    console.error('[API Status] Error:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/api/queue/pause', (req, res) => {

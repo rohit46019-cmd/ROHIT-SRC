@@ -100,6 +100,7 @@ export default function App() {
           setFailedTasks(failedJson.failed || []);
         }
       } catch (err) {
+        console.error('Frontend Error:', err);
         setError(err instanceof Error ? err.message : 'An error occurred');
       } finally {
         setLoading(false);
