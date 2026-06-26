@@ -7181,18 +7181,18 @@ getConnectedUserbotClient = async (userId: number) => {
                 console.error(`[getConnectedUserbotClient] Verification failed for ${lookupId}: ${meErr.message}`);
                 if (meErr.message?.includes('AUTH_KEY_UNREGISTERED')) {
                     userSessions.delete(lookupId);
-                    if (approvedUsersCollection) {
-                        await approvedUsersCollection.updateOne({ userId: lookupId.toString() }, { $unset: { stringSession: "" } });
-                    }
+                    // if (approvedUsersCollection) {
+                    //     await approvedUsersCollection.updateOne({ userId: lookupId.toString() }, { $unset: { stringSession: "" } });
+                    // }
                     await client.disconnect().catch(() => {});
                     return null;
                 }
                 
                 if (meErr.message?.includes('AUTH_KEY_DUPLICATED')) {
                     userSessions.delete(lookupId);
-                    if (approvedUsersCollection) {
-                        await approvedUsersCollection.updateOne({ userId: lookupId.toString() }, { $unset: { stringSession: "" } });
-                    }
+                    // if (approvedUsersCollection) {
+                    //     await approvedUsersCollection.updateOne({ userId: lookupId.toString() }, { $unset: { stringSession: "" } });
+                    // }
                     await client.disconnect().catch(() => {});
                     console.error(`Session key duplicated for ${lookupId}. Cleared session.`);
                     return null;
@@ -7205,9 +7205,9 @@ getConnectedUserbotClient = async (userId: number) => {
             console.error(`Userbot Client failed for user ${lookupId}:`, err);
             if (err.message?.includes('AUTH_KEY_DUPLICATED') || (err as any).errorMessage === 'AUTH_KEY_DUPLICATED') {
                 userSessions.delete(lookupId);
-                if (approvedUsersCollection) {
-                    await approvedUsersCollection.updateOne({ userId: lookupId.toString() }, { $unset: { stringSession: "" } });
-                }
+                // if (approvedUsersCollection) {
+                //     await approvedUsersCollection.updateOne({ userId: lookupId.toString() }, { $unset: { stringSession: "" } });
+                // }
                 console.error(`Session key duplicated for ${lookupId} in watchdog. Cleared session.`);
                 throw new Error(`[Userbot] Session key duplicated for ${lookupId}. Cleared session.`);
             }
@@ -8048,6 +8048,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
 
             while (!uploadDone) {
                 try {
+                    if (!destClient.connected) await destClient.connect().catch(() => {});
                     const uploadedFile = await destClient.uploadFile({
                         file: new CustomFile(filename, totalSize, tempFilePath),
                         workers: uploadWorkers,
