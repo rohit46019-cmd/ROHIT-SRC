@@ -8024,7 +8024,8 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
             }
 
             const agentLabel = (userDoc?.uploadAgent === 'bot') ? 'Bot itself' : 'Destination Account';
-            await safeEditMessage(`📤 **Uploading via ${agentLabel}...**`, { chat_id: chatId, message_id: statusMsgId });
+            const uploadRes = await safeEditMessage(`📤 **Uploading via ${agentLabel}...**`, { chat_id: chatId, message_id: statusMsgId });
+            if (uploadRes && uploadRes.id) statusMsgId = uploadRes.id;
             
             const uploadStartTime = Date.now();
             const totalSize = fs.statSync(tempFilePath).size;
@@ -8050,7 +8051,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                     const uploadedFile = await destClient.uploadFile({
                         file: new CustomFile(filename, totalSize, tempFilePath),
                         workers: uploadWorkers,
-                        onProgress: (current: any) => {
+                        onProgress: async (current: any) => {
                             let currentBytes = Number(current);
                             if (currentBytes <= 1.0 && currentBytes >= 0) {
                                 currentBytes = Math.floor(currentBytes * totalSize);
@@ -8078,7 +8079,8 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                             if (now - lastUploadUpdate > 1000 || currentBytes === totalSize) {
                                 lastUploadUpdate = now;
                                 const text = createProgressBar(Number(totalSize), currentBytes, "Uploading", uploadStartTime, pathDisplay);
-                                safeEditMessage(text, { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown' }).catch(() => {});
+                                const progressRes = await safeEditMessage(text, { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown' });
+                                if (progressRes && progressRes.id) statusMsgId = progressRes.id;
                             }
                         }
                     });
