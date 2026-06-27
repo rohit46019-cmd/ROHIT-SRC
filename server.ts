@@ -163,8 +163,8 @@ async function getConnectedBotClient(): Promise<TelegramClient | null> {
             apiHashValue,
             {
                 connectionRetries: 10,
-                timeout: 120000,
-                requestRetries: 5,
+                timeout: 300000,
+                requestRetries: 10,
                 ...getRandomDeviceProps(),
                 useWSS: false,
                 autoReconnect: true,
@@ -176,7 +176,7 @@ async function getConnectedBotClient(): Promise<TelegramClient | null> {
         });
         let timeoutId: any;
         const timeoutPromise = new Promise((_, reject) => {
-            timeoutId = setTimeout(() => reject(new Error("GramJS bot start timeout after 60000ms")), 60000);
+            timeoutId = setTimeout(() => reject(new Error("GramJS bot start timeout after 300000ms")), 300000);
         });
         await Promise.race([startPromise, timeoutPromise]);
         clearTimeout(timeoutId);
@@ -384,7 +384,9 @@ async function getOrCreateCachedFilesTopicId(client: any): Promise<number | unde
     }
     
     try {
+        console.log(`[CacheLog] Attempting to resolve DEFAULT_LOG_GROUP: ${DEFAULT_LOG_GROUP}`);
         const logPeer = await safelyResolveEntity(client, DEFAULT_LOG_GROUP);
+        console.log(`[CacheLog] Resolved logPeer result:`, logPeer ? "Success" : "Failed");
         if (logPeer) {
             console.log("[CacheLog] Creating Saved Files Cache topic in DEFAULT_LOG_GROUP...");
             const result = await client.invoke(new Api.channels.CreateForumTopic({
@@ -422,6 +424,8 @@ async function getOrCreateCachedFilesTopicId(client: any): Promise<number | unde
                 console.log(`[CacheLog] Created new topic "📁 Saved Files Cache" with ThreadID: ${topicId}`);
                 return topicId;
             }
+        } else {
+            console.warn(`[CacheLog] Critical: Could not resolve DEFAULT_LOG_GROUP: ${DEFAULT_LOG_GROUP}. Is the bot in this group?`);
         }
     } catch (e: any) {
         const errStr = String(e?.message || e);
@@ -482,7 +486,7 @@ async function resumeDownloadFile(
     }
 
     let lastProgressTime = Date.now();
-    const DOWNLOAD_STALL_TIMEOUT = 180000;
+    const DOWNLOAD_STALL_TIMEOUT = 600000;
     let isFinished = false;
 
     let stallInterval: NodeJS.Timeout | null = null;
@@ -671,17 +675,27 @@ const safeEditMessage = async (text: string, options: { chat_id: number, message
     const safeText = ensureSafeMessageLength(text);
     
     // 1. Attempt editMessageText
-    const res = await safeBotCall('editMessageText', safeText, options);
-    if (res) return res;
+    try {
+        const res = await safeBotCall('editMessageText', safeText, options);
+        if (res) return res;
+    } catch (e: any) {
+        if (e.message?.includes('Message is not modified')) return true;
+        throw e;
+    }
 
     // 2. Fallback: Attempt editMessageCaption
-    const resCaption = await safeBotCall('editMessageCaption', safeText, {
-        chat_id: options.chat_id,
-        message_id: options.message_id,
-        parse_mode: options.parse_mode,
-        reply_markup: options.reply_markup
-    });
-    if (resCaption) return resCaption;
+    try {
+        const resCaption = await safeBotCall('editMessageCaption', safeText, {
+            chat_id: options.chat_id,
+            message_id: options.message_id,
+            parse_mode: options.parse_mode,
+            reply_markup: options.reply_markup
+        });
+        if (resCaption) return resCaption;
+    } catch (e: any) {
+        if (e.message?.includes('Message is not modified')) return true;
+        // Do not throw here, let it fall through to delete/send fallback
+    }
 
     // 3. Ultimate Fallback: Delete and send new text message
     try {
@@ -7148,9 +7162,9 @@ getConnectedUserbotClient = async (userId: number) => {
                 apiIdValue,
                 apiHashValue,
                 {
-                    connectionRetries: 15,
-                    timeout: 300000,
-                    requestRetries: 10,
+                    connectionRetries: 20,
+                    timeout: 600000,
+                    requestRetries: 15,
                     ...getRandomDeviceProps(),
                     useWSS: false,
                     autoReconnect: true,
@@ -7190,9 +7204,9 @@ getConnectedUserbotClient = async (userId: number) => {
                 
                 if (meErr.message?.includes('AUTH_KEY_DUPLICATED')) {
                     userSessions.delete(lookupId);
-                    // if (approvedUsersCollection) {
-                    //     await approvedUsersCollection.updateOne({ userId: lookupId.toString() }, { $unset: { stringSession: "" } });
-                    // }
+                    if (approvedUsersCollection) {
+                        await approvedUsersCollection.updateOne({ userId: lookupId.toString() }, { $unset: { stringSession: "" } });
+                    }
                     await client.disconnect().catch(() => {});
                     console.error(`Session key duplicated for ${lookupId}. Cleared session.`);
                     return null;
@@ -7202,14 +7216,10 @@ getConnectedUserbotClient = async (userId: number) => {
                 throw new Error(`[Userbot] Verification failed for ${lookupId}: ${meErr.message}`);
             }
         } catch (err: any) {
-            console.error(`Userbot Client failed for user ${lookupId}:`, err);
+            console.warn(`[Userbot] Userbot Client failed for user ${lookupId}:`, err);
             if (err.message?.includes('AUTH_KEY_DUPLICATED') || (err as any).errorMessage === 'AUTH_KEY_DUPLICATED') {
-                userSessions.delete(lookupId);
-                // if (approvedUsersCollection) {
-                //     await approvedUsersCollection.updateOne({ userId: lookupId.toString() }, { $unset: { stringSession: "" } });
-                // }
-                console.error(`Session key duplicated for ${lookupId} in watchdog. Cleared session.`);
-                throw new Error(`[Userbot] Session key duplicated for ${lookupId}. Cleared session.`);
+                console.warn(`[Userbot] Session key duplicated for ${lookupId}. Ignoring.`);
+                return client;
             }
             throw new Error(`[Userbot] Connection failed for user ${lookupId}: ${err.message}`);
         }
@@ -7452,9 +7462,13 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
             let mirrorPath: any = undefined;
             if (targetIdOverride === undefined) {
                 const sourceId = linkData.channelId;
-                mirrorPath = (isMirror || !forceGeneralPath) ? userDoc?.mirrorPaths?.find((p: any) => 
-                     p.sourceId === sourceId || p.sourceId === `-100${sourceId}` || sourceId === p.sourceId.replace('-100', '')
-                ) : undefined;
+                mirrorPath = (isMirror || !forceGeneralPath) ? userDoc?.mirrorPaths?.find((p: any) => {
+                     const pSource = p.sourceId.startsWith('-100') ? p.sourceId.substring(4) : p.sourceId;
+                     const sSource = sourceId.startsWith('-100') ? sourceId.substring(4) : sourceId;
+                     console.log(`[Debug MirrorPath] Checking pSource: ${pSource} vs sSource: ${sSource}, p.sourceId: ${p.sourceId}, sourceId: ${sourceId}`);
+                     return pSource === sSource;
+                }) : undefined;
+                console.log(`[Debug MirrorPath] Result:`, mirrorPath);
 
                 if (mirrorPath) {
                     uploadTarget = mirrorPath.destId;
@@ -7496,7 +7510,16 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                     const directResolve = await destClient.getEntity(uploadTarget);
                     destPeer = await destClient.getInputEntity(directResolve);
                 } catch (e: any) {
-                    throw new Error("Target destination could not be resolved by the Telegram Bot. Ensure the Bot has been joined/invited to the destination chat/channel as an Administrator.");
+                    // Fallback to userbot resolution if bot fails
+                    try {
+                        console.log(`[Resolution] Bot failed to resolve ${uploadTarget}, trying userbot fallback...`);
+                        const resolvedTarget = await getBestClientForTarget(uploadTarget, userId, statusMsgId, chatId);
+                        destClient = resolvedTarget.client;
+                        destPeer = resolvedTarget.peer;
+                        if (!destPeer) throw new Error("Not resolved");
+                    } catch (fallbackErr) {
+                        throw new Error("Target destination could not be resolved by the Telegram Bot. Ensure the Bot has been joined/invited to the destination chat/channel as an Administrator.");
+                    }
                 }
             } else {
                 const resolvedTarget = await getBestClientForTarget(uploadTarget, userId, statusMsgId, chatId);
@@ -9504,9 +9527,9 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                 }
 
                 const client = new TelegramClient(new StringSession(""), apiIdValue, apiHashValue, {
-                    connectionRetries: 15,
-                    timeout: 300000,
-                    requestRetries: 10,
+                    connectionRetries: 20,
+                    timeout: 600000,
+                    requestRetries: 15,
                     ...getRandomDeviceProps(),
                     floodSleepThreshold: 300,
                     proxy: undefined,
@@ -9897,6 +9920,16 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
       console.log('Shutting down bot...');
       if (bot) await bot.stopPolling();
       if (client) await client.close();
+      
+      console.log(`Closing ${userClients.size} user clients...`);
+      for (const [userId, userClient] of userClients) {
+          try {
+              console.log(`Closing user client for ${userId}`);
+              await userClient.disconnect();
+          } catch(e) {
+              console.error(`Failed to close user client for ${userId}:`, e);
+          }
+      }
       process.exit(0);
     };
 
