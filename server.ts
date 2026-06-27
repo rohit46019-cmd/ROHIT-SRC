@@ -7125,6 +7125,11 @@ getConnectedUserbotClient = async (userId: number) => {
         // Check if we already have an active client for this user
         if (userClients.has(lookupId)) {
             const client = userClients.get(lookupId)!;
+            if (typeof client.getMessages !== 'function') {
+                console.error(`[Error] Client in userClients for ${lookupId} is not a valid TelegramClient. Removing.`);
+                userClients.delete(lookupId);
+                return null;
+            }
             try {
                 if (client.connected) {
                     try {
@@ -7613,7 +7618,10 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
             const maxTimeoutRetries = 7;
             while (retryCount <= maxRetries && timeoutRetryCount <= maxTimeoutRetries) {
                 try {
-                    console.log(`[Debug] Attempting to fetch message ${linkData.msgId} from ${linkData.channelId} using sourceClient (attempt ${retryCount+1}).`);
+                    if (typeof sourceClient.getMessages !== 'function') {
+                        console.error(`[Error] sourceClient does not have getMessages! Client: ${sourceClient?.constructor?.name}`);
+                        throw new Error("sourceClient is not a valid TelegramClient");
+                    }
                     const messages = await sourceClient.getMessages(sourcePeer, { ids: [linkData.msgId] });
                     msg = messages?.[0];
                     if (msg && !(msg instanceof Api.MessageEmpty)) break;
