@@ -612,11 +612,11 @@ const safeBotCall = async (method: string, ...args: any[]) => {
                 }
             }
 
-            if (e.message?.includes('TOPIC_CLOSED') || e.message?.includes('message thread not found')) {
+            if (e.message?.includes('TOPIC_CLOSED') || e.message?.includes('message thread not found') || e.message?.includes('message to be replied not found')) {
                 if (args.length > 0 && typeof args[args.length - 1] === 'object') {
                     const options = { ...args[args.length - 1] };
                     if (options.message_thread_id || options.reply_to_message_id) {
-                        console.warn(`[Bot API] Topic error on ${method}. Retrying without thread context.`);
+                        console.warn(`[Bot API] Topic or reply error on ${method}. Retrying without thread context.`);
                         delete options.message_thread_id;
                         delete options.reply_to_message_id;
                         args[args.length - 1] = options;
@@ -1819,12 +1819,12 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
         bot = new TelegramBot(token, { 
           polling: {
             params: {
-              timeout: 30
+              timeout: 60
             }
           },
           request: {
             url: "https://api.telegram.org",
-            timeout: 120000,
+            timeout: 300000,
             agentOptions: {
               keepAlive: true,
               keepAliveMsecs: 10000
@@ -1835,10 +1835,14 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
         
         bot.getMe().then((me) => {
           botInfo = me;
+          botStatus = 'Running';
           console.log(`Bot started: @${me.username}`);
         }).catch((err) => {
           botStatus = 'Error';
-          console.error(`Failed to retrieve bot info:`, err.message);
+          console.error(`Failed to initialize bot:`, err.message);
+          if (err.message.includes('401')) {
+            console.error("Please check your TELEGRAM_BOT_TOKEN in the environment variables.");
+          }
         });
 
         // Security Interceptor to ignore all non-admin messages globally
