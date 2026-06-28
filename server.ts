@@ -1687,7 +1687,7 @@ if (mongoUri) {
       }
 
       // Periodically check, recover, and self-heal user sessions and watchers every 60 seconds
-      setInterval(runActiveWatchdog, 60000);
+      // setInterval(runActiveWatchdog, 60000);
     })
     .catch((err) => {
       dbStatus = 'Error';
@@ -7221,14 +7221,17 @@ getConnectedUserbotClient = async (userId: number) => {
                     return null;
                 }
                 
-                await client.disconnect().catch(() => {});
+                await (client as any).disconnect().catch(() => {});
                 throw new Error(`[Userbot] Verification failed for ${lookupId}: ${meErr.message}`);
             }
         } catch (err: any) {
             console.warn(`[Userbot] Userbot Client failed for user ${lookupId}:`, err);
             if (err.message?.includes('AUTH_KEY_DUPLICATED') || (err as any).errorMessage === 'AUTH_KEY_DUPLICATED') {
-                console.warn(`[Userbot] Session key duplicated for ${lookupId}. Ignoring.`);
-                return client;
+                console.warn(`[Userbot] Session key duplicated for ${lookupId}. Removing broken client.`);
+                userClients.delete(lookupId);
+                userSessions.delete(lookupId);
+                await (client as any).disconnect().catch(() => {});
+                return null;
             }
             throw new Error(`[Userbot] Connection failed for user ${lookupId}: ${err.message}`);
         }
@@ -7862,6 +7865,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                         
                         await safeEditMessage(message, { chat_id: chatId, message_id: statusMsgId, reply_markup: kb.length > 0 ? { inline_keyboard: kb } : undefined });
                         await recordSuccessfulMirror();
+                        activeTaskJobs.delete(`${userId}-${link}`);
                         return true;
                     }
                 } catch (forwardErr) {
@@ -7960,7 +7964,8 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                     if (now - lastDownloadUpdate > 5000 || currentBytes === totalBytes) {
                         lastDownloadUpdate = now;
                         const isPaused = taskControlMap.get(jobKey)?.isPaused || false;
-                        safeEditMessage(createProgressBar(totalBytes, currentBytes, "Downloading", downloadStartTime, pathDisplay), { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown', reply_markup: createProgressMarkup(jobKey, isPaused) }).catch(() => {});
+                        const progressRes = await safeEditMessage(createProgressBar(totalBytes, currentBytes, "Downloading", downloadStartTime, pathDisplay), { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown', reply_markup: createProgressMarkup(jobKey, isPaused) });
+                        if (progressRes && progressRes.id) statusMsgId = progressRes.id;
                     }
                 });
             };
@@ -7980,7 +7985,8 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                         console.log(`[Download] Task ${jobKey} is paused by user. Entering idle wait...`);
                         
                         // Edit message status to (Paused)
-                        safeEditMessage(createProgressBar(totalBytes || 100, currentBytes || 0, "Downloading (Paused)", downloadStartTime, pathDisplay), { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown', reply_markup: createProgressMarkup(jobKey, true) }).catch(() => {});
+                        const pausedRes = await safeEditMessage(createProgressBar(totalBytes || 100, currentBytes || 0, "Downloading (Paused)", downloadStartTime, pathDisplay), { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown', reply_markup: createProgressMarkup(jobKey, true) });
+                        if (pausedRes && pausedRes.id) statusMsgId = pausedRes.id;
                         
                         // Loop to wait for resume
                         while (true) {
@@ -7992,7 +7998,8 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                         }
                         
                         // Edited status to (Resuming...)
-                        safeEditMessage(createProgressBar(totalBytes || 100, currentBytes || 0, "Downloading (Resuming...)", downloadStartTime, pathDisplay), { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown', reply_markup: createProgressMarkup(jobKey, false) }).catch(() => {});
+                        const resumingRes = await safeEditMessage(createProgressBar(totalBytes || 100, currentBytes || 0, "Downloading (Resuming...)", downloadStartTime, pathDisplay), { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown', reply_markup: createProgressMarkup(jobKey, false) });
+                        if (resumingRes && resumingRes.id) statusMsgId = resumingRes.id;
                         console.log(`[Download] Task ${jobKey} was resumed. Reconnecting stream...`);
                         
                         // Reset downloadStartTime to compensate for paused duration, so speed calculations remain correct
@@ -8251,6 +8258,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
             
             await safeEditMessage(message, { chat_id: chatId, message_id: statusMsgId, reply_markup: kb.length > 0 ? { inline_keyboard: kb } : undefined });
             await recordSuccessfulMirror();
+            activeTaskJobs.delete(jobKey);
             return true;
         } catch (err: any) {
             const isSkip = err.message?.includes("DOWNLOAD_SKIPPED");
@@ -9960,6 +9968,9 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
 }
 
 app.use(express.json());
+
+app.get('/api/logs', (req, res) => res.json(sysLogs));
+app.get('/api/sessions', (req, res) => res.json(Array.from(userClients.keys())));
 
 app.get('/api/status', async (req, res) => {
   try {

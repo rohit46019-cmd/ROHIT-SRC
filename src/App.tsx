@@ -34,6 +34,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import type { BotStatus } from './types';
+import SystemStatusBar from './components/SystemStatusBar';
 
 type Tab = 'dashboard' | 'config' | 'rules' | 'mirror' | 'system';
 
@@ -1746,6 +1747,7 @@ export default function App() {
           <div className="max-w-4xl w-full mx-auto p-4 sm:p-6 lg:p-8 flex flex-col gap-6">
             
             {/* Header */}
+            <SystemStatusBar />
             <header className="flex items-center justify-between gap-4 bg-white/90 dark:bg-[#0b1224]/90 backdrop-blur-xl py-4.5 px-6 border border-slate-200/80 dark:border-[#15203c] rounded-2xl shadow-md">
               <div className="flex items-center gap-3">
                 <button onClick={() => setIsSidebarOpen(true)} className="lg:hidden p-2.5 rounded-xl bg-slate-100 dark:bg-slate-850 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800 transition-colors">
