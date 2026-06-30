@@ -1,3 +1,4 @@
+process.env.NTBA_FIX_350 = '1';
 import cron from 'node-cron';
 import crypto from 'crypto';
 import express from 'express';
@@ -22,6 +23,13 @@ const activeWatchers = new Set<number>();
 let botFloodWaitEnd = 0;
 const mirrorTasks = new Map<string, any[]>();
 let getConnectedUserbotClient: (userId: number) => Promise<any>;
+let performSystemReset: () => Promise<{
+  tasksStopped: number;
+  junkCleanedCount: number;
+  actionsCleared: number;
+  loginsAborted: number;
+  clientsRefreshed: number;
+}>;
 let startAutoMirrorWatcher: (userId: number, client: TelegramClient) => Promise<any>;
 let createProgressMarkup: (jobKey: string, isPaused: boolean) => any;
 let createProgressBar: (total: number, current: number, label: string, startTime: number, pathStr?: string) => string;
@@ -65,7 +73,7 @@ const token = process.env.TELEGRAM_BOT_TOKEN;
 const mongoUri = process.env.MONGODB_URI;
 let apiIdValue = Number(process.env.API_ID) || 0;
 let apiHashValue = process.env.API_HASH || "";
-const DEFAULT_LOG_GROUP = "-1003995334936";
+const DEFAULT_LOG_GROUP = process.env.DEFAULT_LOG_GROUP || "";
 
 const sysLogs: string[] = [];
 const originalLog = console.log;
@@ -383,6 +391,8 @@ async function getOrCreateCachedFilesTopicId(client: any): Promise<number | unde
         }
     }
     
+    if (!DEFAULT_LOG_GROUP) return undefined;
+    
     try {
         console.log(`[CacheLog] Attempting to resolve DEFAULT_LOG_GROUP: ${DEFAULT_LOG_GROUP}`);
         const logPeer = await safelyResolveEntity(client, DEFAULT_LOG_GROUP);
@@ -472,17 +482,19 @@ async function resumeDownloadFile(
         } catch (e) {}
     }
 
-    let downloadWorkers = 4;
-    let partSizeKb = 512;
+    let downloadWorkers = 12;
+    let partSizeKb = 2048;
 
     if (totalSize > 500 * 1024 * 1024) { // > 500 MB
-        downloadWorkers = 8;
+        downloadWorkers = 16;
     } else if (totalSize > 100 * 1024 * 1024) { // > 100 MB
-        downloadWorkers = 6;
+        downloadWorkers = 16;
     } else if (totalSize > 10 * 1024 * 1024) { // > 10 MB
-        downloadWorkers = 4;
+        downloadWorkers = 12;
+        partSizeKb = 1024;
     } else {
-        downloadWorkers = 2;
+        downloadWorkers = 12;
+        partSizeKb = 512;
     }
 
     let lastProgressTime = Date.now();
@@ -586,10 +598,23 @@ const safeBotCall = async (method: string, ...args: any[]) => {
                             retryAfter = parseInt(match[1], 10);
                         }
                     }
+
+                    // Special 429 Optimize: If it's a cosmetic method like editMessageText or deleteMessage,
+                    // we must NEVER block the calling thread (e.g., active download/upload files) as it gets stuck.
+                    if (method === 'editMessageText' || method === 'deleteMessage') {
+                        console.warn(`[Bot API] 429 on cosmetic method '${method}' (retry after ${retryAfter}s). Skipping update to avoid blocking file transfers.`);
+                        return null;
+                    }
                 }
                 
                 // Add a small buffer
                 const waitTime = (is429 ? (retryAfter + 5) : 3) * 1000;
+                
+                // If wait time is > 30 seconds, do not block the server event loop/queue for so long.
+                if (is429 && waitTime > 30000) {
+                    console.warn(`[Bot API] Flood wait too high (${Math.round(waitTime / 1000)}s) on ${method}. Skipping wait.`);
+                    return null;
+                }
                 
                 console.log(`[Bot API] Temporary issue (${e.message}) on ${method}. Waiting ${Math.round(waitTime / 1000)}s (Attempt ${retries + 1}/${maxRetries})...`);
                 await sleep(waitTime);
@@ -955,7 +980,7 @@ async function resumeFullMirrorSession(chatId: number, sessionId: string, trigge
                 if (topicTitle) {
                     const normTitle = topicTitle.trim().toLowerCase();
                     // Skip if blocked
-                    if (blockedTopics.some((bt: string) => bt === normTitle || bt === sourceTopicId!.toString())) {
+                    if (blockedTopics.some((bt: string) => bt === normTitle || bt === sourceTopicId!.toString() || bt === `${sourceIdClean}_${sourceTopicId}` || bt === `-100${sourceIdClean}_${sourceTopicId}`)) {
                         skippedCount++;
                         continue;
                     }
@@ -1385,30 +1410,28 @@ async function safelyResolveEntity(client: TelegramClient, entity: any): Promise
         // II. Deep search via getDialogs (Paginating to find "lost" entities)
         if (!(client as any)._isBotInApp) {
             try {
-                console.log(`[safelyResolveEntity] Starting deep resolve for ${idStrClean}...`);
-                let batchLimit = 1000;
-                let currentOffsetDate = 0;
+                console.log(`[safelyResolveEntity] Starting safe deep resolve for ${idStrClean}...`);
                 
-                // Try first 1000
-                const firstBatch = await client.getDialogs({ limit: 1000 });
+                // Try first 100 (Extremely fast, <100ms, covers 95%+ of active chats)
+                const firstBatch = await client.getDialogs({ limit: 100 });
                 let found = firstBatch.find(matchDialog);
                 if (found) return await client.getInputEntity(found.entity);
 
-                // If large account, go deeper (up to 12,000 dialogs)
-                if (firstBatch.length >= 950) {
-                    console.log(`[safelyResolveEntity] Extremely large account. Paginating deeply...`);
+                // Go deeper safely (up to 400 dialogs total, limit 100 to avoid TIMEOUT)
+                if (firstBatch.length >= 95) {
+                    console.log(`[safelyResolveEntity] Paginating dialogs safely...`);
                     let lastDate = firstBatch[firstBatch.length - 1].date;
-                    for (let i = 0; i < 11; i++) {
-                        const moreDialogs = await client.getDialogs({ limit: 1000, offsetDate: lastDate });
+                    for (let i = 0; i < 3; i++) {
+                        const moreDialogs = await client.getDialogs({ limit: 100, offsetDate: lastDate });
                         if (!moreDialogs || moreDialogs.length === 0) break;
                         found = moreDialogs.find(matchDialog);
                         if (found) return await client.getInputEntity(found.entity);
                         lastDate = moreDialogs[moreDialogs.length - 1].date;
-                        if (moreDialogs.length < 1000) break;
+                        if (moreDialogs.length < 100) break;
                     }
                 }
             } catch (dgErr: any) {
-                console.warn(`[safelyResolveEntity] Deep dialog search failed: ${dgErr.message}`);
+                console.warn(`[safelyResolveEntity] Safe dialog search failed: ${dgErr.message}`);
             }
         }
 
@@ -1462,16 +1485,18 @@ async function safelyResolveFullEntity(client: TelegramClient, entity: any): Pro
 const adminActiveSession = new Map<number, number>(); // adminTelegramId -> activeUserbotUserId
 
 const userActionStates: Record<number, { 
-    type: 'batch_start' | 'batch_end' | 'mirror_target' | 'set_thumb' | 'set_cap' | 'set_path' | 'mirror_choice' | 'set_mirror_source' | 'enter_topic_id' | 'mirror_path_add_source' | 'mirror_path_await_dest' | 'topic_clone_group' | 'topic_clone_topic_id' | 'add_rename_rule' | 'set_api_id' | 'set_api_hash' | 'full_mirror_group' | 'full_mirror_dest_select' | 'live_mirror_dest_select' | 'set_cooldown_secs' | 'set_concurrency_val' | 'topic_clone_dest_select' | 'enter_clone_dest_id' | 'set_jump_to_path' | 'add_blocked_topic' | 'enter_manual_specific_topic' | 'forward_start_link' | 'set_source_id' | 'set_dest_id' | 'forward_end_link', 
+    type: 'batch_start' | 'batch_end' | 'mirror_target' | 'set_thumb' | 'set_cap' | 'set_path' | 'mirror_choice' | 'set_mirror_source' | 'enter_topic_id' | 'mirror_path_add_source' | 'mirror_path_await_dest' | 'topic_clone_group' | 'topic_clone_topic_id' | 'topic_clone_start_link' | 'add_rename_rule' | 'set_api_id' | 'set_api_hash' | 'full_mirror_group' | 'full_mirror_dest_select' | 'live_mirror_dest_select' | 'set_cooldown_secs' | 'set_concurrency_val' | 'topic_clone_dest_select' | 'enter_clone_dest_id' | 'set_jump_to_path' | 'add_blocked_topic' | 'enter_manual_specific_topic' | 'forward_start_link' | 'set_source_id' | 'set_dest_id' | 'forward_end_link', 
     startLink?: string,
     mirrorTarget?: any,
     pendingMirrorDest?: string,
     pendingMirrorThread?: number,
     pendingSourceId?: string,
-    pendingSourceName?: string,
-    cloneSourceGroupId?: string,
+    pendingSourceIdForDirectClone?: string,
     pendingCloneDest?: string,
-    pendingSourceIdForDirectClone?: string
+    cloneSourceGroupId?: string,
+    cloneTopicId?: number,
+    cloneStartMsgId?: number,
+    pendingSourceName?: string
 }> = {};
 
 // User Sessions Management and watchdog
@@ -2024,7 +2049,7 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
         const userDoc = await approvedUsersCollection?.findOne({ userId: targetUidStr });
         const session = userSessions.get(targetUid) || userDoc?.stringSession;
         
-        let pathDisplay = `Log Group (${DEFAULT_LOG_GROUP})`;
+        let pathDisplay = DEFAULT_LOG_GROUP ? `Log Group (${DEFAULT_LOG_GROUP})` : 'Not Set';
         if (userDoc?.uploadPath === 'me') {
             pathDisplay = 'Saved Messages';
         } else if (userDoc?.uploadPath) {
@@ -2100,8 +2125,11 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
               [
                 { text: '🔄 𝗦𝘆𝗻𝗰', callback_data: 're_login' },
                 { text: '📜 𝗟𝗼𝗴𝘀', callback_data: 'view_logs' },
-                { text: '🛡️ 𝗔𝘂𝗱𝗶𝘁', callback_data: 'check_perms' },
-                { text: '🚫 𝗕𝗮𝗻', callback_data: 'blocked_topics_panel' }
+                { text: '🛡️ 𝗔𝘂𝗱𝗶𝘁', callback_data: 'check_perms' }
+              ],
+              [
+                { text: '🚫 𝗕𝗮𝗻', callback_data: 'blocked_topics_panel' },
+                { text: userDoc?.cacheEnabled !== false ? '✅ 𝗖𝗮𝗰𝗵𝗲 𝗢𝗡' : '❌ 𝗖𝗮𝗰𝗵𝗲 𝗢𝗙𝗙', callback_data: 'toggle_cache' }
               ],
               [{ text: '⬅️ 𝗕𝗮𝗰𝗸', callback_data: 'menu_back' }]
             ]
@@ -2187,6 +2215,87 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
       } else {
         safeSendMessage(chatId, "⚠️ **No active tasks or operations found to cancel.**");
       }
+    };
+
+    performSystemReset = async () => {
+        // 1. Mark all active/running task jobs as skipped to immediately terminate their download/upload tasks
+        for (const [key, job] of activeTaskJobs) {
+            taskControlMap.set(key, { isPaused: false, shouldRetry: false, isSkipped: true });
+        }
+
+        // 2. Clear Active Jobs Map
+        activeTaskJobs.clear();
+
+        // 3. Reset Active Counters
+        activeTasksCount = 0;
+        activeTasksPerUser.clear();
+
+        // 4. Stop and Clear the entire local and database Task Queue
+        const tasksStopped = taskQueue.length;
+        taskQueue.length = 0;
+        nextTaskRunAt = null;
+        if (typeof dbClearAllTasks === 'function') {
+            await dbClearAllTasks().catch(e => console.error("[Queue DB] failed to clear on reset:", e));
+        }
+
+        // 5. Clear batchStatusMap (cancels all current batches)
+        batchStatusMap.clear();
+
+        // 6. Clear Performance metrics
+        for (const key in libraryPerfMetrics) {
+            libraryPerfMetrics[key] = { totalBytes: 0, totalTimeMs: 0, count: 0 };
+        }
+
+        // 7. Cleanup temp junk files
+        let junkCleanedCount = 0;
+        try {
+            const tmpDir = os.tmpdir();
+            const files = fs.readdirSync(tmpDir);
+            for (const file of files) {
+                if (file.startsWith('temp_') || file.startsWith('thumb_') || file.includes('userbot_')) {
+                    try {
+                        fs.unlinkSync(path.join(tmpDir, file));
+                        junkCleanedCount++;
+                    } catch {}
+                }
+            }
+        } catch (e) {
+            console.error("Failed to clean disk junk on reset:", e);
+        }
+
+        // 8. Clear Interaction UI states
+        const actionsCleared = Object.keys(userActionStates).length;
+        for (const key in userActionStates) {
+            delete userActionStates[Number(key)];
+        }
+
+        // 9. Abort pending logins
+        const loginsAborted = Object.keys(loginStates).length;
+        for (const key in loginStates) {
+            try {
+                await loginStates[Number(key)].client?.disconnect();
+            } catch {}
+            delete loginStates[Number(key)];
+        }
+
+        // 10. Disconnect GramJS Clients (Keeps login credentials/session totally intact)
+        const clientsRefreshed = userClients.size;
+        for (const [userId, client] of userClients.entries()) {
+            try {
+                await client.disconnect();
+            } catch (e) {
+                console.error(`Failed to disconnect client for user ${userId} on reset:`, e);
+            }
+        }
+        userClients.clear();
+
+        return {
+            tasksStopped,
+            junkCleanedCount,
+            actionsCleared,
+            loginsAborted,
+            clientsRefreshed
+        };
     };
 
     const userAnimeHistory = new Map<number, Set<string>>();
@@ -2897,8 +3006,11 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
       const recentSources = userDoc?.recentSources || [];
       let kb: any[] = [];
       if (recentSources.length > 0) {
-          recentSources.forEach((s: any) => {
-              kb.push([{ text: `📥 ${s.sourceName}`, callback_data: `clonesource_${s.sourceId}` }]);
+          recentSources.forEach((s: any, originalIndex: number) => {
+              kb.push([
+                  { text: `📥 ${s.sourceName}`, callback_data: `clonesource_${s.sourceId}` },
+                  { text: `🗑`, callback_data: `del_recent_source:${originalIndex}` }
+              ]);
           });
           kb.push([{ text: `➕ Enter New Source ID`, callback_data: `clonesource_new` }]);
       }
@@ -2952,8 +3064,11 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
           
           let kb: any[] = [];
           if (recentSources.length > 0) {
-              recentSources.forEach((s: any) => {
-                  kb.push([{ text: `📥 ${s.sourceName}`, callback_data: `clonesource_${s.sourceId}` }]);
+              recentSources.forEach((s: any, originalIndex: number) => {
+                  kb.push([
+                      { text: `📥 ${s.sourceName}`, callback_data: `clonesource_${s.sourceId}` },
+                      { text: `🗑`, callback_data: `del_recent_source:${originalIndex}` }
+                  ]);
               });
               kb.push([{ text: `➕ Enter New Source ID`, callback_data: `clonesource_new` }]);
           }
@@ -3009,6 +3124,26 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
           });
       }
       bot?.answerCallbackQuery(query.id);
+      return;
+  }
+
+  if (query.data === 'clone_start_all') {
+      if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+      const state = userActionStates[query.from.id];
+      if (!state || state.type !== 'topic_clone_start_link') {
+          return bot?.answerCallbackQuery(query.id, { text: '❌ Session expired.', show_alert: true });
+      }
+
+      const sourceGroupId = state.cloneSourceGroupId!;
+      const destGroupId = state.pendingCloneDest!;
+      const topicId = state.cloneTopicId!;
+      delete userActionStates[query.from.id];
+
+      bot?.answerCallbackQuery(query.id);
+      // Remove inline keyboard by editing
+      safeEditMessage(`🎯 **Clone Specific Topic**\n\nStarting from the beginning...`, { chat_id: chatId, message_id: query.message!.message_id });
+      
+      startTopicClone(chatId, query.from.id, sourceGroupId, destGroupId, topicId, undefined);
       return;
   }
 
@@ -3456,8 +3591,11 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
           
           let kb: any[] = [];
           if (recent.length > 0) {
-              recent.forEach((s: any) => {
-                  kb.push([{ text: `📥 ${s.sourceName}`, callback_data: `mirrorsource_${s.sourceId}` }]);
+              recent.forEach((s: any, originalIndex: number) => {
+                  kb.push([
+                      { text: `📥 ${s.sourceName}`, callback_data: `mirrorsource_${s.sourceId}` },
+                      { text: `🗑`, callback_data: `del_recent_source:${originalIndex}` }
+                  ]);
               });
               kb.push([{ text: `➕ Enter New Source ID`, callback_data: `mirrorsource_new` }]);
           }
@@ -3669,6 +3807,12 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
               const alreadyMirroredDocs = mirroredMessagesCollection ? 
                     await mirroredMessagesCollection.find({ destId: destPath }).toArray() : [];
               const alreadyMirroredLinks = new Set(alreadyMirroredDocs.map((doc: any) => doc.link));
+
+              // Load blocked topics to skip
+              const settingsUidForBlock = await resolveSettingsUserId(query.from.id);
+              const userDocForBlock = await approvedUsersCollection?.findOne({ userId: settingsUidForBlock });
+              const blockedTopics = (userDocForBlock?.blockedTopics || []).map((t: string) => t.trim().toLowerCase());
+
               let skippedCount = 0;
 
               const msgsToQueue = [];
@@ -3698,6 +3842,13 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                       if (sourceTopicId) {
                           const topicTitle = sourceTopics[sourceTopicId];
                           if (topicTitle) {
+                              const normTitle = topicTitle.trim().toLowerCase();
+                              // Skip if blocked
+                              if (blockedTopics.some((bt: string) => bt === normTitle || bt === sourceTopicId!.toString() || bt === `${sourceIdClean}_${sourceTopicId}` || bt === `-100${sourceIdClean}_${sourceTopicId}`)) {
+                                  skippedCount++;
+                                  continue;
+                              }
+
                               if (topicMap[sourceTopicId] !== undefined) {
                                   overrideThreadId = topicMap[sourceTopicId] ?? dest.destThreadId;
                               } else {
@@ -4095,16 +4246,29 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                   );
 
                   let destPath = mirrorPath ? mirrorPath.destId : (userDoc?.uploadPath || DEFAULT_LOG_GROUP);
-                  if (!userDoc?.uploadPath) {
-                      destPath = DEFAULT_LOG_GROUP;
+                  if (!destPath) {
+                      throw new Error("No destination path configured. Please set an upload path first.");
                   }
                   const destEntity: any = await safelyResolveFullEntity(client, destPath).catch(() => { throw new Error("Could not access Destination.")});
 
                   await safeEditMessage(`📍 **Mirroring ${topicsResult.topics.length} Topics.**\nCloning started...`, { chat_id: chatId, message_id: loadingMsg!.message_id });
 
+                  // Load blocked topics to skip
+                  const settingsUidForBlock = await resolveSettingsUserId(fromId);
+                  const userDocForBlock = await approvedUsersCollection?.findOne({ userId: settingsUidForBlock });
+                  const blockedTopics = (userDocForBlock?.blockedTopics || []).map((t: string) => t.trim().toLowerCase());
+
                   for (const topic of topicsResult.topics) {
-                      let destTopicId;
                       const topicName = topic.title;
+                      const normTitle = topicName.trim().toLowerCase();
+                      
+                      // Skip if blocked
+                      if (blockedTopics.some((bt: string) => bt === normTitle || bt === topic.id.toString() || bt === `${sourceId}_${topic.id}` || bt === `-100${sourceId}_${topic.id}`)) {
+                          console.log(`[Mirror Topics] Skipping blocked topic: ${topicName}`);
+                          continue;
+                      }
+
+                      let destTopicId;
                       try {
                           // First, verify if topic already exists in destination
                           const existing: any = await client.invoke(new Api.channels.GetForumTopics({ 
@@ -4483,6 +4647,22 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
           return;
       }
 
+      if (query.data === 'toggle_cache') {
+          if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
+          if (approvedUsersCollection) {
+              const settingsUid = await resolveSettingsUserId(query.from?.id);
+              const userDoc = await approvedUsersCollection.findOne({ userId: settingsUid });
+              const currentCache = userDoc?.cacheEnabled !== false; // true by default
+              await approvedUsersCollection.updateOne(
+                  { userId: settingsUid },
+                  { $set: { cacheEnabled: !currentCache } }
+              );
+              bot?.answerCallbackQuery(query.id, { text: `✅ Cache is now ${!currentCache ? 'ON' : 'OFF'}` });
+              handleSettings(chatId, query.from?.id, query.message!.message_id);
+          }
+          return;
+      }
+
       if (query.data === 'toggle_agent') {
           if (!isAdmin(query.from?.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Restricted to Admin', show_alert: true });
           if (approvedUsersCollection) {
@@ -4620,7 +4800,7 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                       } else if (userDoc?.uploadPath === 'me') {
                           destStatus = '✅ Saved Messages (DM)';
                       } else {
-                          destStatus = `✅ Default Log Group (${DEFAULT_LOG_GROUP})`;
+                          destStatus = DEFAULT_LOG_GROUP ? `✅ Default Log Group (${DEFAULT_LOG_GROUP})` : `❌ Not Configured (No Upload Path Set)`;
                       }
                   } else {
                       userbotStatus = '⚠️ Session exists but Failed to Authenticate';
@@ -4805,6 +4985,79 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
               }
           } else {
               bot?.answerCallbackQuery(query.id, { text: '❌ Destination not found', show_alert: true });
+          }
+          return;
+      }
+
+      if (query.data?.startsWith('del_recent_source:')) {
+          const index = parseInt(query.data.split(':')[1]);
+          const settingsUid = await resolveSettingsUserId(query.from.id);
+          const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
+          const recentSources = userDoc?.recentSources || [];
+          
+          if (recentSources[index]) {
+              recentSources.splice(index, 1);
+              await approvedUsersCollection?.updateOne({ userId: settingsUid }, { $set: { recentSources: recentSources } });
+              bot?.answerCallbackQuery(query.id, { text: '✅ Source Deleted', show_alert: true });
+              
+              const state = userActionStates[query.from.id];
+              
+              // Dynamic Re-rendering
+              if (state?.type === 'topic_clone_group') {
+                  const groupName = state.pendingCloneDest || 'Group';
+                  
+                  let kb: any[] = [];
+                  if (recentSources.length > 0) {
+                      recentSources.forEach((s: any, originalIndex: number) => {
+                          kb.push([
+                              { text: `📥 ${s.sourceName}`, callback_data: `clonesource_${s.sourceId}` },
+                              { text: `🗑`, callback_data: `del_recent_source:${originalIndex}` }
+                          ]);
+                      });
+                      kb.push([{ text: `➕ Enter New Source ID`, callback_data: `clonesource_new` }]);
+                  }
+                  
+                  if (kb.length > 0) {
+                      await safeEditMessage(`🔗 **Destination Selected: ${groupName}**\n\n2. Select or enter the **Source Group** to clone from:`, {
+                          chat_id: chatId,
+                          message_id: query.message!.message_id,
+                          reply_markup: { inline_keyboard: kb }
+                      }).catch(() => {});
+                  } else {
+                      await safeEditMessage(`🔗 **Destination Selected: ${groupName}**\n\n2. Now send the **Source Group Link/ID** to clone from:`, {
+                          chat_id: chatId,
+                          message_id: query.message!.message_id,
+                          reply_markup: { force_reply: true }
+                      }).catch(() => {});
+                  }
+              } else if (state?.type === 'mirror_path_add_source') {
+                  let kb: any[] = [];
+                  if (recentSources.length > 0) {
+                      recentSources.forEach((s: any, originalIndex: number) => {
+                          kb.push([
+                              { text: `📥 ${s.sourceName}`, callback_data: `mirrorsource_${s.sourceId}` },
+                              { text: `🗑`, callback_data: `del_recent_source:${originalIndex}` }
+                          ]);
+                      });
+                      kb.push([{ text: `➕ Enter New Source ID`, callback_data: `mirrorsource_new` }]);
+                  }
+                  
+                  if (kb.length > 0) {
+                      await safeEditMessage("🔄 **Live Mirror Setup**\n\n1. Select the **Source Group** to mirror from:", {
+                          chat_id: chatId,
+                          message_id: query.message!.message_id,
+                          reply_markup: { inline_keyboard: kb }
+                      }).catch(() => {});
+                  } else {
+                      await safeEditMessage("🔄 **Live Mirror Setup**\n\n1. Please send the **Source Group ID or Link**:", {
+                          chat_id: chatId,
+                          message_id: query.message!.message_id,
+                          reply_markup: { force_reply: true }
+                      }).catch(() => {});
+                  }
+              }
+          } else {
+              bot?.answerCallbackQuery(query.id, { text: '❌ Source not found', show_alert: true });
           }
           return;
       }
@@ -5276,6 +5529,37 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
         report += `\n💾 **Login Persistence:** \`SAFE\` (Your accounts stay logged in)`;
 
         bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
+    });
+
+    bot.onText(/\/reset/, async (msg) => {
+        const fromId = msg.from?.id;
+        const chatId = msg.chat.id;
+        if (!fromId || !isAdmin(fromId)) return;
+
+        bot.sendMessage(chatId, "⏳ **Initiating Full System Reset...**\nStopping all tasks, mirrors, and active background threads.", { parse_mode: 'Markdown' });
+
+        try {
+            const stats = await performSystemReset();
+            
+            let report = "🔄 **System Reset Completed Successfully!**\n\n";
+            report += `🛑 Tasks Stopped/Cancelled: \`${stats.tasksStopped}\`\n`;
+            report += `🧹 Junk Files Removed: \`${stats.junkCleanedCount}\`\n`;
+            report += `🖱 UI States Cleared: \`${stats.actionsCleared}\`\n`;
+            report += `🔐 Pending Logins Aborted: \`${stats.loginsAborted}\`\n`;
+            report += `⚡ Active Sessions Disconnected: \`${stats.clientsRefreshed}\`\n\n`;
+            report += `💾 **Login Persistence:** \`SAFE\` (Your accounts stay logged in! No sessions were deleted)\n\n`;
+            report += `🤖 **Rebooting Bot Daemon...**\nProcess is restarting to clear memory and start fresh. Please wait 5 seconds.`;
+
+            await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
+            
+            // Soft restart the process
+            setTimeout(() => {
+                console.log("[Reset] Process restarting on admin request...");
+                process.exit(0);
+            }, 1500);
+        } catch (err: any) {
+            bot.sendMessage(chatId, `❌ **Reset Error:** ${err.message}`, { parse_mode: 'Markdown' });
+        }
     });
 
     bot.onText(/\/clearmirrorhistory/, async (msg) => {
@@ -6463,24 +6747,29 @@ runNextTask = async () => {
                     job.cooldownRemaining = waitSecs;
                 }
                 console.log(`[Queue] Throttling for ${waitSecs}s due to ${cooldownSecs}s cooldown.`);
+                let lastCooldownUpdate = 0;
                 for (let i = waitSecs; i > 0; i--) {
                     if (job) {
                         job.cooldownRemaining = i;
                     }
-                    const totalBarLen = 12;
-                    const elapsed = waitSecs - i;
-                    const filledLen = Math.min(totalBarLen, Math.max(0, Math.round((elapsed / Math.max(1, waitSecs)) * totalBarLen)));
-                    const emptyLen = Math.max(0, totalBarLen - filledLen);
-                    const cBar = '█'.repeat(filledLen) + '░'.repeat(emptyLen);
-                    const pct = Math.round((elapsed / waitSecs) * 100);
+                    const now = Date.now();
+                    if (now - lastCooldownUpdate > 10000 || i === waitSecs || i === 1) {
+                        lastCooldownUpdate = now;
+                        const totalBarLen = 12;
+                        const elapsed = waitSecs - i;
+                        const filledLen = Math.min(totalBarLen, Math.max(0, Math.round((elapsed / Math.max(1, waitSecs)) * totalBarLen)));
+                        const emptyLen = Math.max(0, totalBarLen - filledLen);
+                        const cBar = '█'.repeat(filledLen) + '░'.repeat(emptyLen);
+                        const pct = Math.round((elapsed / waitSecs) * 100);
 
-                    const cooldownText = `⏳ **Auto-Countdown Cooldown Active**\n\n` +
-                                         `• **Status:** Anti-Flood Limit Buffer\n` +
-                                         `• **Time Remaining:** \`${i} seconds\`\n` +
-                                         `• **Delay Progress:** \`[${cBar}]\` **${pct}%**\n\n` +
-                                         `🛡 _Protecting your Telegram session against API throttling limits._`;
+                        const cooldownText = `⏳ **Auto-Countdown Cooldown Active**\n\n` +
+                                             `• **Status:** Anti-Flood Limit Buffer\n` +
+                                             `• **Time Remaining:** \`${i} seconds\`\n` +
+                                             `• **Delay Progress:** \`[${cBar}]\` **${pct}%**\n\n` +
+                                             `🛡 _Protecting your Telegram session against API throttling limits._`;
 
-                    await safeEditMessage(cooldownText, { chat_id: task.chatId, message_id: statusMsgId, parse_mode: 'Markdown' }).catch(() => {});
+                        await safeEditMessage(cooldownText, { chat_id: task.chatId, message_id: statusMsgId, parse_mode: 'Markdown' }).catch(() => {});
+                    }
                     await sleep(1000);
                 }
             }
@@ -7498,6 +7787,9 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                 uploadTarget = DEFAULT_LOG_GROUP;
                 threadId = undefined;
             }
+            if (!uploadTarget) {
+                throw new Error("No destination path configured. Please configure an upload path.");
+            }
 
         // Smart Route Destination: Find a client that can reach the destination
             let destClient: any = null;
@@ -7720,7 +8012,6 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                     const targetPeer = finalDestPeer || await safelyResolveEntity(destClient, uploadTarget);
                     
                     if (finalSourcePeer && targetPeer) {
-                        forwardAttempted = true;
                         const forwardResult = await destClient.invoke(new Api.messages.ForwardMessages({
                             fromPeer: finalSourcePeer,
                             id: [linkData.msgId],
@@ -7729,6 +8020,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                             topMsgId: threadId,
                             randomId: [helpers.generateRandomLong(true)]
                         }));
+                        forwardAttempted = true;
                         console.log(`[Debug] Direct forward successful.`);
                         
                         let sentMsgId = 0;
@@ -7803,15 +8095,20 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
             }
 
             // --- Cache Interception start ---
+            const isCacheEnabled = userDoc?.cacheEnabled !== false;
             fileKey = getSecureHashedFileKey(msg);
-            console.log(`[Cache] Checking cache with fileKey: ${fileKey}`);
             let cachedFileRecord: any = null;
-            if (fileKey && fileCacheCollection) {
-                try {
-                    cachedFileRecord = await fileCacheCollection.findOne({ fileKey });
-                } catch (ce) {
-                    console.error("[Cache] Failed to query cache database:", ce);
+            if (isCacheEnabled) {
+                console.log(`[Cache] Checking cache with fileKey: ${fileKey}`);
+                if (fileKey && fileCacheCollection) {
+                    try {
+                        cachedFileRecord = await fileCacheCollection.findOne({ fileKey });
+                    } catch (ce) {
+                        console.error("[Cache] Failed to query cache database:", ce);
+                    }
                 }
+            } else {
+                console.log(`[Cache] Cache is disabled for user. Skipping cache lookup.`);
             }
 
             if (cachedFileRecord) {
@@ -7819,11 +8116,10 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                 await safeEditMessage(`⚡ **Cached file found! Forwarding directly...**`, { chat_id: chatId, message_id: statusMsgId });
                 
                 try {
-                    const defaultLogPeer = await safelyResolveEntity(destClient, DEFAULT_LOG_GROUP);
+                    const defaultLogPeer = DEFAULT_LOG_GROUP ? await safelyResolveEntity(destClient, DEFAULT_LOG_GROUP).catch(() => null) : null;
                     const targetPeer = finalDestPeer || await safelyResolveEntity(destClient, uploadTarget);
                     
                     if (defaultLogPeer && targetPeer) {
-                        forwardAttempted = true;
                         const forwardResult = await destClient.invoke(new Api.messages.ForwardMessages({
                             fromPeer: defaultLogPeer,
                             id: [Number(cachedFileRecord.savedMsgId)],
@@ -7832,6 +8128,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                             topMsgId: threadId,
                             randomId: [helpers.generateRandomLong(true)]
                         }));
+                        forwardAttempted = true;
                         
                         let sentMsgId: number | undefined;
                         if (forwardResult && forwardResult.updates) {
@@ -7961,7 +8258,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                         };
                     }
 
-                    if (now - lastDownloadUpdate > 5000 || currentBytes === totalBytes) {
+                    if (now - lastDownloadUpdate > 10000 || currentBytes === totalBytes) {
                         lastDownloadUpdate = now;
                         const isPaused = taskControlMap.get(jobKey)?.isPaused || false;
                         const progressRes = await safeEditMessage(createProgressBar(totalBytes, currentBytes, "Downloading", downloadStartTime, pathDisplay), { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown', reply_markup: createProgressMarkup(jobKey, isPaused) });
@@ -8073,15 +8370,15 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
             const totalSize = fs.statSync(tempFilePath).size;
             let lastUploadUpdate = 0;
 
-            let uploadWorkers = 4;
+            let uploadWorkers = 12;
             if (totalSize > 1000 * 1024 * 1024) { // > 1GB
-                uploadWorkers = 16;
+                uploadWorkers = 24;
             } else if (totalSize > 500 * 1024 * 1024) { // > 500 MB
-                uploadWorkers = 10;
+                uploadWorkers = 16;
             } else if (totalSize > 100 * 1024 * 1024) {
-                uploadWorkers = 8;
+                uploadWorkers = 16;
             } else if (totalSize > 20 * 1024 * 1024) {
-                uploadWorkers = 4;
+                uploadWorkers = 12;
             }
 
             let uploadDone = false;
@@ -8119,7 +8416,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                                 };
                             }
         
-                            if (now - lastUploadUpdate > 1000 || currentBytes === totalSize) {
+                            if (now - lastUploadUpdate > 10000 || currentBytes === totalSize) {
                                 lastUploadUpdate = now;
                                 const text = createProgressBar(Number(totalSize), currentBytes, "Uploading", uploadStartTime, pathDisplay);
                                 const progressRes = await safeEditMessage(text, { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown' });
@@ -8175,47 +8472,51 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
 
                     // --- Save Copy to Saved Files Cache topic in DEFAULT_LOG_GROUP start ---
                     let savedLogMsg: any = null;
-                    try {
-                        const logGroupPeer = await safelyResolveEntity(destClient, DEFAULT_LOG_GROUP);
-                        if (logGroupPeer) {
-                            const cachedTopicId = await getOrCreateCachedFilesTopicId(destClient);
-                            console.log(`[CacheLog] Saving copy of file to DEFAULT_LOG_GROUP under topic/thread ${cachedTopicId}`);
-                            
-                            savedLogMsg = await destClient.sendFile(logGroupPeer, {
-                                file: uploadedFile,
-                                caption: caption,
-                                workers: uploadWorkers,
-                                attributes: attributes,
-                                thumb: hasThumb ? thumbPath : undefined,
-                                replyTo: cachedTopicId
-                            } as any);
-                        }
-                    } catch (logErr) {
-                        console.error("[CacheLog] Failed to save copy of file to DEFAULT_LOG_GROUP:", logErr);
-                    }
-
-                    if (savedLogMsg && fileKey && fileCacheCollection) {
+                    if (isCacheEnabled) {
                         try {
-                            await fileCacheCollection.updateOne(
-                                { fileKey },
-                                {
-                                    $set: {
-                                        fileKey,
-                                        fileName: filename,
-                                        totalSize: totalSize,
-                                        savedMsgId: savedLogMsg.id,
-                                        savedChatId: secureMetadataField(DEFAULT_LOG_GROUP),
-                                        sourceLink: link,
-                                        cachedAt: new Date(),
-                                        expiresAt: new Date(Date.now() + CACHE_TTL_MS)
-                                    }
-                                },
-                                { upsert: true }
-                            );
-                            console.log(`[CacheLog] File successfully registered in file_cache collection under fileKey: ${fileKey}`);
-                        } catch (dbErr) {
-                            console.error("[CacheLog] Failed to insert file cache record to MongoDB:", dbErr);
+                            const logGroupPeer = DEFAULT_LOG_GROUP ? await safelyResolveEntity(destClient, DEFAULT_LOG_GROUP).catch(() => null) : null;
+                            if (logGroupPeer) {
+                                const cachedTopicId = await getOrCreateCachedFilesTopicId(destClient);
+                                console.log(`[CacheLog] Saving copy of file to DEFAULT_LOG_GROUP under topic/thread ${cachedTopicId}`);
+                                
+                                savedLogMsg = await destClient.sendFile(logGroupPeer, {
+                                    file: uploadedFile,
+                                    caption: caption,
+                                    workers: uploadWorkers,
+                                    attributes: attributes,
+                                    thumb: hasThumb ? thumbPath : undefined,
+                                    replyTo: cachedTopicId
+                                } as any);
+                            }
+                        } catch (logErr) {
+                            console.error("[CacheLog] Failed to save copy of file to DEFAULT_LOG_GROUP:", logErr);
                         }
+
+                        if (savedLogMsg && fileKey && fileCacheCollection) {
+                            try {
+                                await fileCacheCollection.updateOne(
+                                    { fileKey },
+                                    {
+                                        $set: {
+                                            fileKey,
+                                            fileName: filename,
+                                            totalSize: totalSize,
+                                            savedMsgId: savedLogMsg.id,
+                                            savedChatId: secureMetadataField(DEFAULT_LOG_GROUP),
+                                            sourceLink: link,
+                                            cachedAt: new Date(),
+                                            expiresAt: new Date(Date.now() + CACHE_TTL_MS)
+                                        }
+                                    },
+                                    { upsert: true }
+                                );
+                                console.log(`[CacheLog] File successfully registered in file_cache collection under fileKey: ${fileKey}`);
+                            } catch (dbErr) {
+                                console.error("[CacheLog] Failed to insert file cache record to MongoDB:", dbErr);
+                            }
+                        }
+                    } else {
+                        console.log(`[CacheLog] Cache is disabled, skipping save to DEFAULT_LOG_GROUP.`);
                     }
                     // --- Save Copy to Saved Files Cache topic in DEFAULT_LOG_GROUP end ---
 
@@ -8285,6 +8586,142 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
             throw new Error(errMsg || "Unknown Error");
         }
     };
+
+const startTopicClone = async (chatId: number, fromId: number, sourceGroupId: string, destGroupId: string, topicId: number, startMsgId?: number) => {
+    await safeSendMessage(chatId, `📂 **Starting Specific Topic Clone...**\nSource: \`${sourceGroupId}\`\nTopic ID: \`${topicId}\`\nDest: \`${destGroupId}\`${startMsgId ? `\nStart Msg ID: \`${startMsgId}\`` : ''}`);
+    try {
+        const targetUid = Number(await resolveSettingsUserId(fromId));
+        const client = await getConnectedUserbotClient(targetUid);
+        if (!client) throw new Error("Your Userbot session is not active. Please /login first.");
+        
+        const sourceEntity = await safelyResolveFullEntity(client, sourceGroupId);
+        const destEntity = await safelyResolveFullEntity(client, destGroupId);
+        
+        const realSourceId = (sourceEntity as any).id?.toString() || sourceGroupId;
+        const resolvedSourceId = realSourceId.startsWith('-100') ? realSourceId : "-100" + realSourceId;
+        const sourceUsername = (sourceEntity as any).username || '';
+
+        const realDestId = (destEntity as any).id?.toString() || destGroupId;
+        const resolvedDestId = realDestId.startsWith('-100') ? realDestId : "-100" + realDestId;
+
+        const sourceTitle = (sourceEntity as any).title || "Source Group";
+        const destTitle = (destEntity as any).title || "Destination Group";
+
+        let topicTitle = "Mirrored Topic";
+        try {
+            const topicsResult: any = await client.invoke(new Api.channels.GetForumTopics({ channel: sourceEntity, limit: 100 }));
+            const topic = topicsResult.topics?.find((t: any) => t.id === topicId);
+            if (topic) topicTitle = topic.title;
+        } catch(e) { console.error("Error getting topic title", e); }
+        
+        const topicResult = await getOrCreateTopic(client, destEntity, topicTitle);
+        
+        if (topicResult.error) {
+            throw new Error(`Could not create or find the topic.\n\n⚠️ **Telegram Error:** \`${topicResult.error}\`\n\n💡 **Troubleshooting Tips:**\n1. Ensure the destination is indeed a **Forum Group** (Forum must be turned on in settings).\n2. Make sure the Userbot account has **Admin / Create Topics** permission inside that group.\n3. Make sure the destination link or ID is fully correct and the userbot has successfully joined.`);
+        }
+        
+        const destTopicId = topicResult.topicId;
+
+        try {
+            await safeSendMessage(Number(resolvedDestId), `✅ **SetDone: Bot is ready to upload here for specific topic clone.**`, { message_thread_id: destTopicId });
+        } catch(e) { console.error("Error sending topic clone confirmation", e); }
+        
+        const sourceIdClean = resolvedSourceId.replace('-100', '');
+
+        const alreadyMirroredDocs = mirroredMessagesCollection ? 
+              await mirroredMessagesCollection.find({ destId: resolvedDestId }, { projection: { link: 1 } }).toArray() : [];
+        const alreadyMirroredLinks = new Set(alreadyMirroredDocs.map((doc: any) => doc.link));
+        let skippedCount = 0;
+        let queuedCount = 0;
+        const topicTasksToQueue: Task[] = [];
+
+        for await (const m of client.iterMessages(sourceEntity, {
+            replyTo: topicId,
+            reverse: true
+        })) {
+            if (startMsgId && m.id < startMsgId) continue;
+            
+            if (m.action) continue; 
+            if (!m.message && !m.media) continue;
+
+            const virtualLink = `https://t.me/c/${sourceIdClean}/${m.id}`;
+            if (alreadyMirroredLinks.has(virtualLink)) {
+                skippedCount++;
+                continue;
+            }
+            
+            topicTasksToQueue.push({ 
+                chatId, 
+                link: virtualLink, 
+                userId: fromId,
+                forceGeneralPath: false,
+                overrideTargetId: resolvedDestId, 
+                overrideThreadId: destTopicId,
+                isMirror: true
+            });
+            queuedCount++;
+        }
+        
+        topicTasksToQueue.sort((a, b) => {
+            const idA = parseInt(a.link.split('/').pop() || '0');
+            const idB = parseInt(b.link.split('/').pop() || '0');
+            return idA - idB;
+        });
+
+        if (queuedCount === 0 && skippedCount === 0) {
+            throw new Error("No messages found inside this topic (or from the start point), or topic ID is invalid.");
+        }
+
+        if (topicTasksToQueue.length > 0) {
+            const topicCloneSessionId = `tc-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+            const statusMsg = await safeSendMessage(chatId, `⏳ **Initializing real-time universal tracking bar...**`);
+            const statusMsgId = statusMsg ? statusMsg.message_id : undefined;
+
+            for (const t of topicTasksToQueue) {
+                t.topicCloneSessionId = topicCloneSessionId;
+            }
+
+            const sessionInfo = {
+                chatId,
+                statusMsgId,
+                totalFiles: queuedCount,
+                processedFiles: 0,
+                successCount: 0,
+                failedCount: 0,
+                topicTitle,
+                sourceGroupId: resolvedSourceId,
+                destGroupId: resolvedDestId,
+                startTime: Date.now()
+            };
+            activeTopicCloneSessions.set(topicCloneSessionId, sessionInfo);
+
+            if (statusMsgId) {
+                try {
+                    await safeBotCall('pinChatMessage', chatId, String(statusMsgId), { disable_notification: true });
+                } catch (pErr) {
+                    console.error("[Queue DB] pinChatMessage initial error:", pErr);
+                }
+            }
+
+            taskQueue.push(...topicTasksToQueue);
+            dbEnqueueTasks(topicTasksToQueue).catch(e => console.error("[Queue DB] Bulk enqueue error:", e));
+
+            await updateTopicCloneProgress(topicCloneSessionId).catch(err => {
+                console.error("[Topic Clone Progress Setup Failed]", err);
+            });
+        }
+
+        await startAutoMirrorWatcher(Number(targetUid), client).catch(err => {
+            console.warn("[Topic Clone -> Live Watcher] Failed to auto start watcher:", err.message);
+        });
+
+        runNextTask();
+        const skipText = skippedCount > 0 ? ` (Skipped **${skippedCount}** already mirrored previously)` : '';
+        safeSendMessage(chatId, `✅ Added **${queuedCount}** items from Topic ID \`${topicId}\` to copy queue${skipText} for destination: \`${resolvedDestId}\` (Topic: \`${topicTitle}\`).`);
+    } catch (err: any) {
+        safeSendMessage(chatId, `❌ **Clone Error:** ${err.message}`);
+    }
+}
 
     bot.on('message', async (msg) => {
       const chatId = msg.chat.id;
@@ -8815,8 +9252,11 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                       
                       let kb: any[] = [];
                       if (recentSources.length > 0) {
-                          recentSources.forEach((s: any) => {
-                              kb.push([{ text: `📥 ${s.sourceName}`, callback_data: `clonesource_${s.sourceId}` }]);
+                          recentSources.forEach((s: any, originalIndex: number) => {
+                              kb.push([
+                                  { text: `📥 ${s.sourceName}`, callback_data: `clonesource_${s.sourceId}` },
+                                  { text: `🗑`, callback_data: `del_recent_source:${originalIndex}` }
+                              ]);
                           });
                           kb.push([{ text: `➕ Enter New Source ID`, callback_data: `clonesource_new` }]);
                       }
@@ -9153,183 +9593,38 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                   return;
               }
               
+              state.type = 'topic_clone_start_link';
+              state.cloneTopicId = topicId;
+              
+              safeSendMessage(chatId, `🎯 **Clone Specific Topic**\n\n4. How do you want to clone this topic?\n\n• Send **all** to download from the start.\n• Send the **Message Link** (or ID) of the message where you want to start from.`, {
+                  reply_markup: {
+                      inline_keyboard: [[{ text: 'Download from start', callback_data: `clone_start_all` }]]
+                  }
+              });
+              return;
+          }
+
+          if (state.type === 'topic_clone_start_link') {
               const sourceGroupId = state.cloneSourceGroupId!;
               const destGroupId = state.pendingCloneDest!;
+              const topicId = state.cloneTopicId!;
               delete userActionStates[fromId];
-              
-              await safeSendMessage(chatId, `📂 **Starting Specific Topic Clone...**\nSource: \`${sourceGroupId}\`\nTopic ID: \`${topicId}\`\nDest: \`${destGroupId}\``);
-              
-              try {
-                  const targetUid = Number(await resolveSettingsUserId(fromId));
-                  const client = await getConnectedUserbotClient(targetUid);
-                  if (!client) throw new Error("Your Userbot session is not active. Please /login first.");
-                  
-                  const sourceEntity = await safelyResolveFullEntity(client, sourceGroupId);
-                  const destEntity = await safelyResolveFullEntity(client, destGroupId);
-                  
-                  const realSourceId = (sourceEntity as any).id?.toString() || sourceGroupId;
-                  const resolvedSourceId = realSourceId.startsWith('-100') ? realSourceId : "-100" + realSourceId;
-                  const sourceUsername = (sourceEntity as any).username || '';
 
-                  const realDestId = (destEntity as any).id?.toString() || destGroupId;
-                  const resolvedDestId = realDestId.startsWith('-100') ? realDestId : "-100" + realDestId;
-
-                  // Dynamically assign correct sourceName to the mirrorPath
-                  const sourceTitle = (sourceEntity as any).title || "Source Group";
-                  const destTitle = (destEntity as any).title || "Destination Group";
-
-                  // Get topic title
-                  let topicTitle = "Mirrored Topic";
-                  try {
-                      const topicsResult: any = await client.invoke(new Api.channels.GetForumTopics({ channel: sourceEntity, limit: 100 }));
-                      const topic = topicsResult.topics?.find((t: any) => t.id === topicId);
-                      if (topic) topicTitle = topic.title;
-                  } catch(e) { console.error("Error getting topic title", e); }
-                  
-                  // Save mirror path to database first, with fully resolved fields!
-                  const settingsUid = await resolveSettingsUserId(fromId);
-                  const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
-                  const paths = userDoc?.mirrorPaths || [];
-                  
-                  // Remove any duplicate specific topic mirror config first
-                  const filteredPaths = paths.filter((p: any) => 
-                      !(p.sourceId === resolvedSourceId && p.destId === resolvedDestId && p.destThreadId === Number(topicId))
-                  );
-                  
-                  filteredPaths.push({ 
-                      sourceId: resolvedSourceId, 
-                      sourceNumericId: resolvedSourceId,
-                      sourceUsername,
-                      sourceName: sourceTitle,
-                      destId: resolvedDestId, 
-                      destThreadId: Number(topicId), 
-                      groupName: destTitle, 
-                      topicName: topicTitle,
-                      isLive: true, // Auto-enable live matching on this Specific Topic!
-                      createdAt: new Date()
-                  });
-                  await approvedUsersCollection?.updateOne({ userId: settingsUid }, { $set: { mirrorPaths: filteredPaths } });
-
-                  // Create or get topic in dest
-                  console.log(`[Debug] Topic Clone: destEntity: ${destEntity.id}, topicTitle: ${topicTitle}`);
-                  const topicResult = await getOrCreateTopic(client, destEntity, topicTitle);
-                  console.log(`[Debug] Topic Clone result:`, topicResult);                
-                  
-                  if (topicResult.error) {
-                      throw new Error(`Could not create or find the topic.\n\n⚠️ **Telegram Error:** \`${topicResult.error}\`\n\n💡 **Troubleshooting Tips:**\n1. Ensure the destination is indeed a **Forum Group** (Forum must be turned on in settings).\n2. Make sure the Userbot account has **Admin / Create Topics** permission inside that group.\n3. Make sure the destination link or ID is fully correct and the userbot has successfully joined.`);
+              let startMsgId: number | undefined = undefined;
+              if (text.toLowerCase() !== 'all') {
+                  const match = text.match(/\/(\d+)(\?|$)/);
+                  if (match) {
+                      startMsgId = parseInt(match[1]);
+                  } else {
+                      startMsgId = parseInt(text);
                   }
-                  
-                  const destTopicId = topicResult.topicId;
-                  
-                  // Update mirrorPath destTopicId to the real created destTopicId!
-                  const finalPaths = filteredPaths.map((p: any) => {
-                      if (p.sourceId === resolvedSourceId && p.destId === resolvedDestId && p.destThreadId === Number(topicId)) {
-                          return { ...p, destThreadId: destTopicId };
-                      }
-                      return p;
-                  });
-                  await approvedUsersCollection?.updateOne({ userId: settingsUid }, { $set: { mirrorPaths: finalPaths } });
-
-                  // Confirmation in topic
-                  try {
-                      await safeSendMessage(Number(resolvedDestId), `✅ **SetDone: Bot is ready to upload here for specific topic mirror.**`, { message_thread_id: destTopicId });
-                      await safeSendMessage(Number(DEFAULT_LOG_GROUP), `✅ **Topic Mirror Set!**\nTarget Id: ${resolvedDestId}\nTopic Id: ${destTopicId}`);
-                  } catch(e) { console.error("Error sending topic mirror confirmation", e); }
-                  
-                  const sourceIdClean = resolvedSourceId.replace('-100', '');
-
-                  const alreadyMirroredDocs = mirroredMessagesCollection ? 
-                        await mirroredMessagesCollection.find({ destId: resolvedDestId }, { projection: { link: 1 } }).toArray() : [];
-                  const alreadyMirroredLinks = new Set(alreadyMirroredDocs.map((doc: any) => doc.link));
-                  let skippedCount = 0;
-                  let queuedCount = 0;
-                  const topicTasksToQueue: Task[] = [];
-
-                  for await (const m of client.iterMessages(sourceEntity, {
-                      replyTo: topicId
-                  })) {
-                      if (m.action) continue; 
-                      if (!m.message && !m.media) continue;
-
-                      const virtualLink = `https://t.me/c/${sourceIdClean}/${m.id}`;
-                      if (alreadyMirroredLinks.has(virtualLink)) {
-                          skippedCount++;
-                          continue;
-                      }
-                      
-                      topicTasksToQueue.push({ 
-                          chatId, 
-                          link: virtualLink, 
-                          userId: fromId,
-                          forceGeneralPath: false,
-                          overrideTargetId: resolvedDestId, 
-                          overrideThreadId: destTopicId,
-                          isMirror: true
-                      });
-                      queuedCount++;
+                  if (isNaN(startMsgId)) {
+                      safeSendMessage(chatId, "❌ **Invalid Input.** Send 'all', a Message Link, or a numeric Message ID.");
+                      return;
                   }
-                  
-                  // Sort by ID to ensure oldest to newest processing
-                  topicTasksToQueue.sort((a, b) => {
-                      const idA = parseInt(a.link.split('/').pop() || '0');
-                      const idB = parseInt(b.link.split('/').pop() || '0');
-                      return idA - idB;
-                  });
-
-                  if (queuedCount === 0 && skippedCount === 0) {
-                      throw new Error("No messages found inside this topic, or topic ID is invalid.");
-                  }
-
-                  if (topicTasksToQueue.length > 0) {
-                      const topicCloneSessionId = `tc-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
-                      const statusMsg = await safeSendMessage(chatId, `⏳ **Initializing real-time universal tracking bar...**`);
-                      const statusMsgId = statusMsg ? statusMsg.message_id : undefined;
-
-                      for (const t of topicTasksToQueue) {
-                          t.topicCloneSessionId = topicCloneSessionId;
-                      }
-
-                      const sessionInfo = {
-                          chatId,
-                          statusMsgId,
-                          totalFiles: queuedCount,
-                          processedFiles: 0,
-                          successCount: 0,
-                          failedCount: 0,
-                          topicTitle,
-                          sourceGroupId: resolvedSourceId,
-                          destGroupId: resolvedDestId,
-                          startTime: Date.now()
-                      };
-                      activeTopicCloneSessions.set(topicCloneSessionId, sessionInfo);
-
-                      if (statusMsgId) {
-                          try {
-                              await safeBotCall('pinChatMessage', chatId, String(statusMsgId), { disable_notification: true });
-                          } catch (pErr) {
-                              console.error("[Queue DB] pinChatMessage initial error:", pErr);
-                          }
-                      }
-
-                      taskQueue.push(...topicTasksToQueue);
-                      dbEnqueueTasks(topicTasksToQueue).catch(e => console.error("[Queue DB] Bulk enqueue error:", e));
-
-                      await updateTopicCloneProgress(topicCloneSessionId).catch(err => {
-                          console.error("[Topic Clone Progress Setup Failed]", err);
-                      });
-                  }
-
-                  // Start watcher for client so live mirroring works as well!
-                  await startAutoMirrorWatcher(Number(settingsUid), client).catch(err => {
-                      console.warn("[Topic Clone -> Live Watcher] Failed to auto start watcher:", err.message);
-                  });
-
-                  runNextTask();
-                  const skipText = skippedCount > 0 ? ` (Skipped **${skippedCount}** already mirrored previously)` : '';
-                  safeSendMessage(chatId, `✅ Added **${queuedCount}** items from Topic ID \`${topicId}\` to copy queue${skipText} for destination: \`${resolvedDestId}\` (Topic: \`${topicTitle}\`).`);
-              } catch (err: any) {
-                  safeSendMessage(chatId, `❌ **Clone Error:** ${err.message}`);
               }
+
+              startTopicClone(chatId, fromId, sourceGroupId, destGroupId, topicId, startMsgId);
               return;
           }
 
@@ -9360,8 +9655,8 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                   );
 
                   let destId = mirrorPath ? mirrorPath.destId : (userDoc?.uploadPath || DEFAULT_LOG_GROUP);
-                  if (!userDoc?.uploadPath) {
-                      destId = DEFAULT_LOG_GROUP;
+                  if (!destId) {
+                      throw new Error("No destination path configured. Please configure an upload path first.");
                   }
 
                   const messages: any = await client.getMessages(sourceEntity, {
@@ -10031,7 +10326,7 @@ app.get('/api/status', async (req, res) => {
         uploadEngine: currentUploadEngine,
         renameRules: globalRenameRules,
         cooldownSeconds: globalCooldownSeconds,
-        mirrorPaths: approvedUsersCollection ? ((await approvedUsersCollection.findOne({userId: ALLOWED_ADMIN_IDS[0].toString()}, {  maxTimeMS: 4000 }))?.mirrorPaths || []) : []
+        mirrorPaths: (approvedUsersCollection && dbStatus === 'Connected') ? ((await approvedUsersCollection.findOne({userId: ALLOWED_ADMIN_IDS[0].toString()}, {  maxTimeMS: 4000 }))?.mirrorPaths || []) : []
       }
     });
   } catch (err: any) {
@@ -10088,7 +10383,7 @@ app.post('/api/queue/prioritize-item', (req, res) => {
 
 app.get('/api/failed/list', async (req, res) => {
   try {
-     const failed = failedTasksCollection ? await failedTasksCollection.find({}, { maxTimeMS: 4000 }).sort({ failedAt: -1 }).toArray() : [];
+     const failed = (failedTasksCollection && dbStatus === 'Connected') ? await failedTasksCollection.find({}, { maxTimeMS: 4000 }).sort({ failedAt: -1 }).toArray() : [];
      res.json({ failed });
   } catch (err: any) {
      res.status(500).json({ error: err.message });
@@ -10126,7 +10421,7 @@ app.post('/api/failed/clear', async (req, res) => {
 app.get('/api/mirrored/history', async (req, res) => {
   try {
     let logs = [...inMemoryMirrorLogs];
-    if (mirroredMessagesCollection) {
+    if (mirroredMessagesCollection && dbStatus === 'Connected') {
       try {
         const dbLogs = await mirroredMessagesCollection.find({}, { maxTimeMS: 4000 }).sort({ mirroredAt: -1 }).limit(100).toArray();
         const mappedDbLogs = dbLogs.map((log: any) => ({
@@ -10231,6 +10526,23 @@ app.post('/api/queue/add', async (req, res) => {
 app.post('/api/system/restart', (req, res) => {
   res.json({ success: true, message: 'Restarting bot server...' });
   setTimeout(() => process.exit(0), 1000);
+});
+
+app.post('/api/system/reset', async (req, res) => {
+  try {
+    const stats = await performSystemReset();
+    res.json({ 
+      success: true, 
+      message: 'System reset performed successfully! Bot process is rebooting to start completely fresh...',
+      stats
+    });
+    setTimeout(() => {
+      console.log("[Reset API] Process restarting on admin request...");
+      process.exit(0);
+    }, 1500);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/api/system/ping', (req, res) => {
@@ -10431,7 +10743,24 @@ app.post('/api/settings', async (req, res) => {
 // Global error handlers to prevent unhandled rejections from crashing or being noisy
 process.on('unhandledRejection', (reason: any, promise) => {
     const msg = (reason?.message || String(reason)).toLowerCase();
-    if (msg.includes('429') || reason?.error_code === 429 || msg.includes('topic_closed') || msg.includes('message thread not found') || msg.includes('timeout') || msg.includes('etimedout') || msg.includes('socket hang up') || msg.includes('econnreset') || msg.includes('econnrefused')) {
+    if (
+        msg.includes('429') || 
+        reason?.error_code === 429 || 
+        msg.includes('topic_closed') || 
+        msg.includes('message thread not found') || 
+        msg.includes('timeout') || 
+        msg.includes('etimedout') || 
+        msg.includes('socket hang up') || 
+        msg.includes('econnreset') || 
+        msg.includes('econnrefused') ||
+        msg.includes('channel_invalid') ||
+        msg.includes('channel_private') ||
+        msg.includes('chat_admin_required') ||
+        msg.includes('peer_id_invalid') ||
+        msg.includes('user_deactivated') ||
+        msg.includes('input_user_deactivated') ||
+        msg.includes('flood_wait')
+    ) {
         console.warn('Silent caught known Telegram Rejection:', msg);
     } else {
         console.error('Unhandled Rejection at:', promise, 'reason:', reason);
@@ -10440,7 +10769,20 @@ process.on('unhandledRejection', (reason: any, promise) => {
 
 process.on('uncaughtException', (err: any) => {
     const msg = (err?.message || String(err)).toLowerCase();
-    if (msg.includes('timeout') || msg.includes('etimedout') || msg.includes('socket hang up') || msg.includes('econnreset') || msg.includes('econnrefused')) {
+    if (
+        msg.includes('timeout') || 
+        msg.includes('etimedout') || 
+        msg.includes('socket hang up') || 
+        msg.includes('econnreset') || 
+        msg.includes('econnrefused') ||
+        msg.includes('channel_invalid') ||
+        msg.includes('channel_private') ||
+        msg.includes('chat_admin_required') ||
+        msg.includes('peer_id_invalid') ||
+        msg.includes('user_deactivated') ||
+        msg.includes('input_user_deactivated') ||
+        msg.includes('flood_wait')
+    ) {
         console.warn('Silent caught known Telegram/Network Uncaught Exception:', msg);
     } else {
         console.error('Uncaught Exception:', err);

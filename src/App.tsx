@@ -36,15 +36,16 @@ import { motion, AnimatePresence } from 'motion/react';
 import type { BotStatus } from './types';
 import SystemStatusBar from './components/SystemStatusBar';
 
-type Tab = 'dashboard' | 'config' | 'rules' | 'mirror' | 'system';
+type Tab = 'home' | 'control' | 'config' | 'mirror';
 
 export default function App() {
   const [data, setData] = useState<BotStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<Tab>('dashboard');
+  const [activeTab, setActiveTab] = useState<Tab>('home');
   const [isDarkMode, setIsDarkMode] = useState(true);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [telegramSessions, setTelegramSessions] = useState<number[]>([]);
 
   // Operator Panel Forms
   const [singleTaskLink, setSingleTaskLink] = useState('');
@@ -82,10 +83,11 @@ export default function App() {
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const [statusRes, historyRes, failedRes] = await Promise.all([
+        const [statusRes, historyRes, failedRes, sessionsRes] = await Promise.all([
           fetch('/api/status'),
           fetch('/api/mirrored/history'),
-          fetch('/api/failed/list')
+          fetch('/api/failed/list'),
+          fetch('/api/sessions').catch(() => null)
         ]);
         if (!statusRes.ok) throw new Error('Failed to fetch status');
         const statusJson = await statusRes.json();
@@ -99,6 +101,11 @@ export default function App() {
         if (failedRes.ok) {
           const failedJson = await failedRes.json();
           setFailedTasks(failedJson.failed || []);
+        }
+
+        if (sessionsRes && sessionsRes.ok) {
+          const sessionsJson = await sessionsRes.json();
+          setTelegramSessions(sessionsJson || []);
         }
       } catch (err) {
         console.error('Frontend Error:', err);
@@ -380,150 +387,204 @@ export default function App() {
     </button>
   );
 
-  const renderDashboard = () => (
-    <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
-      {/* Bot Identity & Queue Stats */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 sm:p-8 rounded-3xl relative overflow-hidden group shadow-lg">
-          <div className="absolute top-0 right-0 p-4 opacity-5 group-hover:opacity-10 transition-opacity">
-            <Bot size={120} />
-          </div>
-          <h2 className="text-slate-500 text-[10px] font-bold uppercase tracking-[0.2em] mb-6">Bot Identity</h2>
-          {data?.botInfo ? (
-            <div className="flex flex-col sm:flex-row items-start sm:items-center gap-5">
-              <div className="w-16 h-16 sm:w-20 sm:h-20 bg-gradient-to-br from-sky-500 to-blue-600 rounded-2xl sm:rounded-3xl flex items-center justify-center text-white text-3xl font-extrabold shadow-md">
-                {data.botInfo.first_name[0]}
+  const renderHome = () => {
+    const botName = data?.botInfo?.first_name || 'Bot Offline';
+    const botUsername = data?.botInfo?.username ? `@${data.botInfo.username}` : 'No Username';
+    const botStatus = data?.status || 'Stopped';
+    const isRunning = botStatus === 'Running';
+    const sessionCount = telegramSessions.length;
+    const activeJob = data?.activeJobs && data?.activeJobs.length > 0 ? data.activeJobs[0] : null;
+    const progressPercent = activeJob?.progress?.percent || 0;
+    const activeSpeed = activeJob?.progress?.speed || '0 KB/s';
+    const activeEta = activeJob?.progress?.eta || 'N/A';
+    const activeCurrent = activeJob?.progress?.current || 0;
+    const activeTotal = activeJob?.progress?.total || 0;
+    const totalRemaining = data?.queueSize || 0;
+
+    return (
+      <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500 pb-24">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          
+          {/* Card 1: Bot Identity (3D Style) */}
+          <div className="bg-white dark:bg-[#0f172a] border-2 border-slate-200 dark:border-[#1e293b] p-6 rounded-2xl relative overflow-hidden group shadow-[6px_6px_0px_0px_rgba(14,165,233,0.3)] dark:shadow-[6px_6px_0px_0px_rgba(2,132,199,0.35)] transition-all hover:-translate-x-1 hover:-translate-y-1 hover:shadow-[10px_10px_0px_0px_rgba(14,165,233,0.4)] dark:hover:shadow-[10px_10px_0px_0px_rgba(2,132,199,0.45)] duration-200">
+            <div className="absolute top-0 right-0 p-4 opacity-5 group-hover:opacity-10 transition-opacity">
+              <Bot size={100} className="text-sky-500" />
+            </div>
+            <span className="text-slate-400 dark:text-slate-500 text-[10px] font-extrabold uppercase tracking-[0.25em] block mb-4">
+              🤖 BOT IDENTITY
+            </span>
+            <div className="flex items-center gap-4">
+              <div className="w-14 h-14 bg-gradient-to-br from-sky-400 to-blue-600 rounded-xl flex items-center justify-center text-white text-xl font-black shadow-[3px_3px_0px_0px_rgba(14,165,233,0.4)]">
+                {botName[0]}
               </div>
               <div className="min-w-0 flex-1">
-                <h3 className="text-slate-900 dark:text-white text-lg font-bold tracking-tight truncate">{data.botInfo.first_name}</h3>
-                <p className="text-sky-500 font-mono text-sm leading-none mt-2 truncate">
-                  @{data.botInfo.username}
+                <h3 className="text-slate-900 dark:text-white text-base font-black tracking-tight truncate">{botName}</h3>
+                <p className="text-sky-500 font-mono text-xs font-bold leading-none mt-1 truncate">
+                  {botUsername}
                 </p>
-                <div className="mt-4 flex items-center gap-2 text-slate-500 text-[10px] font-bold uppercase tracking-widest bg-slate-100 dark:bg-slate-800/60 px-3 py-1 rounded-lg w-max border border-slate-200/50 dark:border-slate-700/50">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                  ID-TG: <span className="text-sky-400 dark:text-sky-300 font-mono">{data.botInfo.id}</span>
-                </div>
-              </div>
-            </div>
-          ) : (
-            <div className="flex items-center gap-4 py-4 text-slate-500">
-              <Bot className="animate-bounce" />
-              <p className="text-sm font-semibold">Connecting to active bot instance...</p>
-            </div>
-          )}
-        </div>
-
-        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 sm:p-8 rounded-3xl shadow-lg">
-          <h2 className="text-slate-500 text-[10px] font-bold uppercase tracking-[0.2em] mb-6">Active Workload</h2>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div className="bg-slate-100 dark:bg-slate-800/80 p-5 rounded-2xl border border-slate-200/80 dark:border-slate-800 flex flex-col justify-between">
-              <div>
-                <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1">Queue Size</p>
-                <div className="flex items-baseline gap-2">
-                  <span className="text-3xl font-black text-sky-500 dark:text-sky-400">{data?.queueSize || 0}</span>
-                  <span className="text-xs text-slate-400 uppercase font-black tracking-tight">tasks</span>
-                </div>
-              </div>
-              <div className="mt-3 flex items-center gap-1.5 label text-[10px] uppercase tracking-wide font-extrabold text-slate-400">
-                <span>Status:</span>
-                {data?.isQueuePaused ? (
-                  <span className="text-amber-500 bg-amber-500/10 px-2 py-0.5 rounded border border-amber-500/20">PAUSED</span>
-                ) : (
-                  <span className="text-emerald-500 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">RUNNING</span>
-                )}
-              </div>
-            </div>
-            <div className={`bg-slate-100 dark:bg-slate-800/80 p-5 rounded-2xl border transition-all ${data?.nextTaskIn ? 'border-orange-500/30 bg-orange-500/5' : 'border-slate-200 dark:border-slate-800'} flex flex-col justify-between`}>
-              <div>
-                <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1 flex items-center gap-1.5">
-                  <Clock size={10} className={data?.nextTaskIn ? 'text-orange-500' : ''} />
-                  Next Delay
-                </p>
-                <div className="flex items-baseline gap-2">
-                  <span className={`text-3xl font-extrabold ${data?.nextTaskIn ? 'text-orange-500 dark:text-orange-400' : 'text-slate-400'}`}>
-                    {data?.nextTaskIn || 0}
+                <div className="mt-3 flex items-center gap-2">
+                  <span className={`w-2 h-2 rounded-full ${isRunning ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'} shrink-0`} />
+                  <span className="text-[10px] text-slate-500 dark:text-slate-400 font-bold uppercase tracking-wider">
+                    Status: <span className={isRunning ? 'text-emerald-500 font-black' : 'text-rose-500 font-black'}>{botStatus}</span>
                   </span>
-                  <span className="text-xs text-slate-500 uppercase font-bold tracking-tight">seconds</span>
                 </div>
               </div>
-              <p className="mt-3 text-[9px] text-slate-400 font-bold uppercase tracking-wider leading-relaxed">
-                Buffer cooldown to comply with Telegram API flood protection limits.
-              </p>
             </div>
           </div>
-          {(() => {
-            const configuredCD = data?.settings?.cooldownSeconds ? Number(data.settings.cooldownSeconds) : 15;
-            const effectiveCD = configuredCD > 0 ? configuredCD : 15;
-            const waitPercent = data?.nextTaskIn && effectiveCD > 0 
-              ? Math.min(100, Math.max(0, Math.round(((effectiveCD - data.nextTaskIn) / effectiveCD) * 100))) 
-              : 0;
-            return (
-              <div className="mt-6 flex items-center gap-4 p-4 bg-slate-100 dark:bg-slate-800 rounded-2xl border border-slate-200/60 dark:border-slate-800">
-                <Activity className="text-sky-500 shrink-0" size={18} />
-                <div className="flex-1 min-w-0">
-                   <div className="flex justify-between mb-1 text-[10px] font-extrabold">
-                     <span className="text-slate-400 uppercase">Wait Progress</span>
-                     <span className="text-sky-500">{data?.nextTaskIn ? `${waitPercent}%` : '0%'}</span>
-                   </div>
-                   <div className="h-1.5 bg-slate-200 dark:bg-slate-700 rounded-full overflow-hidden">
-                     <motion.div 
-                       animate={{ width: data?.nextTaskIn ? `${waitPercent}%` : '0%' }}
-                       className="h-full bg-sky-500 shadow-[0_0_8px_rgba(14,165,233,0.5)]"
-                     />
-                   </div>
+
+          {/* Card 2: Telegram Accounts (3D Style) */}
+          <div className="bg-white dark:bg-[#0f172a] border-2 border-slate-200 dark:border-[#1e293b] p-6 rounded-2xl relative overflow-hidden group shadow-[6px_6px_0px_0px_rgba(16,185,129,0.3)] dark:shadow-[6px_6px_0px_0px_rgba(16,185,129,0.35)] transition-all hover:-translate-x-1 hover:-translate-y-1 hover:shadow-[10px_10px_0px_0px_rgba(16,185,129,0.4)] dark:hover:shadow-[10px_10px_0px_0px_rgba(16,185,129,0.45)] duration-200">
+            <div className="absolute top-0 right-0 p-4 opacity-5 group-hover:opacity-10 transition-opacity">
+              <UserCheck size={100} className="text-emerald-500" />
+            </div>
+            <span className="text-slate-400 dark:text-slate-500 text-[10px] font-extrabold uppercase tracking-[0.25em] block mb-4">
+              🔑 TELEGRAM LOGIN ID
+            </span>
+            <div className="flex flex-col justify-between h-[64px]">
+              <div>
+                <p className="text-xs text-slate-500 dark:text-slate-400 font-bold">Connected Login Accounts</p>
+                <div className="flex items-baseline gap-1.5 mt-1">
+                  <span className="text-2xl font-black text-emerald-500 dark:text-emerald-400">{sessionCount}</span>
+                  <span className="text-[10px] text-slate-400 uppercase font-bold tracking-tight">Active sessions</span>
                 </div>
               </div>
-            );
-          })()}
+              {sessionCount > 0 && (
+                <div className="flex flex-wrap gap-1 mt-2 max-h-[24px] overflow-y-auto pr-1">
+                  {telegramSessions.map((id, index) => (
+                    <span key={`sess-${id}-${index}`} className="text-[9px] font-mono font-bold bg-emerald-500/10 text-emerald-500 dark:text-emerald-400 border border-emerald-500/20 px-1.5 py-0.5 rounded">
+                      ID: {id}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Card 3: Download Progress Bar (3D Style) */}
+          <div className="col-span-1 md:col-span-2 bg-white dark:bg-[#0f172a] border-2 border-slate-200 dark:border-[#1e293b] p-6 rounded-2xl relative overflow-hidden group shadow-[6px_6px_0px_0px_rgba(99,102,241,0.3)] dark:shadow-[6px_6px_0px_0px_rgba(99,102,241,0.35)] transition-all hover:-translate-x-1 hover:-translate-y-1 hover:shadow-[10px_10px_0px_0px_rgba(99,102,241,0.4)] dark:hover:shadow-[10px_10px_0px_0px_rgba(99,102,241,0.45)] duration-200">
+            <span className="text-slate-400 dark:text-slate-500 text-[10px] font-extrabold uppercase tracking-[0.25em] block mb-3">
+              ⏳ CURRENT DOWNLOAD PROGRESS BAR
+            </span>
+            {activeJob ? (
+              <div className="space-y-3">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1.5 border-b border-slate-100 dark:border-slate-800/80 pb-2">
+                  <div className="min-w-0 flex-1">
+                    <span className="text-[11px] font-bold text-slate-900 dark:text-white font-mono break-all">{activeJob.link}</span>
+                  </div>
+                  <span className="text-[8px] px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 font-bold uppercase self-start sm:self-center">
+                    {activeJob.phase}
+                  </span>
+                </div>
+                <div className="space-y-2">
+                  <div className="flex justify-between items-center text-xs font-bold">
+                    <span className="text-emerald-500">Speed: <span className="font-mono">{activeSpeed}</span></span>
+                    <span className="text-indigo-400 font-mono">ETA: {activeEta}</span>
+                  </div>
+                  <div className="h-3.5 bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden border border-slate-200 dark:border-slate-700/80 p-0.5 shadow-inner">
+                    <motion.div animate={{ width: `${progressPercent}%` }} className="h-full bg-gradient-to-r from-sky-500 to-emerald-500 rounded-full" />
+                  </div>
+                  <div className="flex justify-between items-center text-[9px] font-bold text-slate-400 uppercase tracking-wider">
+                    <span>{Math.round(progressPercent)}% COMPLETED</span>
+                    <span>{(activeCurrent / 1024 / 1024).toFixed(1)}MB / {(activeTotal / 1024 / 1024).toFixed(1)}MB</span>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="flex flex-col items-center justify-center py-5 text-slate-400 dark:text-slate-500 space-y-1">
+                <div className="w-8 h-8 rounded-full bg-slate-100 dark:bg-slate-800/60 flex items-center justify-center animate-pulse">
+                  <Activity size={14} className="text-indigo-500/60" />
+                </div>
+                <p className="text-[10px] font-extrabold uppercase tracking-wider">No active downloads running</p>
+                <p className="text-[9px] text-slate-500">The bot is waiting for link tasks to mirror.</p>
+              </div>
+            )}
+          </div>
+
+          {/* Card 4: Total Remaining (3D Style) */}
+          <div className="col-span-1 md:col-span-2 bg-white dark:bg-[#0f172a] border-2 border-slate-200 dark:border-[#1e293b] p-6 rounded-2xl relative overflow-hidden group shadow-[6px_6px_0px_0px_rgba(245,158,11,0.3)] dark:shadow-[6px_6px_0px_0px_rgba(245,158,11,0.35)] transition-all hover:-translate-x-1 hover:-translate-y-1 hover:shadow-[10px_10px_0px_0px_rgba(245,158,11,0.4)] dark:hover:shadow-[10px_10px_0px_0px_rgba(245,158,11,0.45)] duration-200">
+            <div className="absolute top-0 right-0 p-4 opacity-5 group-hover:opacity-10 transition-opacity">
+              <Clock size={100} className="text-amber-500" />
+            </div>
+            <span className="text-slate-400 dark:text-slate-500 text-[10px] font-extrabold uppercase tracking-[0.25em] block mb-3">
+              📊 TOTAL KITNA BAKI HAI (REMAINING QUEUE)
+            </span>
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+              <div>
+                <p className="text-xs text-slate-500 dark:text-slate-400 font-bold mb-1">Queue Pipeline Size</p>
+                <div className="flex items-baseline gap-2">
+                  <span className="text-3xl font-black text-amber-500 dark:text-amber-400">{totalRemaining}</span>
+                  <span className="text-xs text-slate-400 uppercase font-black tracking-wider">Tasks Left</span>
+                </div>
+              </div>
+              <div className="bg-slate-50 dark:bg-slate-800/30 p-3 rounded-xl border border-slate-200/60 dark:border-[#1e293b] flex-1 w-full max-w-sm">
+                <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest block mb-1">Pipeline Engine</span>
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-slate-700 dark:text-slate-300">Automation Mode</span>
+                  {data?.isQueuePaused ? (
+                    <span className="text-[8px] font-extrabold text-amber-400 bg-amber-500/10 border border-amber-500/20 px-2 py-0.5 rounded-full uppercase tracking-wider">PAUSED</span>
+                  ) : (
+                    <span className="text-[8px] font-extrabold text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded-full uppercase tracking-wider">RUNNING</span>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+
         </div>
       </div>
+    );
+  };
 
-      {/* Primary Queue Telemetry Controls (Sare function ko app se bi operate karein) */}
-      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 sm:p-8 rounded-3xl shadow-lg">
-        <h2 className="text-slate-500 text-[10px] font-bold uppercase tracking-[0.2em] mb-4 flex items-center gap-2">
+  const renderControl = () => (
+    <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+      {/* Play/Pause/Wipe queue controls */}
+      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 sm:p-5 rounded-2xl shadow-md">
+        <h2 className="text-slate-500 text-[9px] font-bold uppercase tracking-[0.2em] mb-2 flex items-center gap-2">
           <span>⚙️ OPERATIONAL INTERFACES & AUTOMATIC CONTROLS</span>
         </h2>
-        <p className="text-slate-500 text-xs mb-6 leading-relaxed">
+        <p className="text-slate-500 text-[11px] mb-4 leading-relaxed">
           Start/Stop tasks, clear pending download queues, and manage synchronization pipelines directly from this application console.
         </p>
 
-        <div className="flex flex-wrap items-center gap-3 pb-6 border-b border-slate-100 dark:border-slate-800">
+        <div className="flex flex-wrap items-center gap-2 pb-4 border-b border-slate-100 dark:border-slate-800">
           <button 
             disabled={queueActionLoading}
+            type="button"
             onClick={() => handleQueueAction(data?.isQueuePaused ? 'resume' : 'pause')}
-            className={`flex items-center gap-2 px-4 py-3 rounded-xl border text-xs font-bold uppercase tracking-wider transition-all disabled:opacity-50 shadow-md ${
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-[11px] font-bold uppercase tracking-wider transition-all disabled:opacity-50 shadow-sm ${
               data?.isQueuePaused 
                 ? 'bg-emerald-500 hover:bg-emerald-600 text-white border-emerald-600' 
                 : 'bg-amber-500 hover:bg-amber-600 text-white border-amber-600'
             }`}
           >
-            {data?.isQueuePaused ? <Play size={14} /> : <Pause size={14} />}
+            {data?.isQueuePaused ? <Play size={12} /> : <Pause size={12} />}
             {data?.isQueuePaused ? 'Play Queue (Resume)' : 'Pause Queue'}
           </button>
           
           <button 
             disabled={queueActionLoading}
+            type="button"
             onClick={() => {
               if (confirm('Verify: Do you want to purge all scheduled download tasks inside the bot queue?')) {
                 handleQueueAction('clear');
               }
             }}
-            className="flex items-center gap-2 px-4 py-3 bg-rose-500 hover:bg-rose-600 text-white border border-rose-600 rounded-xl text-xs font-bold uppercase tracking-wider transition-all disabled:opacity-50 shadow-md"
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-rose-500 hover:bg-rose-600 text-white border border-rose-600 rounded-lg text-[11px] font-bold uppercase tracking-wider transition-all disabled:opacity-50 shadow-sm"
           >
-            <Trash size={14} />
+            <Trash size={12} />
             Wipe Cache Queue ({data?.queueSize || 0})
           </button>
         </div>
 
         {/* Dual Mode: Queue Single Link or Start Range Batch */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-6">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-4">
           {/* Form 1: Add Single Task */}
-          <form onSubmit={handleAddSingleTask} className="space-y-4">
-            <h3 className="text-slate-900 dark:text-slate-200 text-xs font-bold uppercase tracking-wider flex items-center gap-1.5 text-sky-500 dark:text-sky-400">
-              <Link2 size={14} /> Queue Single Message Link
+          <form onSubmit={handleAddSingleTask} className="space-y-3">
+            <h3 className="text-slate-900 dark:text-slate-200 text-[11px] font-bold uppercase tracking-wider flex items-center gap-1.5 text-sky-500 dark:text-sky-400">
+              <Link2 size={12} /> Queue Single Message Link
             </h3>
             <div>
-              <p className="text-[11px] text-slate-500 mb-2">
+              <p className="text-[10px] text-slate-500 mb-1.5">
                 Paste any specific public or private Telegram message link to mirror or mirror-download instantly.
               </p>
               <input 
@@ -531,23 +592,23 @@ export default function App() {
                 placeholder="e.g. https://t.me/c/123456789/402"
                 value={singleTaskLink}
                 onChange={(e) => setSingleTaskLink(e.target.value)}
-                className="w-full max-w-sm bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-800 rounded-full px-3.5 py-1.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-sky-500/50 transition-all font-mono"
+                className="w-full max-w-sm bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-800 rounded-lg px-2.5 py-1 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-sky-500/50 transition-all font-mono"
               />
             </div>
-            <div className="flex items-center justify-between gap-3">
-              <label className="flex items-center gap-2 cursor-pointer text-[10px] uppercase font-bold text-slate-400 select-none">
+            <div className="flex items-center justify-between gap-2">
+              <label className="flex items-center gap-1.5 cursor-pointer text-[9px] uppercase font-bold text-slate-400 select-none">
                 <input 
                   type="checkbox"
                   checked={singleIsMirror}
                   onChange={(e) => setSingleIsMirror(e.target.checked)}
-                  className="rounded border-slate-300 dark:border-slate-700 text-sky-600 focus:ring-sky-500"
+                  className="rounded border-slate-300 dark:border-slate-700 text-sky-600 focus:ring-sky-500 w-3 h-3"
                 />
                 Act as Structured Mirror
               </label>
               <button 
                 type="submit"
                 disabled={submittingSingleTask || !singleTaskLink}
-                className="px-6 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs uppercase tracking-wider rounded-full transition-all disabled:opacity-50 shadow-md"
+                className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[11px] uppercase tracking-wider rounded-lg transition-all disabled:opacity-50 shadow-sm"
               >
                 {submittingSingleTask ? 'Processing...' : 'Queue Link'}
               </button>
@@ -555,83 +616,81 @@ export default function App() {
           </form>
 
           {/* Form 2: Batch Range Process */}
-          <form onSubmit={handleAddBatchTask} className="space-y-4 border-t md:border-t-0 md:border-l border-slate-100 dark:border-slate-800/80 pt-6 md:pt-0 md:pl-6">
-            <h3 className="text-slate-900 dark:text-slate-200 text-xs font-bold uppercase tracking-wider flex items-center gap-1.5 text-indigo-500 dark:text-indigo-400">
-              <Server size={14} /> Trigger Range Batch Sync
+          <form onSubmit={handleAddBatchTask} className="space-y-3 border-t md:border-t-0 md:border-l border-slate-100 dark:border-slate-800/80 pt-4 md:pt-0 md:pl-4">
+            <h3 className="text-slate-900 dark:text-slate-200 text-[11px] font-bold uppercase tracking-wider flex items-center gap-1.5 text-indigo-500 dark:text-indigo-400">
+              <Server size={12} /> Trigger Range Batch Sync
             </h3>
-            <p className="text-[11px] text-slate-500">
+            <p className="text-[10px] text-slate-500">
               Enter a message scope range to perform batch synchronization. Highly scalable (Max 200 links).
             </p>
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-2 gap-2">
               <div>
-                <label className="block text-[8px] font-black uppercase text-slate-400 tracking-wider mb-1">Start Link</label>
+                <label className="block text-[8px] font-black uppercase text-slate-400 tracking-wider mb-0.5">Start Link</label>
                 <input 
                   type="text"
                   placeholder="https://t.me/c/.../1"
                   value={batchStartLink}
                   onChange={(e) => setBatchStartLink(e.target.value)}
-                  className="w-full max-w-sm bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-800 rounded-full px-3 py-1.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500/50 transition-all font-mono"
+                  className="w-full max-w-sm bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-800 rounded-lg px-2 py-1 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500/50 transition-all font-mono"
                 />
               </div>
               <div>
-                <label className="block text-[8px] font-black uppercase text-slate-400 tracking-wider mb-1">End Link</label>
+                <label className="block text-[8px] font-black uppercase text-slate-400 tracking-wider mb-0.5">End Link</label>
                 <input 
                   type="text"
                   placeholder="https://t.me/c/.../50"
                   value={batchEndLink}
                   onChange={(e) => setBatchEndLink(e.target.value)}
-                  className="w-full max-w-sm bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-800 rounded-full px-3 py-1.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500/50 transition-all font-mono"
+                  className="w-full max-w-sm bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-800 rounded-lg px-2 py-1 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500/50 transition-all font-mono"
                 />
               </div>
             </div>
-            <div className="flex items-center justify-between gap-3">
-              <label className="flex items-center gap-2 cursor-pointer text-[10px] uppercase font-bold text-slate-400 select-none">
+            <div className="flex items-center justify-between gap-2">
+              <label className="flex items-center gap-1.5 cursor-pointer text-[9px] uppercase font-bold text-slate-400 select-none">
                 <input 
                   type="checkbox"
                   checked={batchIsMirror}
                   onChange={(e) => setBatchIsMirror(e.target.checked)}
-                  className="rounded border-slate-300 dark:border-slate-700 text-indigo-600 focus:ring-indigo-500"
+                  className="rounded border-slate-300 dark:border-slate-700 text-indigo-600 focus:ring-indigo-500 w-3 h-3"
                 />
                 Act as Structured Mirror
               </label>
               <button 
                 type="submit"
                 disabled={submittingBatchTask || !batchStartLink || !batchEndLink}
-                className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs uppercase tracking-wider rounded-full transition-all disabled:opacity-50 shadow-md"
+                className="px-3.5 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-bold text-[11px] uppercase tracking-wider rounded-lg transition-all disabled:opacity-50 shadow-sm"
               >
                 {submittingBatchTask ? 'Processing...' : 'Start Web Batch'}
               </button>
             </div>
           </form>
         </div>
-      </div>
-
-      {/* SETUP CHECKER */}
+            {/* SETUP CHECKER */}
       <AnimatePresence>
         {!data?.config.hasToken || !data?.config.hasMongo || !data?.adminConfigured ? (
           <motion.div
             initial={{ opacity: 0, scale: 0.95 }}
             animate={{ opacity: 1, scale: 1 }}
-            className="bg-rose-500/5 border border-rose-500/20 p-6 rounded-3xl"
+            className="bg-rose-500/5 border border-rose-500/20 p-4 rounded-2xl"
           >
-            <div className="flex items-center gap-3 mb-6">
-              <AlertCircle size={18} className="text-rose-500" />
-              <h3 className="text-slate-800 dark:text-white font-semibold text-sm">Critical Credentials Setup</h3>
+            <div className="flex items-center gap-2 mb-4">
+              <AlertCircle size={16} className="text-rose-500" />
+              <h3 className="text-slate-800 dark:text-white font-semibold text-xs">Critical Credentials Setup</h3>
             </div>
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
               {[
                 { active: data?.config.hasToken, label: 'Bot Token' },
                 { active: data?.config.hasMongo, label: 'Database' },
                 { active: data?.adminConfigured, label: 'Admin ID Set' },
                 { active: data?.config.hasTarget, label: 'Target ID Set' }
               ].map((conf, i) => (
-                <div key={i} className={`p-4 rounded-xl border flex flex-col items-center gap-2 text-center transition-colors ${
+                <div key={i} className={`p-2.5 rounded-lg border flex flex-col items-center gap-1 text-center transition-colors ${
                   conf.active 
                     ? 'bg-emerald-500/5 dark:bg-emerald-500/10 border-emerald-500/20' 
                     : 'bg-rose-500/5 dark:bg-rose-500/10 border-rose-500/20'
                 }`}>
-                  {conf.active ? <CheckCircle2 size={16} className="text-emerald-500" /> : <XCircle size={16} className="text-rose-500" />}
-                  <span className={`text-[10px] font-bold uppercase tracking-widest ${conf.active ? 'text-emerald-500' : 'text-rose-500'}`}>
+                  {conf.active ? <CheckCircle2 size={14} className="text-emerald-500" /> : <XCircle size={14} className="text-rose-500" />}
+                  <span className={`text-[9px] font-bold uppercase tracking-widest ${conf.active ? 'text-emerald-500' : 'text-rose-500'}`}>
                     {conf.label}
                   </span>
                 </div>
@@ -639,7 +698,7 @@ export default function App() {
             </div>
             <button 
               onClick={() => setActiveTab('config')}
-              className="mt-6 w-full py-3 bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 text-xs font-bold uppercase tracking-widest rounded-xl hover:opacity-90 transition-opacity"
+              className="mt-4 w-full py-2 bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 text-[11px] font-bold uppercase tracking-widest rounded-lg hover:opacity-90 transition-opacity"
             >
               Configure Credentials
             </button>
@@ -649,28 +708,28 @@ export default function App() {
 
       {/* Real-time Task Live Feedback Streams */}
       {(data?.activeJobs && data?.activeJobs.length > 0) || (data?.batches && data?.batches.length > 0) ? (
-        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 sm:p-8 rounded-3xl space-y-6 shadow-lg">
+        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 sm:p-5 rounded-2xl space-y-4 shadow-md">
           
           {/* Active Workload Jobs */}
           {data?.activeJobs && data?.activeJobs.length > 0 && (
-            <div className="space-y-3">
-              <h3 className="text-slate-400 text-[10px] font-bold uppercase tracking-[0.2em]">Active Sync Transfers</h3>
+            <div className="space-y-2.5">
+              <h3 className="text-slate-400 text-[9px] font-bold uppercase tracking-[0.2em]">Active Sync Transfers</h3>
               {data.activeJobs.map((job, idx) => (
-                <div key={`job-${job.progress?.eta || idx}-${idx}`} className="p-4 bg-slate-50 dark:bg-slate-800 border border-slate-200/50 dark:border-slate-700/50 rounded-2xl flex flex-col gap-2">
-                  <div className="flex flex-wrap justify-between items-center gap-2 text-xs">
-                    <span className="text-sky-500 font-mono font-bold truncate max-w-[280px] sm:max-w-md">{job.link}</span>
-                    <span className="text-xs bg-sky-500/10 text-sky-400 px-2 py-0.5 rounded font-bold uppercase tracking-wider">{job.phase}</span>
+                <div key={`job-${job.progress?.eta || idx}-${idx}`} className="p-3 bg-slate-50 dark:bg-slate-800 border border-slate-200/50 dark:border-slate-700/50 rounded-xl flex flex-col gap-1.5">
+                  <div className="flex flex-wrap justify-between items-center gap-1.5 text-xs">
+                    <span className="text-sky-500 font-mono text-[11px] font-bold truncate max-w-[240px] sm:max-w-md">{job.link}</span>
+                    <span className="text-[10px] bg-sky-500/10 text-sky-400 px-1.5 py-0.5 rounded font-bold uppercase tracking-wider">{job.phase}</span>
                   </div>
                   {job.progress && (
                     <div className="space-y-1">
-                      <div className="flex justify-between items-center text-[10px] font-bold">
+                      <div className="flex justify-between items-center text-[9px] font-bold">
                         <span className="text-emerald-400">{job.progress.speed || '0 KB/s'}</span>
-                        <span className="text-slate-400">ETA: {job.progress.eta || 'N/A'}</span>
+                        <span className="text-slate-400 font-mono">ETA: {job.progress.eta || 'N/A'}</span>
                       </div>
-                      <div className="h-2.5 bg-slate-200 dark:bg-slate-800 rounded-full overflow-hidden shadow-inner">
+                      <div className="h-2 bg-slate-200 dark:bg-slate-800 rounded-full overflow-hidden shadow-inner">
                         <motion.div initial={{ width: 0 }} animate={{ width: `${job.progress.percent || 0}%` }} className="h-full bg-emerald-500 rounded-full" />
                       </div>
-                      <div className="flex justify-between items-center text-[9px] text-slate-400 font-bold">
+                      <div className="flex justify-between items-center text-[8px] text-slate-400 font-bold">
                         <span>{Math.round(job.progress.percent || 0)}% Completed</span>
                         <span>{(job.progress.current / 1024 / 1024).toFixed(1)}MB / {(job.progress.total / 1024 / 1024).toFixed(1)}MB</span>
                       </div>
@@ -683,26 +742,26 @@ export default function App() {
 
           {/* Batches running monitor */}
           {data?.batches && data?.batches.length > 0 && (
-            <div className="space-y-3 pt-4 border-t border-slate-100 dark:border-slate-800">
-              <h3 className="text-slate-400 text-[10px] font-bold uppercase tracking-[0.2em]">Running Batches</h3>
+            <div className="space-y-2.5 pt-3 border-t border-slate-100 dark:border-slate-800">
+              <h3 className="text-slate-400 text-[9px] font-bold uppercase tracking-[0.2em]">Running Batches</h3>
               {data.batches.map((b, idx) => (
-                <div key={`batch-${b.batchId || idx}-${idx}`} className="p-4 bg-slate-50 dark:bg-slate-800 border border-slate-200/50 dark:border-slate-700/50 rounded-2xl space-y-2">
+                <div key={`batch-${b.batchId || idx}-${idx}`} className="p-3 bg-slate-50 dark:bg-slate-800 border border-slate-200/50 dark:border-slate-700/50 rounded-xl space-y-1.5">
                   <div className="flex justify-between items-center">
-                    <span className="text-xs font-mono font-bold text-indigo-400 truncate max-w-[200px]">{b.batchId}</span>
-                    <span className={`text-[10px] uppercase font-bold px-2 py-0.5 rounded ${b.isActive ? 'bg-orange-500/10 text-orange-400' : 'bg-emerald-500/10 text-emerald-400'}`}>
+                    <span className="text-[11px] font-mono font-bold text-indigo-400 truncate max-w-[200px]">{b.batchId}</span>
+                    <span className={`text-[8px] uppercase font-bold px-1.5 py-0.5 rounded ${b.isActive ? 'bg-orange-500/10 text-orange-400' : 'bg-emerald-500/10 text-emerald-400'}`}>
                       {b.isActive ? 'ACTIVE' : 'FINISHED'}
                     </span>
                   </div>
                   {b.currentLink && (
-                    <div className="text-[10px] text-slate-500 truncate font-mono">
-                      Current Link: <span className="text-sky-400">{b.currentLink}</span>
+                    <div className="text-[9px] text-slate-500 truncate font-mono">
+                      Current: <span className="text-sky-400">{b.currentLink}</span>
                     </div>
                   )}
                   <div className="space-y-1">
-                    <div className="h-1.5 bg-slate-200 dark:bg-slate-700 rounded-full overflow-hidden">
+                    <div className="h-1 bg-slate-200 dark:bg-slate-700 rounded-full overflow-hidden">
                       <div className="h-full bg-indigo-500" style={{ width: `${b.progress || 0}%` }}></div>
                     </div>
-                    <div className="flex justify-between text-[9px] font-bold text-slate-400">
+                    <div className="flex justify-between text-[8px] font-bold text-slate-400">
                       <span>{b.progress}% ({b.processed}/{b.total} messages processed)</span>
                       <span className="text-emerald-400">{b.success} Success | {b.failed} Failed</span>
                     </div>
@@ -716,22 +775,22 @@ export default function App() {
 
       {/* Queued tasks list status */}
       {data?.taskQueue && data?.taskQueue.length > 0 && (
-        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 sm:p-8 rounded-3xl shadow-lg space-y-3">
-          <div className="flex justify-between items-center mb-2">
-            <h3 className="text-slate-500 dark:text-slate-400 text-[10px] font-bold uppercase tracking-[0.2em]">Upcoming Queue Feed ({data.taskQueue.length})</h3>
-            <span className="text-[10px] text-slate-400 italic">Operate items directly below</span>
+        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 sm:p-5 rounded-2xl shadow-md space-y-2.5">
+          <div className="flex justify-between items-center mb-1">
+            <h3 className="text-slate-500 dark:text-slate-400 text-[9px] font-bold uppercase tracking-[0.2em]">Upcoming Queue Feed ({data.taskQueue.length})</h3>
+            <span className="text-[9px] text-slate-400 italic">Operate items directly below</span>
           </div>
-          <div className="max-h-[350px] overflow-y-auto space-y-2 pr-1 custom-scrollbar">
+          <div className="max-h-[300px] overflow-y-auto space-y-2 pr-1 custom-scrollbar">
             {data.taskQueue.map((t, idx) => (
-              <div key={`queue-${t.link || idx}-${idx}`} className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-4 bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 rounded-2xl text-xs hover:border-slate-300 dark:hover:border-slate-700 transition-all">
-                <div className="flex items-center gap-2.5 min-w-0 flex-1">
-                  <span className="text-[10px] font-black text-slate-400 font-mono">#{idx + 1}</span>
+              <div key={`queue-${t.link || idx}-${idx}`} className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 p-3 bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 rounded-xl text-xs hover:border-slate-300 dark:hover:border-slate-700 transition-all">
+                <div className="flex items-center gap-2 min-w-0 flex-1">
+                  <span className="text-[9px] font-black text-slate-400 font-mono">#{idx + 1}</span>
                   <div className="min-w-0 flex-1">
-                    <span className="font-mono text-slate-600 dark:text-slate-300 break-all block">{t.link}</span>
+                    <span className="font-mono text-[11px] text-slate-600 dark:text-slate-300 break-all block">{t.link}</span>
                   </div>
                 </div>
-                <div className="flex items-center gap-2 shrink-0 self-end sm:self-auto">
-                  <span className={`text-[9px] uppercase font-mono font-bold px-2.5 py-1 rounded-lg border ${t.isMirror ? 'bg-indigo-500/10 text-indigo-500 border-indigo-500/25' : 'bg-sky-500/10 text-sky-500 border-sky-500/25'}`}>
+                <div className="flex items-center gap-1.5 shrink-0 self-end sm:self-auto">
+                  <span className={`text-[8px] uppercase font-mono font-bold px-1.5 py-0.5 rounded border ${t.isMirror ? 'bg-indigo-500/10 text-indigo-500 border-indigo-500/25' : 'bg-sky-500/10 text-sky-500 border-sky-500/25'}`}>
                     {t.isMirror ? 'Mirror' : 'Direct'}
                   </span>
                   {idx > 0 && (
@@ -739,22 +798,22 @@ export default function App() {
                       type="button"
                       onClick={() => handlePrioritizeTaskItem(idx)}
                       title="Bring to absolute top of queue"
-                      className="p-1.5 bg-sky-50 dark:bg-sky-950/40 border border-sky-100 dark:border-sky-900/50 text-sky-600 dark:text-sky-400 rounded-lg hover:bg-sky-100 dark:hover:bg-sky-900/60 transition-colors"
+                      className="p-1 bg-sky-5 dark:bg-sky-955/40 border border-sky-100 dark:border-sky-900/50 text-sky-600 dark:text-sky-400 rounded-md hover:bg-sky-100 dark:hover:bg-sky-900/60 transition-colors"
                     >
-                      <ArrowUp size={14} />
+                      <ArrowUp size={12} />
                     </button>
                   )}
                   <button 
-                    type="button"
-                    onClick={() => {
-                      if (confirm(`Cancel task #${idx + 1}: ${t.link}?`)) {
-                        handleCancelTaskItem(idx);
-                      }
-                    }}
-                    title="Cancel scheduling context"
-                    className="p-1.5 bg-rose-50 dark:bg-rose-950/40 border border-rose-100 dark:border-rose-900/50 text-rose-600 dark:text-rose-450 rounded-lg hover:bg-rose-100 dark:hover:bg-rose-900/60 transition-colors"
+                     type="button"
+                     onClick={() => {
+                       if (confirm(`Cancel task #${idx + 1}: ${t.link}?`)) {
+                         handleCancelTaskItem(idx);
+                       }
+                     }}
+                     title="Cancel scheduling context"
+                     className="p-1 bg-rose-50 dark:bg-rose-955/40 border border-rose-100 dark:border-rose-900/50 text-rose-600 dark:text-rose-450 rounded-md hover:bg-rose-100 dark:hover:bg-rose-900/60 transition-colors"
                   >
-                    <Trash2 size={14} />
+                    <Trash2 size={12} />
                   </button>
                 </div>
               </div>
@@ -764,83 +823,83 @@ export default function App() {
       )}
 
       {/* Failed Tasks & Sync Recovery Panel */}
-      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 sm:p-8 rounded-3xl shadow-lg space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 sm:p-5 rounded-2xl shadow-md space-y-3">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
-            <h2 className="text-slate-900 dark:text-white text-md font-extrabold tracking-tight flex items-center gap-2">
-              <AlertCircle className="text-rose-500 animate-pulse" size={18} />
+            <h2 className="text-slate-900 dark:text-white text-xs font-extrabold tracking-tight flex items-center gap-1.5">
+              <AlertCircle className="text-rose-500 animate-pulse" size={14} />
               FAILED MIRRORS & RECOOLDOWN RECOVERIES ({failedTasks.length})
             </h2>
-            <p className="text-[11px] text-slate-500 mt-1">
-              Analyze copy/mirror operations that failed due to structural issues, chat limits, or timeouts. You can safely inspect error logs and restart or run them again.
+            <p className="text-[10px] text-slate-500 mt-0.5">
+              Analyze copy/mirror operations that failed. Inspect error logs and retry or delete.
             </p>
           </div>
           {failedTasks.length > 0 && (
-            <div className="flex flex-wrap gap-2">
+            <div className="flex flex-wrap gap-1.5">
               <button
                  type="button"
                  disabled={failedTasksLoading}
                  onClick={handleRetryAllFailed}
-                 className="px-3.5 py-1.5 bg-sky-500 hover:bg-sky-600 text-white border border-sky-600 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-colors disabled:opacity-50 flex items-center gap-1.5"
+                 className="px-2.5 py-1 bg-sky-500 hover:bg-sky-600 text-white border border-sky-600 rounded-lg text-[9px] font-bold uppercase tracking-wider transition-colors disabled:opacity-50 flex items-center gap-1"
               >
-                <RefreshCw size={12} className={failedTasksLoading ? "animate-spin" : ""} />
+                <RefreshCw size={10} className={failedTasksLoading ? "animate-spin" : ""} />
                 Retry All Failed
               </button>
               <button
                  type="button"
                  disabled={failedTasksLoading}
                  onClick={handleClearFailedLogs}
-                 className="px-3.5 py-1.5 bg-rose-50 hover:bg-rose-100 border border-rose-200 text-rose-600 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-colors disabled:opacity-50"
+                 className="px-2.5 py-1 bg-rose-50 hover:bg-rose-100 border border-rose-200 text-rose-600 rounded-lg text-[9px] font-bold uppercase tracking-wider transition-colors disabled:opacity-50"
               >
-                Clear Error Logs
+                Clear Logs
               </button>
             </div>
           )}
         </div>
 
         {failedTasks.length === 0 ? (
-          <div className="flex flex-col items-center justify-center p-8 bg-slate-50/50 dark:bg-slate-800/20 border border-dashed border-slate-200 dark:border-slate-800 rounded-2xl text-center">
-            <CheckCircle2 className="text-emerald-500 mb-2" size={24} />
-            <p className="text-xs text-slate-500 font-bold uppercase tracking-wider">No Failed Mirror Operations!</p>
-            <p className="text-[10px] text-slate-400 mt-1">All copies are successfully dispatched without errors.</p>
+          <div className="flex flex-col items-center justify-center p-6 bg-slate-50/50 dark:bg-slate-800/20 border border-dashed border-slate-200 dark:border-slate-800 rounded-xl text-center">
+            <CheckCircle2 className="text-emerald-500 mb-1.5" size={20} />
+            <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">No Failed Mirror Operations!</p>
+            <p className="text-[9px] text-slate-400 mt-0.5">All copies are successfully dispatched without errors.</p>
           </div>
         ) : (
-          <div className="max-h-[350px] overflow-y-auto space-y-2.5 pr-1 custom-scrollbar">
+          <div className="max-h-[300px] overflow-y-auto space-y-2 pr-1 custom-scrollbar">
             {failedTasks.map((t: any, idx: number) => {
               const parts = t.link.split('/');
               const msgId = parts[parts.length - 1] || 'Media';
               return (
-                <div key={t._id || t.id + '-' + idx || idx} className="p-4 bg-rose-500/5 dark:bg-rose-955/10 border border-rose-500/20 dark:border-rose-900/30 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-4 hover:border-rose-500/40 transition-all">
+                <div key={t._id || t.id + '-' + idx || idx} className="p-3 bg-rose-500/5 dark:bg-rose-955/10 border border-rose-500/20 dark:border-rose-900/30 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 hover:border-rose-500/40 transition-all">
                   <div className="min-w-0 flex-1 space-y-1">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className="font-mono text-xs font-bold text-slate-700 dark:text-slate-300 break-all block">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span className="font-mono text-[11px] font-bold text-slate-700 dark:text-slate-300 break-all block">
                         [Msg: {msgId}] {t.link}
                       </span>
                       {t.isMirror && (
-                        <span className="text-[8px] font-extrabold uppercase bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 px-1.5 py-0.5 rounded">
+                        <span className="text-[7px] font-extrabold uppercase bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 px-1 py-0.2 rounded">
                           Mirror Layout
                         </span>
                       )}
                     </div>
-                    <p className="text-xs text-rose-600 dark:text-rose-400 bg-rose-500/10 dark:bg-rose-950/25 px-2.5 py-1.5 rounded-lg font-mono break-words leading-relaxed border border-rose-500/10">
-                      <strong>Reason:</strong> {t.error || 'Unknown network error / maximum retries limit hit.'}
+                    <p className="text-[11px] text-rose-600 dark:text-rose-400 bg-rose-500/10 dark:bg-rose-950/25 px-2 py-1 rounded-md font-mono break-words leading-relaxed border border-rose-500/10">
+                      <strong>Reason:</strong> {t.error || 'Unknown network error.'}
                     </p>
                     {t.failedAt && (
-                      <p className="text-[9px] text-slate-400 font-medium">
-                        Failed At: {new Date(t.failedAt).toLocaleString()}
+                      <p className="text-[8px] text-slate-400 font-medium">
+                        {new Date(t.failedAt).toLocaleString()}
                       </p>
                     )}
                   </div>
-                  <div className="flex items-center gap-2 self-end sm:self-auto uppercase tracking-wider">
+                  <div className="flex items-center gap-1.5 self-end sm:self-auto uppercase tracking-wider">
                     <button
                       type="button"
                       disabled={failedTasksLoading}
                       onClick={() => handleRetryFailedItem(t.id)}
                       title="Retry copying this direct message link"
-                      className="px-3 py-1.5 bg-sky-50 dark:bg-sky-950/30 border border-sky-200 dark:border-sky-900/40 text-sky-600 dark:text-sky-450 rounded-lg hover:bg-sky-100 dark:hover:bg-sky-900/50 text-[10px] font-bold flex items-center gap-1 transition-colors disabled:opacity-50"
+                      className="px-2 py-1 bg-sky-50 dark:bg-sky-950/30 border border-sky-200 dark:border-sky-900/40 text-sky-600 dark:text-sky-450 rounded-md hover:bg-sky-100 dark:hover:bg-sky-900/50 text-[9px] font-bold flex items-center gap-1 transition-colors disabled:opacity-50"
                     >
-                      <RefreshCw size={12} />
-                      Retry Task
+                      <RefreshCw size={10} />
+                      Retry
                     </button>
                   </div>
                 </div>
@@ -848,17 +907,17 @@ export default function App() {
             })}
           </div>
         )}
-      </div>
+      </div>  </div>
 
       {/* Feature 3: Mirrored Logs & Destination History (Highlight Text Color, NO heavy blacks) */}
-      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 sm:p-8 rounded-3xl shadow-lg space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 sm:p-5 rounded-2xl shadow-md space-y-3">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
-            <h2 className="text-slate-900 dark:text-white text-md font-extrabold tracking-tight flex items-center gap-2">
-              <Sparkles className="text-amber-500 animate-pulse" size={18} />
+            <h2 className="text-slate-900 dark:text-white text-xs font-extrabold tracking-tight flex items-center gap-1.5">
+              <Sparkles className="text-amber-500 animate-pulse" size={14} />
               MIRRORED TRANSFER LOGS HISTORY
             </h2>
-            <p className="text-[11px] text-slate-500 mt-1">
+            <p className="text-[10px] text-slate-500 mt-0.5">
               Check all the successfully copied messages, skips, and failures in real-time.
             </p>
           </div>
@@ -866,7 +925,7 @@ export default function App() {
             <button
                type="button"
                onClick={handleClearMirrorHistory}
-               className="px-3.5 py-1.5 self-start sm:self-auto bg-rose-50 hover:bg-rose-100 border border-rose-200 hover:border-rose-400 text-rose-600 rounded-lg text-xs font-bold uppercase tracking-wider transition-colors"
+               className="px-2.5 py-1 self-start sm:self-auto bg-rose-50 hover:bg-rose-100 border border-rose-200 hover:border-rose-400 text-rose-600 rounded-lg text-[9px] font-bold uppercase tracking-wider transition-colors"
             >
               Clear Log History
             </button>
@@ -874,15 +933,15 @@ export default function App() {
         </div>
 
         {/* Searching & Quick Saturated Badges (High Contrast Text Highlighting) */}
-        <div className="flex flex-col md:flex-row md:items-center gap-3">
+        <div className="flex flex-col md:flex-row md:items-center gap-2">
           <input
             type="text"
-            placeholder="Search logs by keyword, channel link, destination ID..."
+            placeholder="Search logs by keyword..."
             value={logSearch}
             onChange={(e) => setLogSearch(e.target.value)}
-            className="flex-1 bg-slate-100 dark:bg-slate-850 border border-slate-200 dark:border-slate-800 rounded-xl px-4 py-2.5 text-xs text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none focus:border-indigo-500/50 transition-colors"
+            className="flex-1 bg-slate-100 dark:bg-slate-850 border border-slate-200 dark:border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none focus:border-indigo-500/50 transition-colors"
           />
-          <div className="flex flex-wrap gap-2.5">
+          <div className="flex flex-wrap gap-1.5">
             {[
               { id: 'all', label: '📸 All Logs', activeClass: 'bg-indigo-600 text-white border-indigo-750' },
               { id: 'success', label: '🟢 Success', activeClass: 'bg-emerald-600 text-white border-emerald-750' },
@@ -893,9 +952,9 @@ export default function App() {
                 key={btn.id}
                 type="button"
                 onClick={() => setLogFilter(btn.id as any)}
-                className={`px-3 py-1.5 text-xs font-bold rounded-lg border transition-all uppercase tracking-wider ${
+                className={`px-2 py-1 text-[10px] font-bold rounded-md border transition-all uppercase tracking-wider ${
                   logFilter === btn.id 
-                    ? `${btn.activeClass} font-extrabold shadow-md transform scale-[1.03]` 
+                    ? `${btn.activeClass} font-extrabold shadow-sm transform scale-[1.02]` 
                     : 'bg-slate-50 hover:bg-slate-100 dark:bg-slate-800/50 dark:hover:bg-slate-705 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-700'
                 }`}
               >
@@ -906,7 +965,7 @@ export default function App() {
         </div>
 
         {/* List of files */}
-        <div className="max-h-[350px] overflow-y-auto space-y-2 pr-1 custom-scrollbar">
+        <div className="max-h-[300px] overflow-y-auto space-y-2 pr-1 custom-scrollbar">
           {mirrorHistory.filter(log => {
             const matchesSearch = log.link?.toLowerCase().includes(logSearch.toLowerCase()) || 
                                   log.destId?.toLowerCase().includes(logSearch.toLowerCase()) ||
@@ -934,26 +993,26 @@ export default function App() {
               else if (isFailed) badgeClass = 'text-rose-700 bg-rose-55 dark:text-rose-450 dark:bg-rose-950/40 border border-rose-500/25';
 
               return (
-                <div key={index} className="p-4 bg-slate-50 dark:bg-slate-800/30 border border-slate-200 dark:border-slate-800 rounded-2xl flex flex-col md:flex-row justify-between md:items-center gap-3 hover:border-slate-300 dark:hover:border-slate-700 transition-all">
+                <div key={index} className="p-3 bg-slate-50 dark:bg-slate-800/30 border border-slate-200 dark:border-slate-800 rounded-xl flex flex-col md:flex-row justify-between md:items-center gap-2.5 hover:border-slate-300 dark:hover:border-slate-700 transition-all">
                   <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2 mb-1.5">
-                      <span className={`text-[10px] font-extrabold uppercase px-2.5 py-1 rounded-md tracking-wider ${badgeClass}`}>
+                    <div className="flex items-center gap-1.5 mb-1">
+                      <span className={`text-[8px] font-extrabold uppercase px-1.5 py-0.5 rounded tracking-wider ${badgeClass}`}>
                         {log.status}
                       </span>
-                      <span className="text-[10px] font-mono text-slate-400">{dateStr}</span>
+                      <span className="text-[9px] font-mono text-slate-400">{dateStr}</span>
                     </div>
-                    <span className="font-mono text-xs text-slate-750 dark:text-slate-300 break-all select-all block">
+                    <span className="font-mono text-[11px] text-slate-750 dark:text-slate-300 break-all select-all block">
                       {log.link}
                     </span>
                     {log.info && (
-                      <p className="text-[11px] text-slate-550 dark:text-slate-400 mt-2 font-medium bg-slate-100 dark:bg-slate-800/80 px-2.5 py-1 rounded-lg border border-slate-200/50 dark:border-slate-700/50 w-fit">
+                      <p className="text-[10px] text-slate-550 dark:text-slate-400 mt-1.5 font-medium bg-slate-100 dark:bg-slate-800/80 px-2 py-0.5 rounded border border-slate-200/50 dark:border-slate-700/50 w-fit">
                         ℹ️ {log.info}
                       </p>
                     )}
                   </div>
-                  <div className="text-right shrink-0">
-                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Destination target</p>
-                    <p className="text-xs font-mono text-indigo-500 dark:text-indigo-400 font-bold bg-indigo-50 dark:bg-indigo-950/30 px-2.5 py-1 rounded-lg border border-indigo-500/20 mt-1 max-w-[170px] truncate">
+                  <div className="text-left shrink-0">
+                    <p className="text-[8px] font-bold text-slate-400 uppercase tracking-widest">Destination target</p>
+                    <p className="text-[10px] font-mono text-indigo-500 dark:text-indigo-400 font-bold bg-indigo-50 dark:bg-indigo-950/30 px-2 py-0.5 rounded-md border border-indigo-500/20 mt-0.5 max-w-[170px] truncate">
                       {log.destId}
                     </p>
                   </div>
@@ -961,50 +1020,136 @@ export default function App() {
               );
             })
           ) : (
-            <div className="py-12 text-center bg-slate-50 dark:bg-slate-800/10 border border-dashed border-slate-200 dark:border-slate-800 rounded-2xl">
-              <Sparkles className="mx-auto text-slate-450 mb-2" size={24} />
-              <p className="text-xs font-bold text-slate-500 uppercase tracking-wider">No mirrored logs match search key</p>
-              <p className="text-[10px] text-slate-400 mt-1">Initialize mirror actions to populate history</p>
+            <div className="py-8 text-center bg-slate-50 dark:bg-slate-800/10 border border-dashed border-slate-200 dark:border-slate-800 rounded-xl">
+              <Sparkles className="mx-auto text-slate-450 mb-1.5 animate-pulse" size={18} />
+              <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">No mirrored logs match search key</p>
+              <p className="text-[9px] text-slate-400 mt-0.5">Initialize mirror actions to populate history</p>
             </div>
           )}
         </div>
       </div>
 
       {/* Systems Summary Information */}
-      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 sm:p-8 rounded-3xl shadow-lg">
-        <h2 className="text-slate-500 text-[10px] font-bold uppercase tracking-[0.2em] mb-6">Real-time Stream</h2>
-        <div className="space-y-4">
-          <div className="flex items-start gap-4 p-4 bg-slate-100 dark:bg-slate-800/40 rounded-2xl border border-slate-200/50 dark:border-slate-800">
-             <div className="w-10 h-10 rounded-xl bg-sky-500/10 flex items-center justify-center text-sky-500 shrink-0">
-                <Database size={20} />
-             </div>
-             <div className="flex-1 min-w-0">
-               <div className="flex justify-between items-center mb-1">
-                 <span className="text-xs font-bold text-slate-900 dark:text-white tracking-tight">Database Connectivity</span>
-                 <span className={`text-[9px] px-2 py-0.5 rounded-full font-bold uppercase ${data?.dbStatus === 'Connected' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'}`}>
-                   {data?.dbStatus || 'Searching...'}
-                 </span>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 sm:p-5 rounded-2xl shadow-md">
+          <h2 className="text-slate-500 text-[9px] font-bold uppercase tracking-[0.2em] mb-4">Real-time Stream</h2>
+          <div className="space-y-3">
+            <div className="flex items-start gap-3 p-3 bg-slate-100 dark:bg-slate-800/40 rounded-xl border border-slate-200/50 dark:border-slate-800">
+               <div className="w-8 h-8 rounded-lg bg-sky-500/10 flex items-center justify-center text-sky-500 shrink-0">
+                  <Database size={16} />
                </div>
-               <p className="text-[11px] text-slate-500 leading-relaxed">
-                 Using MongoDB Atlas for cluster persistence. Rename rules and configuration are synced instantly.
-               </p>
-             </div>
+               <div className="flex-1 min-w-0">
+                 <div className="flex justify-between items-center mb-1">
+                   <span className="text-[11px] font-bold text-slate-900 dark:text-white tracking-tight">Database Connectivity</span>
+                   <span className={`text-[8px] px-1.5 py-0.5 rounded-full font-bold uppercase ${data?.dbStatus === 'Connected' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-rose-500/10 text-rose-400 border border-rose-500/20'}`}>
+                     {data?.dbStatus || 'Searching...'}
+                   </span>
+                 </div>
+                 <p className="text-[11px] text-slate-500 leading-relaxed">
+                   Using MongoDB Atlas for cluster persistence. Rename rules and configuration are synced instantly.
+                 </p>
+               </div>
+            </div>
+            <div className="flex items-start gap-3 p-3 bg-slate-100 dark:bg-slate-800/40 rounded-xl border border-slate-200/50 dark:border-slate-800">
+               <div className="w-8 h-8 rounded-lg bg-purple-500/10 flex items-center justify-center text-purple-500 shrink-0">
+                  <Shield size={16} />
+               </div>
+               <div className="flex-1 min-w-0">
+                 <div className="flex justify-between items-center mb-1">
+                   <span className="text-[11px] font-bold text-slate-900 dark:text-white tracking-tight">Admin Firewall</span>
+                   <span className={`text-[8px] px-1.5 py-0.5 rounded-full font-bold uppercase ${data?.adminConfigured ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'}`}>
+                     {data?.adminConfigured ? 'Active' : 'Bypass'}
+                   </span>
+                 </div>
+                 <p className="text-[11px] text-slate-500 leading-relaxed">
+                   Command access is strictly verified against your authorized Admin ID to prevent unauthorized mirroring.
+                 </p>
+               </div>
+            </div>
           </div>
-          <div className="flex items-start gap-4 p-4 bg-slate-100 dark:bg-slate-800/40 rounded-2xl border border-slate-200/50 dark:border-slate-800">
-             <div className="w-10 h-10 rounded-xl bg-purple-500/10 flex items-center justify-center text-purple-500 shrink-0">
-                <Shield size={20} />
-             </div>
-             <div className="flex-1 min-w-0">
-               <div className="flex justify-between items-center mb-1">
-                 <span className="text-xs font-bold text-slate-900 dark:text-white tracking-tight">Admin Firewall</span>
-                 <span className={`text-[9px] px-2 py-0.5 rounded-full font-bold uppercase ${data?.adminConfigured ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'}`}>
-                   {data?.adminConfigured ? 'Active' : 'Bypass'}
-                 </span>
-               </div>
-               <p className="text-[11px] text-slate-500 leading-relaxed">
-                 Command access is strictly verified against your authorized Admin ID to prevent unauthorized mirroring.
-               </p>
-             </div>
+        </div>
+
+        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 sm:p-5 rounded-2xl shadow-md">
+          <h2 className="text-slate-500 text-[9px] font-bold uppercase tracking-[0.2em] mb-4">System Core Operations</h2>
+          <div className="grid grid-cols-2 gap-3">
+            <button 
+              type="button"
+              disabled={systemActionLoading}
+              onClick={() => handleSystemAction('ping')}
+              className="p-3 bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 rounded-xl hover:border-emerald-500/45 transition-colors text-left flex flex-col justify-between h-[84px]"
+            >
+              <div className="w-7 h-7 rounded-lg bg-emerald-500/10 flex items-center justify-center text-emerald-500">
+                <Activity size={14} />
+              </div>
+              <div>
+                <h4 className="text-slate-900 dark:text-white font-bold text-[10px] uppercase tracking-wider">Ping Instance</h4>
+                <p className="text-[9px] text-slate-500 mt-0.5">Test response lag.</p>
+              </div>
+            </button>
+
+            <button 
+              type="button"
+              disabled={systemActionLoading}
+              onClick={() => handleSystemAction('cleartopics')}
+              className="p-3 bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 rounded-xl hover:border-amber-500/45 transition-colors text-left flex flex-col justify-between h-[84px]"
+            >
+              <div className="w-7 h-7 rounded-lg bg-amber-500/10 flex items-center justify-center text-amber-500">
+                <Trash2 size={14} />
+              </div>
+              <div>
+                <h4 className="text-slate-900 dark:text-white font-bold text-[10px] uppercase tracking-wider">Wipe Cache</h4>
+                <p className="text-[9px] text-slate-500 mt-0.5">Clear topic registry.</p>
+              </div>
+            </button>
+
+            <button 
+              type="button"
+              disabled={systemActionLoading}
+              onClick={() => handleSystemAction('restart')}
+              className="p-3 bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 rounded-xl hover:border-sky-500/45 transition-colors text-left flex flex-col justify-between h-[84px]"
+            >
+              <div className="w-7 h-7 rounded-lg bg-sky-500/10 flex items-center justify-center text-sky-500">
+                <Power size={14} />
+              </div>
+              <div>
+                <h4 className="text-slate-900 dark:text-white font-bold text-[10px] uppercase tracking-wider">Soft Restart</h4>
+                <p className="text-[9px] text-slate-500 mt-0.5">Reboot background daemon.</p>
+              </div>
+            </button>
+
+            <button 
+              type="button"
+              disabled={systemActionLoading}
+              onClick={() => handleSystemAction('logout')}
+              className="p-3 bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 rounded-xl hover:border-rose-500/45 transition-colors text-left flex flex-col justify-between h-[84px]"
+            >
+              <div className="w-7 h-7 rounded-lg bg-rose-500/10 flex items-center justify-center text-rose-500">
+                <LogOut size={14} />
+              </div>
+              <div>
+                <h4 className="text-slate-900 dark:text-white font-bold text-[10px] uppercase tracking-wider">Kill Session</h4>
+                <p className="text-[9px] text-slate-500 mt-0.5">Revoke internal session.</p>
+              </div>
+            </button>
+
+            <button 
+              type="button"
+              disabled={systemActionLoading}
+              onClick={() => handleSystemAction('reset')}
+              className="col-span-2 p-3 bg-rose-500/5 dark:bg-rose-500/10 border border-rose-500/20 dark:border-rose-500/30 rounded-xl hover:bg-rose-500/10 dark:hover:bg-rose-500/20 hover:border-rose-500/50 transition-all text-left flex flex-col justify-between h-[96px]"
+            >
+              <div className="w-7 h-7 rounded-lg bg-rose-500/20 flex items-center justify-center text-rose-500 animate-pulse">
+                <RefreshCw size={14} />
+              </div>
+              <div>
+                <h4 className="text-rose-600 dark:text-rose-400 font-bold text-[10px] uppercase tracking-wider flex items-center gap-1.5">
+                  Full System Reset <span className="text-[8px] px-1 bg-rose-500/15 text-rose-500 rounded font-normal uppercase tracking-normal">Safe Session</span>
+                </h4>
+                <p className="text-[9px] text-slate-500 mt-0.5 leading-normal">
+                  Stops all active tasks/mirrors, clears queue, and soft restarts bot. Your login session is preserved.
+                </p>
+              </div>
+            </button>
           </div>
         </div>
       </div>
@@ -1568,82 +1713,6 @@ export default function App() {
     );
   };
 
-  const renderSystem = () => (
-    <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500 pb-24">
-      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 sm:p-8 rounded-3xl shadow-lg">
-        <h2 className="text-slate-500 text-[10px] font-bold uppercase tracking-[0.2em] mb-8 italic flex items-center gap-2">
-          <Settings className="text-sky-400" size={14} /> System Core Controls
-        </h2>
-        
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <button 
-            disabled={systemActionLoading}
-            onClick={() => handleSystemAction('ping')}
-            className="group p-6 bg-slate-50 dark:bg-slate-800/40 border border-slate-200/50 dark:border-slate-800 rounded-2xl hover:border-emerald-500/40 transition-all text-left"
-          >
-            <div className="flex items-center gap-4">
-              <div className="w-12 h-12 rounded-2xl bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 flex items-center justify-center text-slate-500 group-hover:text-emerald-500 transition-colors">
-                 <Activity size={22} />
-              </div>
-              <div className="flex-1 min-w-0">
-                <h4 className="text-slate-900 dark:text-white font-bold text-sm truncate">Ping Bot Instance</h4>
-                <p className="text-[11px] text-slate-500 leading-normal">Check latency & response.</p>
-              </div>
-            </div>
-          </button>
-
-          <button 
-            disabled={systemActionLoading}
-            onClick={() => handleSystemAction('cleartopics')}
-            className="group p-6 bg-slate-50 dark:bg-slate-800/40 border border-slate-200/50 dark:border-slate-800 rounded-2xl hover:border-amber-500/40 transition-all text-left"
-          >
-            <div className="flex items-center gap-4">
-              <div className="w-12 h-12 rounded-2xl bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 flex items-center justify-center text-slate-500 group-hover:text-amber-500 transition-colors">
-                 <Trash2 size={22} />
-              </div>
-              <div className="flex-1 min-w-0">
-                <h4 className="text-slate-900 dark:text-white font-bold text-sm truncate">Clear Topic Cache</h4>
-                <p className="text-[11px] text-slate-500 leading-normal">Purges cached TG topics memory.</p>
-              </div>
-            </div>
-          </button>
-
-          <button 
-            disabled={systemActionLoading}
-            onClick={() => handleSystemAction('restart')}
-            className="group p-6 bg-slate-50 dark:bg-slate-800/40 border border-slate-200/50 dark:border-slate-800 rounded-2xl hover:border-sky-500/40 transition-all text-left"
-          >
-            <div className="flex items-center gap-4">
-              <div className="w-12 h-12 rounded-2xl bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 flex items-center justify-center text-slate-500 group-hover:text-sky-500 transition-colors">
-                 <Power size={22} />
-              </div>
-              <div className="flex-1 min-w-0">
-                <h4 className="text-slate-900 dark:text-white font-bold text-sm truncate">Restart Services</h4>
-                <p className="text-[11px] text-slate-500 leading-normal">Soft reboots the application.</p>
-              </div>
-            </div>
-          </button>
-
-          <button 
-            disabled={systemActionLoading}
-            onClick={() => handleSystemAction('logout')}
-            className="group p-6 bg-slate-50 dark:bg-slate-800/40 border border-slate-200/50 dark:border-slate-800 rounded-2xl hover:border-red-500/40 transition-all text-left"
-          >
-            <div className="flex items-center gap-4">
-              <div className="w-12 h-12 rounded-2xl bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 flex items-center justify-center text-slate-500 group-hover:text-red-500 transition-colors">
-                 <LogOut size={22} />
-              </div>
-              <div className="flex-1 min-w-0">
-                <h4 className="text-slate-900 dark:text-white font-bold text-sm truncate">Logout Session</h4>
-                <p className="text-[11px] text-slate-500 leading-normal">Revoke active internal session.</p>
-              </div>
-            </div>
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-
   if (loading && !data) return (
     <div className="min-h-screen bg-slate-900 flex items-center justify-center">
       <motion.div 
@@ -1663,29 +1732,26 @@ export default function App() {
         {/* Desktop Sidebar (Permanent) */}
         <aside className="hidden lg:flex flex-col w-64 border-r border-slate-200/80 dark:border-[#15203c] bg-white dark:bg-[#0b1224] p-5 h-screen sticky top-0">
           <div className="flex items-center mb-8 pl-2">
-            <h1 className="text-xl font-black text-slate-900 dark:text-white tracking-tighter flex items-center gap-2.5 font-display">
-              <div className="p-2 bg-gradient-to-tr from-sky-500 to-emerald-500 rounded-lg shrink-0 shadow-lg shadow-sky-500/20">
-                 <Bot className="text-white animate-pulse" size={16} />
+            <h1 className="text-sm font-black text-slate-900 dark:text-white tracking-tighter flex items-center gap-2 font-display">
+              <div className="p-1.5 bg-gradient-to-tr from-sky-500 to-emerald-500 rounded-md shrink-0 shadow-sm">
+                 <Bot className="text-white animate-pulse" size={13} />
               </div>
               STUDIO <span className="text-sky-500 font-display">V3</span>
             </h1>
           </div>
           
-          <nav className="flex flex-col gap-2 flex-1">
-            <button onClick={() => setActiveTab('dashboard')} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all font-display ${activeTab === 'dashboard' ? 'bg-sky-500/10 text-sky-500 shadow-sm border-l-2 border-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
-              <Home size={18} /> Status
+          <nav className="flex flex-col gap-1.5 flex-1">
+            <button onClick={() => setActiveTab('home')} className={`flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition-all font-display ${activeTab === 'home' ? 'bg-sky-500/10 text-sky-500 border-l-2 border-sky-500 shadow-sm' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
+              <Home size={14} /> Home
             </button>
-            <button onClick={() => setActiveTab('config')} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all font-display ${activeTab === 'config' ? 'bg-sky-500/10 text-sky-500 shadow-sm border-l-2 border-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
-              <Settings size={18} /> Config
+            <button onClick={() => setActiveTab('control')} className={`flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition-all font-display ${activeTab === 'control' ? 'bg-sky-500/10 text-sky-500 border-l-2 border-sky-500 shadow-sm' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
+              <Zap size={14} /> Control
             </button>
-            <button onClick={() => setActiveTab('rules')} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all font-display ${activeTab === 'rules' ? 'bg-sky-500/10 text-sky-500 shadow-sm border-l-2 border-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
-              <FileEdit size={18} /> Rules
+            <button onClick={() => setActiveTab('config')} className={`flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition-all font-display ${activeTab === 'config' ? 'bg-sky-500/10 text-sky-500 border-l-2 border-sky-500 shadow-sm' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
+              <Settings size={14} /> Config
             </button>
-            <button onClick={() => setActiveTab('mirror')} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all font-display ${activeTab === 'mirror' ? 'bg-sky-500/10 text-sky-500 shadow-sm border-l-2 border-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
-              <Layers size={18} /> Mirror
-            </button>
-            <button onClick={() => setActiveTab('system')} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all font-display ${activeTab === 'system' ? 'bg-sky-500/10 text-sky-500 shadow-sm border-l-2 border-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
-              <Bot size={18} /> System
+            <button onClick={() => setActiveTab('mirror')} className={`flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition-all font-display ${activeTab === 'mirror' ? 'bg-sky-500/10 text-sky-500 border-l-2 border-sky-500 shadow-sm' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
+              <Layers size={14} /> Mirror / Rules
             </button>
           </nav>
         </aside>
@@ -1708,81 +1774,87 @@ export default function App() {
                 transition={{ type: 'spring', bounce: 0, duration: 0.4 }}
                 className="fixed inset-y-0 left-0 w-64 bg-white dark:bg-[#0b1224] border-r border-slate-200 dark:border-[#15203c] z-50 flex flex-col p-4 shadow-2xl lg:hidden"
               >
-                <div className="flex items-center justify-between mb-8 pl-2">
-                  <h1 className="text-xl font-black text-slate-900 dark:text-white tracking-tighter flex items-center gap-2.5 font-display">
-                    <div className="p-2 bg-gradient-to-tr from-sky-500 to-emerald-500 rounded-lg shrink-0">
-                       <Bot className="text-white animate-pulse" size={16} />
+                <div className="flex items-center justify-between mb-6 pl-1">
+                  <h1 className="text-sm font-black text-slate-900 dark:text-white tracking-tighter flex items-center gap-2 font-display">
+                    <div className="p-1.5 bg-gradient-to-tr from-sky-500 to-emerald-500 rounded-md shrink-0">
+                       <Bot className="text-white animate-pulse" size={13} />
                     </div>
                     STUDIO <span className="text-sky-500 font-display">V3</span>
                   </h1>
-                  <button onClick={() => setIsSidebarOpen(false)} className="p-2 text-slate-500 hover:text-slate-700 dark:hover:text-slate-300">
-                    <X size={20} />
+                  <button onClick={() => setIsSidebarOpen(false)} className="p-1.5 text-slate-500 hover:text-slate-700 dark:hover:text-slate-300">
+                    <X size={16} />
                   </button>
                 </div>
                 
-                <nav className="flex flex-col gap-2 flex-1">
-                  <button onClick={() => { setActiveTab('dashboard'); setIsSidebarOpen(false); }} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all font-display ${activeTab === 'dashboard' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
-                    <Home size={18} /> Status
+                <nav className="flex flex-col gap-1.5 flex-1">
+                  <button onClick={() => { setActiveTab('home'); setIsSidebarOpen(false); }} className={`flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition-all font-display ${activeTab === 'home' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
+                    <Home size={14} /> Home
                   </button>
-                  <button onClick={() => { setActiveTab('config'); setIsSidebarOpen(false); }} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all font-display ${activeTab === 'config' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
-                    <Settings size={18} /> Config
+                  <button onClick={() => { setActiveTab('control'); setIsSidebarOpen(false); }} className={`flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition-all font-display ${activeTab === 'control' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
+                    <Zap size={14} /> Control
                   </button>
-                  <button onClick={() => { setActiveTab('rules'); setIsSidebarOpen(false); }} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all font-display ${activeTab === 'rules' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
-                    <FileEdit size={18} /> Rules
+                  <button onClick={() => { setActiveTab('config'); setIsSidebarOpen(false); }} className={`flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition-all font-display ${activeTab === 'config' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
+                    <Settings size={14} /> Config
                   </button>
-                  <button onClick={() => { setActiveTab('mirror'); setIsSidebarOpen(false); }} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all font-display ${activeTab === 'mirror' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
-                    <Layers size={18} /> Mirror
-                  </button>
-                  <button onClick={() => { setActiveTab('system'); setIsSidebarOpen(false); }} className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all font-display ${activeTab === 'system' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
-                    <Bot size={18} /> System
+                  <button onClick={() => { setActiveTab('mirror'); setIsSidebarOpen(false); }} className={`flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition-all font-display ${activeTab === 'mirror' ? 'bg-sky-500/10 text-sky-500' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60'}`}>
+                    <Layers size={14} /> Mirror / Rules
                   </button>
                 </nav>
               </motion.aside>
             </>
           )}
         </AnimatePresence>
- 
+
         {/* Main Content Area */}
-        <div className="flex-1 flex flex-col min-w-0 h-screen overflow-y-auto">
-          <div className="max-w-4xl w-full mx-auto p-4 sm:p-6 lg:p-8 flex flex-col gap-6">
-            
+        <div className="flex-1 flex flex-col min-w-0 h-screen bg-slate-50 dark:bg-[#0a0f1c]">
             {/* Header */}
-            <SystemStatusBar />
-            <header className="flex items-center justify-between gap-4 bg-white/90 dark:bg-[#0b1224]/90 backdrop-blur-xl py-4.5 px-6 border border-slate-200/80 dark:border-[#15203c] rounded-2xl shadow-md">
-              <div className="flex items-center gap-3">
-                <button onClick={() => setIsSidebarOpen(true)} className="lg:hidden p-2.5 rounded-xl bg-slate-100 dark:bg-slate-850 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800 transition-colors">
-                  <Menu size={20} />
-                </button>
-                <div className="hidden sm:flex items-center gap-2.5">
-                   <StatusBadge label={data?.status || 'Unknown'} active={data?.status === 'Running'} icon={Activity} />
-                   <StatusBadge label="Atlas DB" active={data?.dbStatus === 'Connected'} icon={Database} />
-                </div>
+            <div className="sticky top-0 z-40 bg-slate-50/80 dark:bg-[#0a0f1c]/80 backdrop-blur-xl">
+              <div className="max-w-4xl w-full mx-auto p-4 sm:px-6 lg:px-8 flex flex-col gap-3">
+                 <SystemStatusBar />
+                 <header className="flex items-center justify-between gap-4">
+                   <div className="flex items-center gap-3">
+                     <button onClick={() => setIsSidebarOpen(true)} className="lg:hidden p-1.5 rounded-lg bg-white dark:bg-[#0b1224] border border-slate-200 dark:border-[#15203c] text-slate-600 dark:text-slate-300 shadow-sm hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors">
+                       <Menu size={16} />
+                     </button>
+                     <div className="hidden sm:flex items-center gap-2.5">
+                        <StatusBadge label={data?.status || 'Unknown'} active={data?.status === 'Running'} icon={Activity} />
+                        <StatusBadge label="Atlas DB" active={data?.dbStatus === 'Connected'} icon={Database} />
+                     </div>
+                   </div>
+                   <div className="flex items-center gap-2">
+                     <button onClick={() => setIsDarkMode(!isDarkMode)} className="p-1.5 rounded-lg border border-slate-200/80 dark:border-[#15203c] text-slate-600 dark:text-slate-450 hover:bg-white dark:hover:bg-[#15203c] transition-colors bg-white/50 dark:bg-transparent shadow-sm">
+                       {isDarkMode ? '🌙' : '☀️'}
+                     </button>
+                   </div>
+                 </header>
               </div>
-              <div className="flex items-center gap-2">
-                <button onClick={() => setIsDarkMode(!isDarkMode)} className="p-2.5 rounded-xl border border-slate-200/80 dark:border-[#15203c] text-slate-600 dark:text-slate-450 hover:bg-slate-100 dark:hover:bg-slate-800/70 transition-colors bg-white/50 dark:bg-transparent">
-                  {isDarkMode ? '🌙' : '☀️'}
-                </button>
+            </div>
+
+            {/* Scrollable Content */}
+            <div className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8">
+              <div className="max-w-4xl w-full mx-auto">
+                <main className="space-y-6 pb-20 lg:pb-6">
+                  {activeTab === 'home' && renderHome()}
+                  {activeTab === 'control' && renderControl()}
+                  {activeTab === 'config' && renderConfig()}
+                  {activeTab === 'mirror' && (
+                    <div className="space-y-6">
+                      {renderMirror()}
+                      {renderRules()}
+                    </div>
+                  )}
+                </main>
               </div>
-            </header>
- 
-            <main className="space-y-6 pb-20 lg:pb-6">
-              {activeTab === 'dashboard' && renderDashboard()}
-              {activeTab === 'config' && renderConfig()}
-              {activeTab === 'rules' && renderRules()}
-              {activeTab === 'mirror' && renderMirror()}
-              {activeTab === 'system' && renderSystem()}
-            </main>
-          </div>
+            </div>
         </div>
- 
+
         {/* Persistent Bottom Nav for Mobile/Tablet */}
         <nav className="lg:hidden fixed bottom-0 inset-x-0 bg-white/95 dark:bg-[#0b1224]/95 backdrop-blur-2xl border-t border-slate-200 dark:border-[#15203c] px-4 py-1.5 z-50 shadow-[0_-10px_40px_rgba(0,0,0,0.15)] dark:shadow-[0_-10px_40px_rgba(0,0,0,0.5)]">
           <div className="max-w-md mx-auto flex items-center justify-between gap-1">
-            <NavButton tab="dashboard" icon={Home} label="Status" />
+            <NavButton tab="home" icon={Home} label="Home" />
+            <NavButton tab="control" icon={Zap} label="Control" />
             <NavButton tab="config" icon={Settings} label="Config" />
-            <NavButton tab="rules" icon={FileEdit} label="Rules" />
-            <NavButton tab="mirror" icon={Layers} label="Mirror" />
-            <NavButton tab="system" icon={Bot} label="System" />
+            <NavButton tab="mirror" icon={Layers} label="Mirror/Rules" />
           </div>
         </nav>
       </div>

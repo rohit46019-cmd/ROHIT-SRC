@@ -24,16 +24,16 @@ export default function SystemStatusBar() {
   return (
     <>
       <div 
-        className="bg-slate-950 text-slate-300 p-2 text-xs font-mono border-b border-slate-800 cursor-pointer hover:bg-slate-900 transition-colors"
+        className="bg-slate-950 dark:bg-slate-900/40 text-slate-300 p-1.5 px-3 text-[10px] font-mono border border-slate-800/80 rounded-xl cursor-pointer hover:bg-slate-900 transition-all shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-1.5"
         onClick={() => setIsModalOpen(true)}
       >
-        <div className="flex items-center gap-2 mb-1">
-           <Terminal size={14} className="text-sky-500" />
+        <div className="flex items-center gap-1.5 min-w-0">
+           <Terminal size={11} className="text-sky-500 shrink-0" />
            <span className="truncate">{lastLog || 'No recent logs'}</span>
         </div>
-        <div className="flex items-center gap-2">
-           <UserCheck size={14} className="text-emerald-500" />
-           <span>Active Sessions: {sessions.length} ({sessions.join(', ')})</span>
+        <div className="flex items-center gap-1.5 shrink-0 text-[9px] bg-slate-900 dark:bg-slate-950 px-1.5 py-0.5 rounded border border-slate-800 w-fit">
+           <UserCheck size={11} className="text-emerald-500" />
+           <span className="font-bold">Active Sessions: {sessions.length}</span>
         </div>
       </div>
 
