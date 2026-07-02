@@ -83,33 +83,78 @@ export default function App() {
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const [statusRes, historyRes, failedRes, sessionsRes] = await Promise.all([
-          fetch('/api/status'),
-          fetch('/api/mirrored/history'),
-          fetch('/api/failed/list'),
-          fetch('/api/sessions').catch(() => null)
+        const fetchStatus = async () => {
+          try {
+            const res = await fetch('/api/status');
+            return res.ok ? await res.json() : null;
+          } catch (e) { return null; }
+        };
+
+        const fetchHistory = async () => {
+          try {
+            const res = await fetch('/api/mirrored/history');
+            return res.ok ? await res.json() : null;
+          } catch (e) { return null; }
+        };
+
+        const fetchFailed = async () => {
+          try {
+            const res = await fetch('/api/failed/list');
+            return res.ok ? await res.json() : null;
+          } catch (e) { return null; }
+        };
+
+        const fetchSessions = async () => {
+          try {
+            const res = await fetch('/api/sessions');
+            return res.ok ? await res.json() : null;
+          } catch (e) { return null; }
+        };
+
+        const fetchMirrorPaths = async () => {
+          try {
+            const res = await fetch('/api/settings/mirror-paths');
+            return res.ok ? await res.json() : [];
+          } catch (e) { return []; }
+        };
+
+        const [statusData, historyData, failedData, sessionsData, mirrorPathsData] = await Promise.all([
+          fetchStatus(),
+          fetchHistory(),
+          fetchFailed(),
+          fetchSessions(),
+          fetchMirrorPaths()
         ]);
-        if (!statusRes.ok) throw new Error('Failed to fetch status');
-        const statusJson = await statusRes.json();
-        setData(statusJson);
 
-        if (historyRes.ok) {
-          const historyJson = await historyRes.json();
-          setMirrorHistory(historyJson.logs || []);
+        if (statusData) {
+          if (mirrorPathsData && statusData.settings) {
+            statusData.settings.mirrorPaths = mirrorPathsData;
+          }
+          setData(statusData);
+          setError(null);
+        } else {
+          // If status fails, we show a warning but don't necessarily crash the whole UI
+          console.warn('Status fetch returned null');
         }
 
-        if (failedRes.ok) {
-          const failedJson = await failedRes.json();
-          setFailedTasks(failedJson.failed || []);
+        if (historyData) {
+          setMirrorHistory(historyData.logs || []);
         }
 
-        if (sessionsRes && sessionsRes.ok) {
-          const sessionsJson = await sessionsRes.json();
-          setTelegramSessions(sessionsJson || []);
+        if (failedData) {
+          setFailedTasks(failedData.failed || []);
         }
+
+        if (sessionsData) {
+          setTelegramSessions(sessionsData || []);
+        }
+
       } catch (err) {
-        console.error('Frontend Error:', err);
-        setError(err instanceof Error ? err.message : 'An error occurred');
+        console.error('Frontend Fetch Group Error:', err);
+        // Only set error if we have NO data at all
+        if (!data) {
+          setError(err instanceof Error ? err.message : 'Connection error');
+        }
       } finally {
         setLoading(false);
       }

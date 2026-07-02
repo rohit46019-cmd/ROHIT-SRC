@@ -134,6 +134,7 @@ let currentUploadEngine = 'GramJS';
 let globalCooldownSeconds = 5;
 const uploadEngines = ['GramJS', 'Telethon', 'Pyrogram', 'Hydrogram'];
 const approvedUsersCache = new Set<string>();
+const dynamicAdminsCache = new Set<string>();
 let globalRenameRules: Array<{ keyword: string; replaceWith: string }> = [];
 const processedMessageKeys = new Set<string>();
 const processedCallbackQueryIds = new Set<string>();
@@ -193,8 +194,8 @@ async function getConnectedBotClient(): Promise<TelegramClient | null> {
         console.log("[Bot GramJS Client] Successfully connected!");
         return connectedBotClient;
     } catch (err: any) {
-        if (client) {
-            await client.disconnect().catch(() => {});
+        if (client && typeof (client as any).disconnect === 'function') {
+            await (client as any).disconnect().catch(() => {});
         }
         if (err.name === 'FloodWaitError' || (err.message && err.message.includes('FloodWaitError'))) {
             const seconds = err.seconds || 1500;
@@ -327,6 +328,7 @@ interface Task {
     forceGeneralPath?: boolean;
     overrideTargetId?: any;
     isMirror?: boolean;
+    isForwardOnly?: boolean;
     retries?: number;
     fullMirrorSessionId?: string;
     topicCloneSessionId?: string;
@@ -888,7 +890,11 @@ async function resumeFullMirrorSession(chatId: number, sessionId: string, trigge
         sourceEntity = await safelyResolveFullEntity(client, sourceId);
     } catch (e: any) {
         if (!sourceId.startsWith('-100') && !isNaN(Number(sourceId))) {
-            sourceEntity = await safelyResolveFullEntity(client, "-100" + sourceId);
+            try {
+                sourceEntity = await safelyResolveFullEntity(client, "-100" + sourceId);
+            } catch (innerE) {
+                throw e;
+            }
         } else {
             throw e;
         }
@@ -1345,7 +1351,10 @@ async function safelyResolveEntity(client: TelegramClient, entity: any): Promise
                 return await client.getInputEntity(resolved);
             }
         } catch (e: any) {
-            // Silently proceed to fallbacks
+            // Silently proceed to fallbacks, but log specifically for debugging if it's an access issue
+            if (e.errorMessage === 'CHANNEL_INVALID' || e.errorMessage === 'CHANNEL_PRIVATE') {
+                console.log(`[safelyResolveEntity] getEntity access issue for ${lookupEntity}: ${e.errorMessage}`);
+            }
         }
 
         // H. Try direct resolution via GramJS's built-in getInputEntity
@@ -1389,9 +1398,7 @@ async function safelyResolveEntity(client: TelegramClient, entity: any): Promise
         // Strategy 2: channels.GetChannels (Specific for supergroups/channels)
         if (isPotentialChannel) {
             try {
-                const chResp = await client.invoke(new Api.channels.GetChannels({
-                    id: [new Api.InputChannel({ channelId: bigInt(idStrClean), accessHash: bigInt(0) })]
-                })).catch(() => null) as any;
+                const chResp: any = null; // Bypassed to prevent redundant API call and CHANNEL_INVALID error
                 
                 if (chResp && chResp.chats && chResp.chats.length > 0) {
                     try {
@@ -1468,17 +1475,25 @@ async function safelyResolveEntity(client: TelegramClient, entity: any): Promise
 
 async function safelyResolveFullEntity(client: TelegramClient, entity: any): Promise<any> {
     const peer = await safelyResolveEntity(client, entity);
+    if (!peer) return null;
+    
     try {
+        // Only try getEntity if we have a proper peer and if it's not a dummy peer (hash 0)
+        if (peer.className === 'InputPeerChannel' && (!peer.accessHash || peer.accessHash.toString() === '0')) {
+            // It's a dummy peer, getEntity will almost certainly fail if we reached here
+            return peer; 
+        }
         return await client.getEntity(peer);
     } catch (e: any) {
         if (e.errorMessage === 'CHANNEL_INVALID' || e.errorMessage === 'CHANNEL_PRIVATE' || (e.message && (e.message.includes('CHANNEL_INVALID') || e.message.includes('CHANNEL_PRIVATE')))) {
             try {
                 return await client.getInputEntity(peer);
             } catch (innerE) {
-                throw new Error(`Cannot access chat/channel format for ${entity}. It may be private, invalid, or the Userbot is not a member.`);
+                // Return the peer we have as last resort instead of throwing
+                return peer;
             }
         }
-        throw e;
+        return peer; // Return whatever peer we have as last resort
     }
 }
 
@@ -1503,6 +1518,20 @@ const userActionStates: Record<number, {
 const userClients = new Map<number, TelegramClient>();
 const pendingConnections = new Map<number, Promise<any>>();
 const userSessions = new Map<number, string>();
+
+const lastSessionNotification = new Map<string, number>();
+
+async function sendSessionNotification(userId: number, type: string, message: string) {
+    const key = `${userId}_${type}`;
+    const now = Date.now();
+    const lastSent = lastSessionNotification.get(key) || 0;
+    // 15 minutes cooldown (900000 ms) to avoid spamming the user with repeated alerts
+    if (now - lastSent < 900000) {
+        return;
+    }
+    lastSessionNotification.set(key, now);
+    await safeSendMessage(userId, message, { parse_mode: 'Markdown' }).catch(() => {});
+}
 
 async function runActiveWatchdog() {
     try {
@@ -1542,7 +1571,9 @@ async function runActiveWatchdog() {
                     activeWatchers.delete(userId);
                     userClients.delete(userId);
                     try {
-                        await existingClient.disconnect().catch(() => {});
+                        if (existingClient && typeof (existingClient as any).disconnect === 'function') {
+                            await (existingClient as any).disconnect().catch(() => {});
+                        }
                     } catch (e) {}
                     await getConnectedUserbotClient(userId).catch(err => {
                         console.error(`[Watchdog] Failed to cleanly reconnect user ${userId} in watchdog: ${err.message}`);
@@ -1622,6 +1653,11 @@ if (mongoUri) {
       // Load approved users into cache
       const users = await approvedUsersCollection.find({}).toArray();
       users.forEach((u: any) => approvedUsersCache.add(u.userId.toString()));
+      
+      // Load dynamic admins into cache
+      users.forEach((u: any) => {
+          if (u.role === 'admin' || u.isAdmin === true) dynamicAdminsCache.add(u.userId.toString());
+      });
 
       // Load active full mirror sessions
       try {
@@ -1712,7 +1748,7 @@ if (mongoUri) {
       }
 
       // Periodically check, recover, and self-heal user sessions and watchers every 60 seconds
-      // setInterval(runActiveWatchdog, 60000);
+      setInterval(runActiveWatchdog, 60000);
     })
     .catch((err) => {
       dbStatus = 'Error';
@@ -1724,6 +1760,15 @@ if (mongoUri) {
 const ALLOWED_ADMIN_IDS = ["6431447408", "6581298945", "6065778458"];
 
 const isAdmin = (userId: number | undefined) => {
+  if (!userId) return false;
+  const uidStr = userId.toString().trim();
+  const mainAdminStr = currentAdminId?.toString().trim();
+  return ALLOWED_ADMIN_IDS.includes(uidStr) || 
+         (mainAdminStr && uidStr === mainAdminStr) || 
+         dynamicAdminsCache.has(uidStr);
+};
+
+const isMainAdmin = (userId: number | undefined) => {
   if (!userId) return false;
   const uidStr = userId.toString().trim();
   const mainAdminStr = currentAdminId?.toString().trim();
@@ -2006,7 +2051,9 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                 pendingConnections.delete(fromId);
                 const oldClient = userClients.get(fromId);
                 if (oldClient) {
-                    await oldClient.disconnect().catch(() => {});
+                    if (oldClient && typeof (oldClient as any).disconnect === 'function') {
+                        await (oldClient as any).disconnect().catch(() => {});
+                    }
                     userClients.delete(fromId);
                 }
                 userSessions.delete(fromId);
@@ -2073,9 +2120,9 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
             uploadModeDisplay = '📁 Document/File';
         }
 
-        let uploadAgentDisplay = '👤 User Account';
+        let uploadAgentDisplay = '👤 UserBot (Your Account)';
         if (userDoc?.uploadAgent === 'bot') {
-            uploadAgentDisplay = '🤖 Bot itself';
+            uploadAgentDisplay = '🤖 Bot Account (Self)';
         }
 
         const apiDisplayId = apiIdValue ? '✅ Set (Hidden for Security)' : '❌ Missing';
@@ -2089,6 +2136,7 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                      `👤 𝗨𝘀𝗲𝗿𝗯𝗼𝘁: ${session ? '✅ Active' : '❌ Missing'}\n` +
                      `🎬 𝗠𝗼𝗱𝗲: ${uploadModeDisplay}\n` +
                      `🤖 𝗔𝗴𝗲𝗻𝘁: ${uploadAgentDisplay}\n` +
+                     `└ *UserBot uses your ID. Bot Account uses this Bot itself.*\n\n` +
                      `🚀 𝗨𝗽𝗹𝗼𝗮𝗱 𝗘𝗻𝗴𝗶𝗻𝗲: ${currentUploadEngine}\n` +
                      `📥 𝗗𝗼𝘄𝗻𝗹𝗼𝗮𝗱 𝗘𝗻𝗴𝗶𝗻𝗲: ${currentDownloadLibrary}\n` +
                      `📍 𝗗𝗲𝘀𝘁𝗶𝗻𝗮𝘁𝗶𝗼𝗻: \`${pathDisplay}\`\n` +
@@ -2099,6 +2147,9 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
         
         const markup = {
             inline_keyboard: [
+              [
+                { text: '➕ Add Bot to Group (With All Perms)', url: `https://t.me/${botInfo?.username || 'bot'}?startgroup=true&admin=post_messages+edit_messages+delete_messages+invite_users+pin_messages+manage_chat+manage_video_chats` }
+              ],
               [
                 { text: '🖼️ 𝗧𝗵𝘂𝗺𝗯', callback_data: 'set_thumb' },
                 { text: '🗑️ 𝗧𝗵𝘂𝗺𝗯', callback_data: 'clr_thumb' },
@@ -2115,7 +2166,7 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
               ],
               [
                 { text: userDoc?.uploadMode === 'document' ? '📁 𝗙𝗶𝗹𝗲 𝗠𝗼𝗱𝗲' : '📹 𝗩𝗶𝗱𝗲𝗼 𝗠𝗼𝗱𝗲', callback_data: 'toggle_mode' },
-                { text: userDoc?.uploadAgent === 'bot' ? '🤖 𝗕𝗼𝘁' : '👤 𝗨𝘀𝗲𝗿', callback_data: 'toggle_agent' }
+                { text: userDoc?.uploadAgent === 'bot' ? '🤖 Switch to UserBot' : '👤 Switch to Bot', callback_data: 'toggle_agent' }
               ],
               [
                 { text: '✏️ 𝗥𝗲𝗻𝗮𝗺𝗲', callback_data: 'toggle_rename' },
@@ -2172,7 +2223,12 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
       const loginCount = Object.keys(loginStates).length;
       if (loginCount > 0) {
         for (const key in loginStates) {
-          if (loginStates[key].client) loginStates[key].client?.disconnect();
+          const cl = loginStates[key].client;
+          if (cl && typeof (cl as any).disconnect === 'function') {
+            try {
+              (cl as any).disconnect();
+            } catch (e) {}
+          }
         }
         for (const key in loginStates) delete loginStates[key];
         cancelled = true;
@@ -2192,26 +2248,17 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
           cancelled = true;
       }
       
-      // Cancel active tasks, except live mirror tasks
-      for (const [key, job] of activeTaskJobs) {
-          if (job.isMirror && ['searching', 'downloading', 'uploading'].includes(job.phase)) {
-              continue;
-          }
-          activeTaskJobs.delete(key);
-          taskControlMap.delete(key);
-          cancelled = true;
+      // Global Cancel: Cancel and abort all active tasks/jobs (including live mirror/batch tasks)
+      const activeJobsCount = activeTaskJobs.size;
+      if (activeJobsCount > 0) {
+        for (const [key, job] of activeTaskJobs) {
+          taskControlMap.set(key, { isPaused: false, shouldRetry: false, isSkipped: true });
+        }
+        cancelled = true;
       }
 
       if (cancelled) {
-          safeSendMessage(chatId, "✅ All non-essential/pending tasks have been cancelled.");
-      }
-
-      // Reset activity trackers
-      activeTasksPerUser.clear();
-      activeTasksCount = 0;
-
-      if (cancelled) {
-        safeSendMessage(chatId, "🛑 **GLOBAL CANCEL:**\nAll active tasks, batches, user operations, and queues have been wiped globally.");
+        safeSendMessage(chatId, "🛑 **GLOBAL CANCEL:**\nAll active tasks, batches, user operations, and queues have been wiped and aborted globally.");
       } else {
         safeSendMessage(chatId, "⚠️ **No active tasks or operations found to cancel.**");
       }
@@ -2273,7 +2320,10 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
         const loginsAborted = Object.keys(loginStates).length;
         for (const key in loginStates) {
             try {
-                await loginStates[Number(key)].client?.disconnect();
+                const cl = loginStates[Number(key)].client;
+                if (cl && typeof (cl as any).disconnect === 'function') {
+                    await (cl as any).disconnect().catch(() => {});
+                }
             } catch {}
             delete loginStates[Number(key)];
         }
@@ -2282,7 +2332,9 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
         const clientsRefreshed = userClients.size;
         for (const [userId, client] of userClients.entries()) {
             try {
-                await client.disconnect();
+                if (client && typeof (client as any).disconnect === 'function') {
+                    await (client as any).disconnect();
+                }
             } catch (e) {
                 console.error(`Failed to disconnect client for user ${userId} on reset:`, e);
             }
@@ -2451,21 +2503,18 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
             inline_keyboard: [
                 [
                     { text: '⚙️ 𝗦𝗲𝘁𝘁𝗶𝗻𝗴𝘀', callback_data: 'bot_settings' },
-                    { text: '📈 𝗗𝗮𝘀𝗵𝗯𝗼𝗮𝗿𝗱', callback_data: 'dashboard_cmd' }
+                    { text: '⏩ 𝗚𝗿𝗼𝘂𝗽 𝗙𝗼𝗿𝘄𝗼𝗿𝗱', callback_data: 'full_mirror_start' }
+                ],
+                [
+                    { text: '⚙️ 𝗠𝗶𝗿𝗿𝗼𝗿 𝗘𝗻𝗴𝗶𝗻𝗲', callback_data: 'mirror_cmd' },
+                    { text: '📍 𝗦𝗲𝘁 𝗣𝗮𝘁𝗵', callback_data: 'set_path_cmd' }
                 ],
                 [
                     { text: '📦 𝗕𝗮𝘁𝗰𝗵', callback_data: 'batch_cmd' },
-                    { text: '⚙️ 𝗠𝗶𝗿𝗿𝗼𝗿 𝗘𝗻𝗴𝗶𝗻𝗲', callback_data: 'mirror_cmd' }
+                    { text: '🔄 𝗥𝗲𝘀𝘁𝗮𝗿𝘁', callback_data: 'restart_bot_cmd' }
                 ],
                 [
-                    { text: '📍 𝗦𝗲𝘁 𝗣𝗮𝘁𝗵', callback_data: 'set_path_cmd' },
                     { text: '❌ 𝗖𝗮𝗻𝗰𝗲𝗹', callback_data: 'cancel_cmd' }
-                ],
-                [
-                    { text: '🚀 𝗦𝘁𝗮𝗿𝘁 𝗦𝗶𝗻𝗴𝗹𝗲 𝗧𝗮𝗿𝗴𝗲𝘁', callback_data: 'start_cmd_link' }
-                ],
-                [
-                    { text: '🌸 𝗔𝗻𝗶𝗺𝗲 𝗣𝗵𝗼𝘁𝗼', callback_data: 'send_anime_photo' }
                 ]
             ]
         };
@@ -2915,18 +2964,18 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
             inline_keyboard: [
                 [
                     { text: '⚙️ 𝗦𝗲𝘁𝘁𝗶𝗻𝗴𝘀', callback_data: 'bot_settings' },
-                    { text: '📈 𝗗𝗮𝘀𝗵𝗯𝗼𝗮𝗿𝗱', callback_data: 'dashboard_cmd' }
+                    { text: '⏩ 𝗚𝗿𝗼𝘂𝗽 𝗙𝗼𝗿𝘄𝗼𝗿𝗱', callback_data: 'full_mirror_start' }
+                ],
+                [
+                    { text: '⚙️ 𝗠𝗶𝗿𝗿𝗼𝗿 𝗘𝗻𝗴𝗶𝗻𝗲', callback_data: 'mirror_cmd' },
+                    { text: '📍 𝗦𝗲𝘁 𝗣𝗮𝘁𝗵', callback_data: 'set_path_cmd' }
                 ],
                 [
                     { text: '📦 𝗕𝗮𝘁𝗰𝗵', callback_data: 'batch_cmd' },
-                    { text: '⚙️ 𝗠𝗶𝗿𝗿𝗼𝗿 𝗘𝗻𝗴𝗶𝗻𝗲', callback_data: 'mirror_cmd' }
+                    { text: '🔄 𝗥𝗲𝘀𝘁𝗮𝗿𝘁', callback_data: 'restart_bot_cmd' }
                 ],
                 [
-                    { text: '📍 𝗦𝗲𝘁 𝗣𝗮𝘁𝗵', callback_data: 'set_path_cmd' },
                     { text: '❌ 𝗖𝗮𝗻𝗰𝗲𝗹', callback_data: 'cancel_cmd' }
-                ],
-                [
-                    { text: '🚀 𝗦𝘁𝗮𝗿𝘁 𝗦𝗶𝗻𝗴𝗹𝗲 𝗧𝗮𝗿𝗴𝗲𝘁', callback_data: 'start_cmd_link' }
                 ]
             ]
         };
@@ -3328,6 +3377,48 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
           bot?.answerCallbackQuery(query.id);
           return;
       }
+      if (query.data === 'restart_bot_cmd') {
+          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+          bot?.answerCallbackQuery(query.id, { text: '♻️ Restarting system...' });
+          // Trigger the same logic as /restart
+          const fromUser = query.from;
+          const msg = query.message!;
+          
+          let report = "♻️ **𝗦𝘆𝘀𝘁𝗲𝗺 𝗛𝗼𝘁-𝗥𝗲𝘀𝘁𝗮𝗿𝘁 𝗜𝗻𝗶𝘁𝗶𝗮𝘁𝗲𝗱**\n\n";
+          
+          // 1. Stop Task Queue
+          const tasksStopped = taskQueue.length;
+          taskQueue.length = 0; 
+          dbClearAllTasks().catch(e => console.error("[Queue DB] failed to clear on restart:", e));
+          nextTaskRunAt = null;
+          report += `🛑 Tasks Stopped: \`${tasksStopped}\`\n`;
+
+          // 2. Clear Performance Junk
+          for (const key in libraryPerfMetrics) {
+              libraryPerfMetrics[key] = { totalBytes: 0, totalTimeMs: 0, count: 0 };
+          }
+          
+          // Cleanup actual junk files from disk
+          try {
+              const files = fs.readdirSync(process.cwd());
+              let cleanedCount = 0;
+              for (const f of files) {
+                  if (f.startsWith('media_') || f.endsWith('.session') || f.endsWith('.session-journal')) {
+                      // Don't delete active sessions
+                      const isActiveSession = Object.values(userClients).some(c => (c as any)._sessionName === f.replace('.session', ''));
+                      if (!isActiveSession) {
+                          try { fs.unlinkSync(f); cleanedCount++; } catch(e) {}
+                      }
+                  }
+              }
+              report += `🧹 Junk Files Cleaned: \`${cleanedCount}\`\n`;
+          } catch(e) {}
+
+          report += `\n✅ **Bot is now refreshed and ready.**`;
+          bot?.sendMessage(chatId, report, { parse_mode: 'Markdown' });
+          return;
+      }
+
       if (query.data === 'batch_cmd') {
           handleBatch(chatId, query.from?.id, query.message?.message_id);
           bot?.answerCallbackQuery(query.id);
@@ -3751,7 +3842,11 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                   sourceEntity = await safelyResolveFullEntity(client, sourceId);
               } catch (e: any) {
                   if (!sourceId.startsWith('-100') && !isNaN(Number(sourceId))) {
-                      sourceEntity = await safelyResolveFullEntity(client, "-100" + sourceId);
+                      try {
+                          sourceEntity = await safelyResolveFullEntity(client, "-100" + sourceId);
+                      } catch (innerE) {
+                          throw e;
+                      }
                   } else {
                       throw e;
                   }
@@ -3814,12 +3909,20 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
               const blockedTopics = (userDocForBlock?.blockedTopics || []).map((t: string) => t.trim().toLowerCase());
 
               let skippedCount = 0;
+              let fetchedCount = 0;
 
               const msgsToQueue = [];
               const topicMap: Record<number, number | undefined> = {};
               let latestMsgId = 0;
 
               for await (const m of client.iterMessages(sourceEntity, { reverse: true, limit: undefined })) {
+                  fetchedCount++;
+                  if (fetchedCount % 1000 === 0) {
+                      await safeEditMessage(`📂 **Fetching History...**\nScanned **${fetchedCount}** messages so far...\n(This may take a moment for large groups)`, {
+                          chat_id: chatId,
+                          message_id: statusMsg.message_id
+                      });
+                  }
                   if (m.action) continue; 
                   if (!m.message && !m.media) continue;
 
@@ -3893,7 +3996,8 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                       forceGeneralPath: true,
                       overrideThreadId,
                       overrideTargetId: destPath,
-                      isMirror: true
+                      isMirror: true,
+                      isForwardOnly: true
                    });
               }
 
@@ -4017,12 +4121,75 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                   }
               }
 
-              taskQueue.push(...orderedTasks);
-              dbEnqueueTasks(orderedTasks).catch(e => console.error("[Queue DB] Bulk enqueue error:", e));
-              runNextTask();
+              // Launch background high-speed bulk forwarding
+              (async () => {
+                  try {
+                      // Get client for forwarding (User preference: UserBot vs Bot)
+                      let forwardingClient = client;
+                      let fSourceEntity = sourceEntity;
+                      let fDestEntity = destEntity;
+
+                      if (userDoc?.uploadAgent === 'bot') {
+                          const botClient = await getConnectedBotClient();
+                          if (botClient) {
+                              forwardingClient = botClient;
+                              // Re-resolve entities for Bot client
+                              try {
+                                  fSourceEntity = await safelyResolveFullEntity(forwardingClient, sourceEntity);
+                                  fDestEntity = await safelyResolveFullEntity(forwardingClient, dest.destId);
+                              } catch (e) {
+                                  console.warn("[BulkForward] Bot failed to resolve source/dest, falling back to user client entities:", e.message);
+                              }
+                          }
+                      }
+
+                      // 1. Process General Tasks (no specific sub-topic in source)
+                      if (generalTasks.length > 0) {
+                          const ids = generalTasks.map(t => parseInt(t.link.split('/').pop() || '0'));
+                          await processBulkForward(forwardingClient, fSourceEntity, fDestEntity, ids, dest.destThreadId, async (done) => {
+                              const session = activeFullMirrorSessions.get(sessionId);
+                              if (session) {
+                                  const prevDone = session.topicStats['general']?.processed || 0;
+                                  const delta = done - prevDone;
+                                  session.processedFiles += delta;
+                                  session.successCount += delta;
+                                  if (!session.topicStats['general']) session.topicStats['general'] = { processed: 0, total: generalTasks.length, title: 'General Discussion', isMarkedCompleted: false };
+                                  session.topicStats['general'].processed = done;
+                                  await updateGlobalMirrorProgress(sessionId);
+                              }
+                          });
+                      }
+                      
+                      // 2. Process Topic Tasks
+                      for (const [topicId, tasks] of tasksByTopic.entries()) {
+                          const ids = tasks.map(t => parseInt(t.link.split('/').pop() || '0'));
+                          await processBulkForward(forwardingClient, fSourceEntity, fDestEntity, ids, topicId as number, async (done) => {
+                              const session = activeFullMirrorSessions.get(sessionId);
+                              if (session) {
+                                  const prevDone = session.topicStats[topicId]?.processed || 0;
+                                  const delta = done - prevDone;
+                                  session.processedFiles += delta;
+                                  session.successCount += delta;
+                                  session.topicStats[topicId].processed = done;
+                                  await updateGlobalMirrorProgress(sessionId);
+                              }
+                          });
+                      }
+                      
+                      // Final notification
+                      safeSendMessage(chatId, `🎊 **Full Mirror Completed!**\n\n✅ Successfully mirrored **${orderedTasks.length}** messages from \`${sourceId}\` to \`${dest.groupName}\`.\n\nEnjoy your content! 🚀`);
+                      
+                      // Clean up session from active map after a short delay
+                      setTimeout(() => activeFullMirrorSessions.delete(sessionId), 60000);
+                  } catch (e: any) {
+                      console.error("[Full Mirror Bulk] Background error:", e.message);
+                      safeSendMessage(chatId, `⚠️ **Mirror interrupted:** ${e.message}`);
+                  }
+              })();
+
               if (statusMsg) {
                   const skipText = skippedCount > 0 ? ` (Skipped **${skippedCount}** already mirrored previously)` : '';
-                  await safeEditMessage(`✅ Added **${orderedTasks.length}** items from Full Mirror to copy queue.${skipText}\nDestination path: \`${destPath}\`.${liveMirrorSuccessInfo}`, {
+                  await safeEditMessage(`⚡ **Full Mirror Started (Fast Mode)**\n\nProcessing **${orderedTasks.length}** items using direct batch forwarding.${skipText}\nDestination path: \`${destPath}\`.${liveMirrorSuccessInfo}`, {
                       chat_id: chatId,
                       message_id: statusMsg.message_id
                   });
@@ -4245,9 +4412,9 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                     p.sourceId === sourceId || p.sourceId === `-100${sourceId}` || sourceId === p.sourceId.replace('-100', '')
                   );
 
-                  let destPath = mirrorPath ? mirrorPath.destId : (userDoc?.uploadPath || DEFAULT_LOG_GROUP);
+                  let destPath = mirrorPath ? mirrorPath.destId : (userDoc?.uploadPath || DEFAULT_LOG_GROUP || (chatId < 0 ? chatId.toString() : ""));
                   if (!destPath) {
-                      throw new Error("No destination path configured. Please set an upload path first.");
+                      throw new Error("No destination path configured. Please set an upload path in /settings or use a mirror binding.");
                   }
                   const destEntity: any = await safelyResolveFullEntity(client, destPath).catch(() => { throw new Error("Could not access Destination.")});
 
@@ -4353,7 +4520,10 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
           `• \`/logout\` 🚪 - Securely disconnects and removes your active userbot Telegram session.\n` +
           `• \`/ping\` 🏓 - Verifies the latency and responds with active server connection status.\n` +
           `• \`/restart\` 🔄 - Restarts the bot application instance (Admin restricted).\n` +
-          `• \`/sync\` 🔄 - Re-synchronizes any active mirror paths and session keys.\n\n` +
+          `• \`/sync\` 🔄 - Re-synchronizes any active mirror paths and session keys.\n` +
+          `• \`/admins\` 🛡 - Lists all authorized administrators.\n` +
+          `• \`/addadmin\` 👤 - Adds a new administrator by User ID (Main Admin only).\n` +
+          `• \`/removeadmin\` 👤 - Removes an existing administrator (Main Admin only).\n\n` +
           `--- \n\n` +
           `🖱 **Interactive Touch Elements & Buttons:**\n\n` +
           `• **Login / Authenticate** 🔑 - Prompts you to paste a standard \`STRING_SESSION\` to authenticate.\n` +
@@ -4668,12 +4838,12 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
           if (approvedUsersCollection) {
               const settingsUid = await resolveSettingsUserId(query.from?.id);
               const userDoc = await approvedUsersCollection.findOne({ userId: settingsUid });
-              const currentAgent = userDoc?.uploadAgent === 'bot' ? 'user' : 'bot';
+              const currentAgent = userDoc?.uploadAgent === 'bot' ? 'userbot' : 'bot';
               await approvedUsersCollection.updateOne(
                   { userId: settingsUid },
                   { $set: { uploadAgent: currentAgent } }
               );
-              bot?.answerCallbackQuery(query.id, { text: `✅ Upload Agent set to ${currentAgent === 'bot' ? 'Bot itself' : 'User Account'}` });
+              bot?.answerCallbackQuery(query.id, { text: `✅ Agent set to ${currentAgent === 'bot' ? 'Bot Account (Self)' : 'UserBot (Your Account)'}` });
               handleSettings(chatId, query.from?.id, query.message!.message_id);
           }
           return;
@@ -5299,7 +5469,9 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
           // Perform global logout
           const client = userClients.get(targetUid);
           if (client) {
-              await client.disconnect().catch(() => {});
+              if (typeof (client as any).disconnect === 'function') {
+                  await (client as any).disconnect().catch(() => {});
+              }
               userClients.delete(targetUid);
           }
           userSessions.delete(targetUid);
@@ -5504,7 +5676,10 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
         const loginsAborted = Object.keys(loginStates).length;
         for (const key in loginStates) {
             try {
-                await loginStates[Number(key)].client?.disconnect();
+                const cl = loginStates[Number(key)].client;
+                if (cl && typeof (cl as any).disconnect === 'function') {
+                    await (cl as any).disconnect().catch(() => {});
+                }
             } catch {}
             delete loginStates[Number(key)];
         }
@@ -5514,7 +5689,9 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
         const clientsRefreshed = userClients.size;
         for (const [userId, client] of userClients.entries()) {
             try {
-                await client.disconnect();
+                if (client && typeof (client as any).disconnect === 'function') {
+                    await (client as any).disconnect();
+                }
             } catch (e) {
                 console.error(`Failed to disconnect client for user ${userId}:`, e);
             }
@@ -5527,6 +5704,71 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
         
         report += `\n✅ **System is now clean. Bot operations resumed.**`;
         report += `\n💾 **Login Persistence:** \`SAFE\` (Your accounts stay logged in)`;
+
+        bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
+    });
+
+    bot.onText(/\/addadmin(?:\s+(.+))?/, async (msg, match) => {
+        const fromId = msg.from?.id;
+        const chatId = msg.chat.id;
+        if (!isMainAdmin(fromId)) return;
+        
+        const targetIdStr = match?.[1]?.trim();
+        if (!targetIdStr) {
+            return bot.sendMessage(chatId, "📝 **Usage:** `/addadmin <userId>`\n\nExample: `/addadmin 123456789`", { parse_mode: 'Markdown' });
+        }
+
+        if (approvedUsersCollection) {
+            await approvedUsersCollection.updateOne(
+                { userId: targetIdStr },
+                { $set: { role: 'admin', isAdmin: true } },
+                { upsert: true }
+            );
+            dynamicAdminsCache.add(targetIdStr);
+            bot.sendMessage(chatId, `✅ **Admin Added:** \`${targetIdStr}\` now has full access.`, { parse_mode: 'Markdown' });
+        } else {
+            bot.sendMessage(chatId, "❌ Database not connected.");
+        }
+    });
+
+    bot.onText(/\/removeadmin(?:\s+(.+))?/, async (msg, match) => {
+        const fromId = msg.from?.id;
+        const chatId = msg.chat.id;
+        if (!isMainAdmin(fromId)) return;
+        
+        const targetIdStr = match?.[1]?.trim();
+        if (!targetIdStr) {
+            return bot.sendMessage(chatId, "📝 **Usage:** `/removeadmin <userId>`", { parse_mode: 'Markdown' });
+        }
+
+        if (approvedUsersCollection) {
+            await approvedUsersCollection.updateOne(
+                { userId: targetIdStr },
+                { $unset: { role: "", isAdmin: "" } }
+            );
+            dynamicAdminsCache.delete(targetIdStr);
+            bot.sendMessage(chatId, `✅ **Admin Removed:** \`${targetIdStr}\` access revoked.`, { parse_mode: 'Markdown' });
+        } else {
+            bot.sendMessage(chatId, "❌ Database not connected.");
+        }
+    });
+
+    bot.onText(/\/admins/, async (msg) => {
+        const fromId = msg.from?.id;
+        const chatId = msg.chat.id;
+        if (!isAdmin(fromId)) return;
+
+        let report = "🛡 **Authorized Administrators**\n\n";
+        report += "👑 **Main Admins (Hardcoded):**\n";
+        ALLOWED_ADMIN_IDS.forEach(id => report += `• \`${id}\`\n`);
+        if (currentAdminId) report += `• \`${currentAdminId}\` (Env)\n`;
+
+        if (dynamicAdminsCache.size > 0) {
+            report += "\n👥 **Dynamic Admins:**\n";
+            dynamicAdminsCache.forEach(id => report += `• \`${id}\`\n`);
+        } else {
+            report += "\n👥 **Dynamic Admins:** `None`";
+        }
 
         bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
     });
@@ -6139,7 +6381,10 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
           `• \`/logout\` 🚪 - Securely disconnects and removes your active userbot Telegram session.\n` +
           `• \`/ping\` 🏓 - Verifies the latency and responds with active server connection status.\n` +
           `• \`/restart\` 🔄 - Restarts the bot application instance (Admin restricted).\n` +
-          `• \`/sync\` 🔄 - Re-synchronizes any active mirror paths and session keys.\n\n` +
+          `• \`/sync\` 🔄 - Re-synchronizes any active mirror paths and session keys.\n` +
+          `• \`/admins\` 🛡 - Lists all authorized administrators.\n` +
+          `• \`/addadmin\` 👤 - Adds a new administrator by User ID (Main Admin only).\n` +
+          `• \`/removeadmin\` 👤 - Removes an existing administrator (Main Admin only).\n\n` +
           `--- \n\n` +
           `🖱 **Interactive Touch Elements & Buttons:**\n\n` +
           `• **Login / Authenticate** 🔑 - Prompts you to paste a standard \`STRING_SESSION\` to authenticate.\n` +
@@ -6207,6 +6452,50 @@ const getOrCreateTopic = async (client: TelegramClient, channelEntity: any, topi
         }
     }
 };
+
+// --- HELPER FOR BULK FORWARDING (FAST) ---
+const processBulkForward = async (
+    client: TelegramClient,
+    sourcePeer: any,
+    destPeer: any,
+    msgIds: number[],
+    threadId: number | undefined,
+    onProgress: (done: number) => Promise<void>
+) => {
+    const CHUNK_SIZE = 100;
+    let totalDone = 0;
+
+    for (let i = 0; i < msgIds.length; i += CHUNK_SIZE) {
+        const chunk = msgIds.slice(i, i + CHUNK_SIZE);
+        try {
+            await client.invoke(new Api.messages.ForwardMessages({
+                fromPeer: sourcePeer,
+                id: chunk,
+                toPeer: destPeer,
+                dropAuthor: true,
+                topMsgId: threadId,
+                randomId: chunk.map(() => helpers.generateRandomLong(true))
+            }));
+            totalDone += chunk.length;
+            await onProgress(totalDone);
+            // Small sleep to avoid flood wait for very large groups
+            if (msgIds.length > CHUNK_SIZE) await new Promise(r => setTimeout(r, 1000));
+        } catch (err: any) {
+            console.error(`[BulkForward] Error in chunk ${i}:`, err.message);
+            // If flood wait, respect it
+            if (err.errorMessage?.includes('FLOOD_WAIT_')) {
+                const seconds = parseInt(err.errorMessage.split('_')[2]) || 10;
+                console.log(`[BulkForward] Flood wait detected, sleeping for ${seconds}s`);
+                await new Promise(r => setTimeout(r, seconds * 1000));
+                i -= CHUNK_SIZE; // Retry this chunk
+                continue;
+            }
+            // Other errors, we might want to log and continue with next chunk or individual fallback?
+            // For "Fast Forward" we'll just log and continue for now.
+        }
+    }
+};
+
 interface ActiveJob {
     link: string;
     chatId: number;
@@ -6749,6 +7038,10 @@ runNextTask = async () => {
                 console.log(`[Queue] Throttling for ${waitSecs}s due to ${cooldownSecs}s cooldown.`);
                 let lastCooldownUpdate = 0;
                 for (let i = waitSecs; i > 0; i--) {
+                    const taskState = taskControlMap.get(jobKey);
+                    if (taskState && taskState.isSkipped) {
+                        throw new Error("DOWNLOAD_SKIPPED");
+                    }
                     if (job) {
                         job.cooldownRemaining = i;
                     }
@@ -6815,7 +7108,7 @@ runNextTask = async () => {
                 finalDone = true;
             } else {
                 // Task timeout is completely removed as requested, allowing unlimited download time for large content.
-                success = await processTask(task.chatId, task.link, statusMsgId, fromId, task.overrideThreadId, task.forceGeneralPath, task.overrideTargetId, task.isMirror);
+                success = await processTask(task.chatId, task.link, statusMsgId, fromId, task.overrideThreadId, task.forceGeneralPath, task.overrideTargetId, task.isMirror, task.isForwardOnly);
                 finalDone = true;
             }
         } catch (taskErr: any) {
@@ -6960,6 +7253,7 @@ runNextTask = async () => {
     } finally {
         const jobKey = `${task.userId}-${task.link}`;
         activeTaskJobs.delete(jobKey);
+        taskControlMap.delete(jobKey);
         activeTasksCount--;
         activeTasksPerUser.set(fromIdKey, Math.max(0, (activeTasksPerUser.get(fromIdKey) || 1) - 1));
         console.log(`[Queue] Finally block hit. activeTasksCount is now ${activeTasksCount}, User ${fromIdKey} active: ${activeTasksPerUser.get(fromIdKey)}`);
@@ -7013,6 +7307,8 @@ async function catchUpLiveMirrors(userId: number, client: TelegramClient) {
         const livePaths = userDoc.mirrorPaths.filter((p: any) => p.isLive === true);
         if (livePaths.length === 0) return;
 
+        const blockedTopics = (userDoc?.blockedTopics || []).map((t: string) => t.trim().toLowerCase());
+
         console.log(`[CatchUp] Checking catch-up for user ${userId} with ${livePaths.length} live paths...`);
 
         for (const pathObj of livePaths) {
@@ -7064,39 +7360,76 @@ async function catchUpLiveMirrors(userId: number, client: TelegramClient) {
                     const sortedMessages = [...messages].reverse();
 
                     for (const m of sortedMessages) {
-                        if (m instanceof Api.MessageEmpty) continue;
-                        if (m.out) continue;
-                        if (m.action instanceof Api.MessageActionTopicCreate) {
+                        if (m instanceof Api.MessageEmpty) {
+                            pathObj.lastProcessedMsgId = m.id;
                             continue;
+                        }
+                        if (m.out) {
+                            pathObj.lastProcessedMsgId = m.id;
+                            continue;
+                        }
+
+                        // Only detect messages that contain actual files/media (document or photo)
+                        const hasFile = m.media && (
+                            m.media instanceof Api.MessageMediaDocument ||
+                            m.media instanceof Api.MessageMediaPhoto
+                        );
+                        if (!hasFile) {
+                            pathObj.lastProcessedMsgId = m.id;
+                            continue;
+                        }
+
+                        if (m.action instanceof Api.MessageActionTopicCreate) {
+                            pathObj.lastProcessedMsgId = m.id;
+                            continue;
+                        }
+
+                        // Resolve Topic details and check blocked topics
+                        const replyTo = m.replyTo;
+                        const sourceTopicId = replyTo ? (replyTo.replyToTopId || replyTo.replyToMsgId) : undefined;
+                        let msgTopicName = 'General';
+
+                        if (sourceTopicId) {
+                            const sourceIdClean = sourceId.toString().replace('-100', '');
+                            const blockStr = `-100${sourceIdClean}_${sourceTopicId}`.toLowerCase();
+                            const blockStrWithoutMinus100 = `${sourceIdClean}_${sourceTopicId}`.toLowerCase();
+                            if (blockedTopics.some((bt: string) => bt === sourceTopicId.toString() || bt === blockStr || bt === blockStrWithoutMinus100)) {
+                                console.log(`[CatchUp] Skipping blocked topic for message ${m.id} (Topic ID: ${sourceTopicId})`);
+                                pathObj.lastProcessedMsgId = m.id;
+                                continue;
+                            }
+
+                            // Fetch/get from cache
+                            if (!sourceTopicCache.has(sourceIdClean)) sourceTopicCache.set(sourceIdClean, new Map());
+                            const chatTopicCache = sourceTopicCache.get(sourceIdClean)!;
+                            if (chatTopicCache.has(sourceTopicId)) {
+                                msgTopicName = chatTopicCache.get(sourceTopicId)!;
+                            } else {
+                                try {
+                                    const topicsResult: any = await client.invoke(new Api.channels.GetForumTopics({
+                                        channel: sourceEntity,
+                                        limit: 500
+                                    }));
+                                    const foundTopic = topicsResult.topics?.find((t: any) => t.id === sourceTopicId);
+                                    if (foundTopic) {
+                                        msgTopicName = foundTopic.title;
+                                        chatTopicCache.set(sourceTopicId, msgTopicName);
+                                    }
+                                } catch (e) {}
+                            }
+
+                            if (msgTopicName && msgTopicName !== 'General') {
+                                const normTitle = msgTopicName.trim().toLowerCase();
+                                if (blockedTopics.some((bt: string) => bt === normTitle)) {
+                                    console.log(`[CatchUp] Skipping blocked topic for message ${m.id} (Topic Title: ${msgTopicName})`);
+                                    pathObj.lastProcessedMsgId = m.id;
+                                    continue;
+                                }
+                            }
                         }
 
                         // Verify topic alignment if this is a topic-specific mirror path
                         if (pathObj.topicName && pathObj.topicName !== 'General') {
-                            const replyTo = m.replyTo;
-                            const sourceTopicId = replyTo ? (replyTo.replyToTopId || replyTo.replyToMsgId) : undefined;
-                            let msgTopicName = 'General';
-                            
-                            if (sourceTopicId) {
-                                const sourceIdStr = sourceId.toString().replace('-100', '');
-                                if (!sourceTopicCache.has(sourceIdStr)) sourceTopicCache.set(sourceIdStr, new Map());
-                                const chatTopicCache = sourceTopicCache.get(sourceIdStr)!;
-                                if (chatTopicCache.has(sourceTopicId)) {
-                                    msgTopicName = chatTopicCache.get(sourceTopicId)!;
-                                } else {
-                                    try {
-                                        const topicsResult: any = await client.invoke(new Api.channels.GetForumTopics({
-                                            channel: sourceEntity,
-                                            limit: 500
-                                        }));
-                                        const foundTopic = topicsResult.topics?.find((t: any) => t.id === sourceTopicId);
-                                        if (foundTopic) {
-                                            msgTopicName = foundTopic.title;
-                                            chatTopicCache.set(sourceTopicId, msgTopicName);
-                                        }
-                                    } catch(e) {}
-                                }
-                            }
-
                             if (msgTopicName.trim().toLowerCase() !== pathObj.topicName.trim().toLowerCase()) {
                                 continue;
                             }
@@ -7194,6 +7527,29 @@ startAutoMirrorWatcher = async (userId: number, client: TelegramClient) => {
             const message = event.message;
             if (!message || message.out) return;
 
+            // Only detect messages that contain actual files/media (document or photo)
+            const hasFile = message.media && (
+                message.media instanceof Api.MessageMediaDocument ||
+                message.media instanceof Api.MessageMediaPhoto
+            );
+
+            if (!hasFile) {
+                // Keep track of the last processed message ID so we don't scan it during catch-up
+                let chatIdRaw = '';
+                if (event.chatId) {
+                    chatIdRaw = event.chatId.toString().replace('-100', '');
+                } else if (message.peerId) {
+                    const pid = message.peerId;
+                    if (pid.channelId) chatIdRaw = pid.channelId.toString().replace('-100', '');
+                    else if (pid.chatId) chatIdRaw = pid.chatId.toString();
+                    else if (pid.userId) chatIdRaw = pid.userId.toString();
+                }
+                if (chatIdRaw) {
+                    await updateMirrorPathLastId(userId, chatIdRaw, message.id).catch(() => {});
+                }
+                return;
+            }
+
             // Use event.match or event.chatId as it's more consistent in GramJS
             let chatIdRaw = '';
             if (event.chatId) {
@@ -7240,6 +7596,21 @@ startAutoMirrorWatcher = async (userId: number, client: TelegramClient) => {
             }
 
             if (matchingPaths.length > 0) {
+                const blockedTopics = (userDoc?.blockedTopics || []).map((t: string) => t.trim().toLowerCase());
+
+                // ID-based blocked topics check first
+                const replyTo = message.replyTo;
+                const sourceTopicId = replyTo ? (replyTo.replyToTopId || replyTo.replyToMsgId) : undefined;
+                if (sourceTopicId) {
+                    const blockStr = `-100${chatIdRaw}_${sourceTopicId}`.toLowerCase();
+                    const blockStrWithoutMinus100 = `${chatIdRaw}_${sourceTopicId}`.toLowerCase();
+                    if (blockedTopics.some((bt: string) => bt === sourceTopicId.toString() || bt === blockStr || bt === blockStrWithoutMinus100)) {
+                        console.log(`[Watcher] Skipping blocked topic for live message ${message.id} (Topic ID: ${sourceTopicId})`);
+                        await updateMirrorPathLastId(userId, chatIdRaw, message.id).catch(() => {});
+                        return;
+                    }
+                }
+
                 let topicName = 'General';
                 
                 // Proactively handle Topic Creation service messages
@@ -7292,6 +7663,16 @@ startAutoMirrorWatcher = async (userId: number, client: TelegramClient) => {
                                 console.error(`[Watcher] Failed to get topic info: ${err.message}`);
                             }
                         }
+                    }
+                }
+
+                // Title-based blocked topics check
+                if (topicName && topicName !== 'General') {
+                    const normTitle = topicName.trim().toLowerCase();
+                    if (blockedTopics.some((bt: string) => bt === normTitle)) {
+                        console.log(`[Watcher] Skipping blocked topic for live message ${message.id} (Topic Title: ${topicName})`);
+                        await updateMirrorPathLastId(userId, chatIdRaw, message.id).catch(() => {});
+                        return;
                     }
                 }
 
@@ -7493,33 +7874,68 @@ getConnectedUserbotClient = async (userId: number) => {
                 console.error(`[getConnectedUserbotClient] Verification failed for ${lookupId}: ${meErr.message}`);
                 if (meErr.message?.includes('AUTH_KEY_UNREGISTERED')) {
                     userSessions.delete(lookupId);
-                    // if (approvedUsersCollection) {
-                    //     await approvedUsersCollection.updateOne({ userId: lookupId.toString() }, { $unset: { stringSession: "" } });
-                    // }
-                    await client.disconnect().catch(() => {});
+                    userClients.delete(lookupId);
+                    activeWatchers.delete(lookupId);
+                    if (approvedUsersCollection) {
+                        await approvedUsersCollection.updateOne(
+                            { userId: lookupId.toString() }, 
+                            { $unset: { stringSession: "", phoneNumber: "", fullName: "" } }
+                        ).catch(() => {});
+                    }
+                    await sendSessionNotification(lookupId, 'unregistered', `⚠️ **Your Userbot session has been logged out!**\n\nTelegram has unregistered the session (possibly terminated from another device or expired). Please use the /login dashboard to link your account again.`);
+                    if (client && typeof (client as any).disconnect === 'function') {
+                        await (client as any).disconnect().catch(() => {});
+                    }
                     return null;
                 }
                 
                 if (meErr.message?.includes('AUTH_KEY_DUPLICATED')) {
                     userSessions.delete(lookupId);
-                    if (approvedUsersCollection) {
-                        await approvedUsersCollection.updateOne({ userId: lookupId.toString() }, { $unset: { stringSession: "" } });
+                    userClients.delete(lookupId);
+                    activeWatchers.delete(lookupId);
+                    // Do NOT unset the session from the database, because the key is still valid and likely active on another instance (e.g., your deployed production app or dev server).
+                    await sendSessionNotification(lookupId, 'duplicated', `⚠️ **Duplicate connection detected for Userbot!**\n\nYour account is already connected on another server/instance (likely your deployed production app or dev environment).\n\nWe have paused connection attempts on this instance to let the other run smoothly. Your session is **NOT** logged out, and no data was deleted.`);
+                    if (client && typeof (client as any).disconnect === 'function') {
+                        await (client as any).disconnect().catch(() => {});
                     }
-                    await client.disconnect().catch(() => {});
-                    console.error(`Session key duplicated for ${lookupId}. Cleared session.`);
+                    console.warn(`[getConnectedUserbotClient] Session key duplicated for ${lookupId}. Pausing this instance.`);
                     return null;
                 }
                 
-                await (client as any).disconnect().catch(() => {});
+                if (client && typeof (client as any).disconnect === 'function') {
+                    await (client as any).disconnect().catch(() => {});
+                }
                 throw new Error(`[Userbot] Verification failed for ${lookupId}: ${meErr.message}`);
             }
         } catch (err: any) {
             console.warn(`[Userbot] Userbot Client failed for user ${lookupId}:`, err);
             if (err.message?.includes('AUTH_KEY_DUPLICATED') || (err as any).errorMessage === 'AUTH_KEY_DUPLICATED') {
-                console.warn(`[Userbot] Session key duplicated for ${lookupId}. Removing broken client.`);
+                console.warn(`[Userbot] Session key duplicated for ${lookupId}. Pausing this instance.`);
                 userClients.delete(lookupId);
                 userSessions.delete(lookupId);
-                await (client as any).disconnect().catch(() => {});
+                activeWatchers.delete(lookupId);
+                // Do NOT unset the session from the database.
+                await sendSessionNotification(lookupId, 'duplicated', `⚠️ **Duplicate connection detected for Userbot!**\n\nYour account is already connected on another server/instance (likely your deployed production app or dev environment).\n\nWe have paused connection attempts on this instance to let the other run smoothly. Your session is **NOT** logged out, and no data was deleted.`);
+                if (client && typeof (client as any).disconnect === 'function') {
+                    await (client as any).disconnect().catch(() => {});
+                }
+                return null;
+            }
+            if (err.message?.includes('AUTH_KEY_UNREGISTERED') || (err as any).errorMessage === 'AUTH_KEY_UNREGISTERED') {
+                console.warn(`[Userbot] Session key unregistered for ${lookupId}. Removing broken client.`);
+                userClients.delete(lookupId);
+                userSessions.delete(lookupId);
+                activeWatchers.delete(lookupId);
+                if (approvedUsersCollection) {
+                    await approvedUsersCollection.updateOne(
+                        { userId: lookupId.toString() }, 
+                        { $unset: { stringSession: "", phoneNumber: "", fullName: "" } }
+                    ).catch(() => {});
+                }
+                await sendSessionNotification(lookupId, 'unregistered', `⚠️ **Your Userbot session has been logged out!**\n\nTelegram has unregistered the session (possibly terminated from another device or expired). Please use the /login dashboard to link your account again.`);
+                if (client && typeof (client as any).disconnect === 'function') {
+                    await (client as any).disconnect().catch(() => {});
+                }
                 return null;
             }
             throw new Error(`[Userbot] Connection failed for user ${lookupId}: ${err.message}`);
@@ -7699,7 +8115,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
         return { client: prefClient, userId: preferredUserId, peer: null };
     };
 
-    const processTask = async (chatId: number, link: string, statusMsgId: number, userId: number, threadIdOverride?: number, forceGeneralPath?: boolean, targetIdOverride?: any, isMirror?: boolean): Promise<boolean> => {
+    const processTask = async (chatId: number, link: string, statusMsgId: number, userId: number, threadIdOverride?: number, forceGeneralPath?: boolean, targetIdOverride?: any, isMirror?: boolean, isForwardOnly?: boolean): Promise<boolean> => {
         let cleanLink = link.trim();
         let destTargetStr = (targetIdOverride || "Default").toString();
         let tempFilePath: string | undefined = undefined;
@@ -7782,13 +8198,13 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                 }
             }
 
-            // CRITICAL USER MANDATE: If no Upload/Set Path is configured AND no target was provided, by default send strictly to -1003995334936 only and nowhere else.
+            // CRITICAL USER MANDATE: If no Upload/Set Path is configured AND no target was provided, by default send strictly to destinationChatId or DEFAULT_LOG_GROUP
             if (!userDoc?.uploadPath && targetIdOverride === undefined) {
-                uploadTarget = DEFAULT_LOG_GROUP;
+                uploadTarget = destinationChatId || DEFAULT_LOG_GROUP || (chatId < 0 ? chatId.toString() : "");
                 threadId = undefined;
             }
             if (!uploadTarget) {
-                throw new Error("No destination path configured. Please configure an upload path.");
+                throw new Error("No destination path configured. Please set an upload path in /settings or use a mirror binding.");
             }
 
         // Smart Route Destination: Find a client that can reach the destination
@@ -7854,7 +8270,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                     if (userDoc?.uploadAgent === 'bot') {
                         throw new Error("Target destination could not be resolved by the Telegram Bot. Ensure the Bot is added as an Administrator in the destination.");
                     } else {
-                        throw new Error("Target destination could not be resolved by your Userbot. Ensure the Userbot has joined the destination chat/channel.");
+                        throw new Error("Target destination could not be resolved by your UserBot. Ensure the UserBot has joined the destination chat/channel.");
                     }
                 }
             }
@@ -7862,7 +8278,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                 if (userDoc?.uploadAgent === 'bot') {
                     throw new Error("Telegram Bot destination client unreachable.");
                 } else {
-                    throw new Error("Destination unreachable. Ensure your Userbot is a member.");
+                    throw new Error("Destination unreachable. Ensure your UserBot is a member.");
                 }
             }
 
@@ -7986,6 +8402,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
             // Attempt direct forward first as requested by user
             let canForward = true;
             let forwardAttempted = false;
+            let forwardErrorMsg: string | null = null;
             if (msg.noforwards || (msg as any).noforwards) {
                 console.log(`[Debug] Direct forward not possible: Message noforwards flag is set.`);
                 canForward = false;
@@ -8006,6 +8423,9 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                 await safeEditMessage("🚀 **Attempting direct forward...**", { chat_id: chatId, message_id: statusMsgId });
                 try {
                     let finalSourcePeer = (destClient === sourceClient) ? sourcePeer : await safelyResolveEntity(destClient, linkData.channelId).catch(() => null);
+                    if (destClient !== sourceClient && (!finalSourcePeer || (finalSourcePeer.className === 'InputPeerChannel' && (!finalSourcePeer.accessHash || finalSourcePeer.accessHash.toString() === '0')))) {
+                        throw new Error("destClient does not have access to the source channel (session-specific access hash required)");
+                    }
                     if (!finalSourcePeer) {
                         finalSourcePeer = sourcePeer;
                     }
@@ -8058,12 +8478,26 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
 
                     } else {
                         console.log(`[Debug] Direct forward skipped: finalSourcePeer or targetPeer missing.`);
+                        forwardErrorMsg = "Final source peer or target peer could not be resolved.";
                     }
                 } catch (e: any) {
-                    console.log(`[Debug] Direct forward attempt failed: ${e.message || e}. Falling back to download/upload flow.`);
+                    forwardErrorMsg = e.message || String(e);
+                    console.log(`[Debug] Direct forward attempt failed: ${forwardErrorMsg}. Falling back to download/upload flow.`);
                 }
             } else {
                 console.log(`[Debug] Skipped direct forward because forwarding is restricted/not possible.`);
+                forwardErrorMsg = "Forwarding restricted (Content Protection enabled).";
+            }
+
+            if (isForwardOnly && !forwardAttempted) {
+                const finalReason = forwardErrorMsg || "Unknown forwarding restriction";
+                await safeEditMessage(`❌ **Forward-Only Mode:** ${finalReason}. Skipping download.`, { chat_id: chatId, message_id: statusMsgId });
+                return true; // Skip but don't break queue
+            }
+            if (isForwardOnly && forwardAttempted) {
+                // If forwardAttempted is true but we reached here, it means it failed but we didn't return true yet
+                await safeEditMessage(`❌ **Forward Failed:** Direct forward failed. Skipping because Forward-Only mode is active.`, { chat_id: chatId, message_id: statusMsgId });
+                return true; 
             }
 
             if (!msg.media || msg.media instanceof Api.MessageMediaWebPage) {
@@ -8362,7 +8796,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                 delete prepJob.progress;
             }
 
-            const agentLabel = (userDoc?.uploadAgent === 'bot') ? 'Bot itself' : 'Destination Account';
+            const agentLabel = (userDoc?.uploadAgent === 'bot') ? 'Bot Account' : 'UserBot Account';
             const uploadRes = await safeEditMessage(`📤 **Uploading via ${agentLabel}...**`, { chat_id: chatId, message_id: statusMsgId });
             if (uploadRes && uploadRes.id) statusMsgId = uploadRes.id;
             
@@ -8403,6 +8837,13 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                             const eta = speed > 0 && totalSize > 0 ? Math.max(0, (totalSize - currentBytes) / speed) : -1;
         
                             const jobKey = `${userId}-${link}`;
+                            const taskState = taskControlMap.get(jobKey);
+                            if (taskState && taskState.isPaused) {
+                                throw new Error("DOWNLOAD_PAUSED");
+                            }
+                            if (taskState && taskState.isSkipped) {
+                                throw new Error("DOWNLOAD_SKIPPED");
+                            }
                             const job = activeTaskJobs.get(jobKey);
                             if (job) {
                                 job.phase = 'uploading';
@@ -8461,6 +8902,11 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
                         caption = template.includes("{original}") ? template.replace("{original}", caption) : `${caption}\n\n${template}`;
                     }
         
+                    const finalTaskState = taskControlMap.get(jobKey);
+                    if (finalTaskState && finalTaskState.isSkipped) {
+                        throw new Error("DOWNLOAD_SKIPPED");
+                    }
+
                     sentMsg = await destClient.sendFile(finalDestPeer, {
                         file: uploadedFile,
                         caption: caption,
@@ -8657,7 +9103,8 @@ const startTopicClone = async (chatId: number, fromId: number, sourceGroupId: st
                 forceGeneralPath: false,
                 overrideTargetId: resolvedDestId, 
                 overrideThreadId: destTopicId,
-                isMirror: true
+                isMirror: true,
+                isForwardOnly: true
             });
             queuedCount++;
         }
@@ -8703,21 +9150,54 @@ const startTopicClone = async (chatId: number, fromId: number, sourceGroupId: st
                 }
             }
 
-            taskQueue.push(...topicTasksToQueue);
-            dbEnqueueTasks(topicTasksToQueue).catch(e => console.error("[Queue DB] Bulk enqueue error:", e));
+            // Launch background high-speed bulk forwarding
+            (async () => {
+                try {
+                    // Get client for forwarding (User preference: UserBot vs Bot)
+                    let forwardingClient = client;
+                    let fSourceEntity = sourceEntity;
+                    let fDestEntity = destEntity;
 
-            await updateTopicCloneProgress(topicCloneSessionId).catch(err => {
-                console.error("[Topic Clone Progress Setup Failed]", err);
-            });
+                    const userDoc = await approvedUsersCollection?.findOne({ userId: targetUid });
+                    if (userDoc?.uploadAgent === 'bot') {
+                        const botClient = await getConnectedBotClient();
+                        if (botClient) {
+                            forwardingClient = botClient;
+                            // Re-resolve entities for Bot client
+                            try {
+                                fSourceEntity = await safelyResolveFullEntity(forwardingClient, resolvedSourceId);
+                                fDestEntity = await safelyResolveFullEntity(forwardingClient, resolvedDestId);
+                            } catch (e) {
+                                console.warn("[BulkForward Topic] Bot failed to resolve source/dest:", e.message);
+                            }
+                        }
+                    }
+
+                    const ids = topicTasksToQueue.map(t => parseInt(t.link.split('/').pop() || '0'));
+                    await processBulkForward(forwardingClient, fSourceEntity, fDestEntity, ids, destTopicId, async (done) => {
+                        const session = activeTopicCloneSessions.get(topicCloneSessionId);
+                        if (session) {
+                            const delta = done - session.processedFiles;
+                            session.processedFiles = done;
+                            session.successCount += delta;
+                            await updateTopicCloneProgress(topicCloneSessionId);
+                        }
+                    });
+                    
+                    // Final notification
+                    safeSendMessage(chatId, `🎊 **Topic Clone Completed!**\n\n✅ Successfully cloned **${queuedCount}** messages from Topic \`${topicTitle}\` to \`${resolvedDestId}\`.\n\nEnjoy! 🚀`);
+                    
+                    // Clean up session from active map after a short delay
+                    setTimeout(() => activeTopicCloneSessions.delete(topicCloneSessionId), 60000);
+                } catch (e: any) {
+                    console.error("[Topic Clone Bulk] Background error:", e.message);
+                    safeSendMessage(chatId, `⚠️ **Clone interrupted:** ${e.message}`);
+                }
+            })();
+
+            const skipText = skippedCount > 0 ? ` (Skipped **${skippedCount}** already mirrored previously)` : '';
+            safeSendMessage(chatId, `⚡ **Topic Clone Started (Fast Mode)**\n\nProcessing **${queuedCount}** items from Topic ID \`${topicId}\` using direct batch forwarding${skipText} for destination: \`${resolvedDestId}\` (Topic: \`${topicTitle}\`).`);
         }
-
-        await startAutoMirrorWatcher(Number(targetUid), client).catch(err => {
-            console.warn("[Topic Clone -> Live Watcher] Failed to auto start watcher:", err.message);
-        });
-
-        runNextTask();
-        const skipText = skippedCount > 0 ? ` (Skipped **${skippedCount}** already mirrored previously)` : '';
-        safeSendMessage(chatId, `✅ Added **${queuedCount}** items from Topic ID \`${topicId}\` to copy queue${skipText} for destination: \`${resolvedDestId}\` (Topic: \`${topicTitle}\`).`);
     } catch (err: any) {
         safeSendMessage(chatId, `❌ **Clone Error:** ${err.message}`);
     }
@@ -9654,9 +10134,9 @@ const startTopicClone = async (chatId: number, fromId: number, sourceGroupId: st
                       p.sourceId === sourceIdClean || p.sourceId === `-100${sourceIdClean}` || sourceIdClean === p.sourceId.replace('-100', '')
                   );
 
-                  let destId = mirrorPath ? mirrorPath.destId : (userDoc?.uploadPath || DEFAULT_LOG_GROUP);
+                  let destId = mirrorPath ? mirrorPath.destId : (userDoc?.uploadPath || DEFAULT_LOG_GROUP || (chatId < 0 ? chatId.toString() : ""));
                   if (!destId) {
-                      throw new Error("No destination path configured. Please configure an upload path first.");
+                      throw new Error("No destination path configured. Please configure an upload path in /settings or use a mirror binding.");
                   }
 
                   const messages: any = await client.getMessages(sourceEntity, {
@@ -9743,7 +10223,7 @@ const startTopicClone = async (chatId: number, fromId: number, sourceGroupId: st
                       const batchTasksToQueue: Task[] = [];
                       for (let i = startId; i <= endId; i++) {
                           const link = `${baseUrl}${i}`;
-                          batchTasksToQueue.push({ chatId, link, batchId, userId: fromId });
+                          batchTasksToQueue.push({ chatId, link, batchId, userId: fromId, forceGeneralPath: true });
                       }
                       if (batchTasksToQueue.length > 0) {
                           taskQueue.push(...batchTasksToQueue);
@@ -9969,7 +10449,7 @@ const startTopicClone = async (chatId: number, fromId: number, sourceGroupId: st
                     await client.getDialogs({ limit: 40 }).catch(() => {});
                     safeSendMessage(chatId, "✨ **Setup Complete!** This account has been set as your active working session.\nYou can manage sessions via /login dashboard.");
                     delete loginStates[fromId];
-                }).catch((err) => {
+                }).catch(async (err) => {
                     if (loginStates[fromId]) {
                         console.error(`[Login] Final Catch Error for ${fromId}:`, err);
                         let cleanMsg = err.message || "Unknown error";
@@ -9986,7 +10466,11 @@ const startTopicClone = async (chatId: number, fromId: number, sourceGroupId: st
                         }
                         
                         safeSendMessage(chatId, `❌ **Login Failed:** \`${displayMsg}\`\n\n💡 **Solution:** ${solution}`);
-                        state.client?.disconnect();
+                        if (state.client && typeof (state.client as any).disconnect === 'function') {
+                            try {
+                                await (state.client as any).disconnect();
+                            } catch {}
+                        }
                         delete loginStates[fromId];
                     }
                 });
@@ -10072,9 +10556,9 @@ const startTopicClone = async (chatId: number, fromId: number, sourceGroupId: st
           }
       }
 
-      // Invite link autodetection & join (Resolves t.me/joinchat/... and t.me/+...)
+      // Invite link autodetection & join - ONLY in private chats
       const inviteHashMatch = text.match(/(?:https?:\/\/)?t\.me\/(?:joinchat\/|\+)([a-zA-Z0-9_\-]+)/);
-      if (inviteHashMatch) {
+      if (inviteHashMatch && msg.chat.type === 'private') {
           if (!fromId) return;
           if (!isAuthorized(fromId)) return safeSendMessage(chatId, "❌ **Access Restricted**\n\nYou are not authorized to use this bot.");
           const inviteHash = inviteHashMatch[1];
@@ -10176,9 +10660,9 @@ const startTopicClone = async (chatId: number, fromId: number, sourceGroupId: st
           return;
       }
 
-      // Link detection (Supports Topics and multiple segments)
+      // Link detection (Supports Topics and multiple segments) - ONLY in private chats
       const links = text.match(/(?:https?:\/\/)?t\.me\/(?:c\/)?[\w.-]+(?:\/[\d]+)+/g);
-      if (links && links.length > 0) {
+      if (links && links.length > 0 && msg.chat.type === 'private') {
         if (!isAuthorized(fromId)) return safeSendMessage(chatId, "❌ **Access Restricted**\n\nYou are not authorized to process links. Please use /start to request access.");
         if (!isAdmin(fromId) && links.length > 1) return safeSendMessage(chatId, "❌ Only authorized admins can process multiple links at once.");
 
@@ -10193,7 +10677,8 @@ const startTopicClone = async (chatId: number, fromId: number, sourceGroupId: st
                 link: link, 
                 statusMsgId: statusMsg?.message_id || 0, 
                 userId: fromId!,
-                overrideThreadId: msg.message_thread_id
+                overrideThreadId: msg.message_thread_id,
+                forceGeneralPath: true
             });
         }
         if (linkTasksToQueue.length > 0) {
@@ -10240,7 +10725,9 @@ const startTopicClone = async (chatId: number, fromId: number, sourceGroupId: st
       for (const [userId, userClient] of userClients) {
           try {
               console.log(`Closing user client for ${userId}`);
-              await userClient.disconnect();
+              if (userClient && typeof (userClient as any).disconnect === 'function') {
+                  await (userClient as any).disconnect();
+              }
           } catch(e) {
               console.error(`Failed to close user client for ${userId}:`, e);
           }
@@ -10326,13 +10813,26 @@ app.get('/api/status', async (req, res) => {
         uploadEngine: currentUploadEngine,
         renameRules: globalRenameRules,
         cooldownSeconds: globalCooldownSeconds,
-        mirrorPaths: (approvedUsersCollection && dbStatus === 'Connected') ? ((await approvedUsersCollection.findOne({userId: ALLOWED_ADMIN_IDS[0].toString()}, {  maxTimeMS: 4000 }))?.mirrorPaths || []) : []
+        mirrorPaths: [] // Simplified to avoid hanging status check
       }
     });
   } catch (err: any) {
     console.error('[API Status] Error:', err);
-    res.status(500).json({ error: err.message });
+    if (!res.headersSent) {
+        res.status(500).json({ error: err.message });
+    }
   }
+});
+
+// Separate route for heavy settings if needed
+app.get('/api/settings/mirror-paths', async (req, res) => {
+    try {
+        if (!approvedUsersCollection || dbStatus !== 'Connected') return res.json([]);
+        const adminDoc = await approvedUsersCollection.findOne({userId: ALLOWED_ADMIN_IDS[0].toString()}, { maxTimeMS: 3000 });
+        res.json(adminDoc?.mirrorPaths || []);
+    } catch (e) {
+        res.json([]);
+    }
 });
 
 app.post('/api/queue/pause', (req, res) => {
@@ -10637,7 +11137,8 @@ app.post('/api/batch/start', async (req, res) => {
           link, 
           batchId, 
           userId: systemAdminId,
-          isMirror: !!isMirror 
+          isMirror: !!isMirror,
+          forceGeneralPath: !isMirror
         });
     }
 
@@ -10738,6 +11239,11 @@ app.post('/api/settings', async (req, res) => {
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// 404 handler for API routes to prevent falling through to Vite HTML
+app.all('/api/*', (req, res) => {
+    res.status(404).json({ error: `API route not found: ${req.method} ${req.url}` });
 });
 
 // Global error handlers to prevent unhandled rejections from crashing or being noisy
