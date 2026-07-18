@@ -198,6 +198,7 @@ export default function App() {
   const [apiHashInput, setApiHashInput] = useState('');
   const [libSelection, setLibSelection] = useState('GramJS');
   const [uploadEngineSelection, setUploadEngineSelection] = useState('GramJS');
+  const [uploadMethodSelection, setUploadMethodSelection] = useState('bot');
   const [renameRules, setRenameRules] = useState<Array<{ keyword: string; replaceWith: string }>>([]);
   const [newKeyword, setNewKeyword] = useState('');
   const [newReplaceWith, setNewReplaceWith] = useState('');
@@ -220,6 +221,7 @@ export default function App() {
       setApiHashInput(data.settings.apiHash || '');
       setLibSelection(data.settings.downloadLibrary || 'GramJS');
       setUploadEngineSelection(data.settings.uploadEngine || 'GramJS');
+      setUploadMethodSelection(data.settings.uploadMethod || 'bot');
       if (data.settings.renameRules) {
         setRenameRules(data.settings.renameRules);
       }
@@ -245,6 +247,7 @@ export default function App() {
           apiHash: apiHashInput,
           downloadLibrary: libSelection,
           uploadEngine: uploadEngineSelection,
+          uploadMethod: uploadMethodSelection,
           renameRules: renameRules,
           cooldownSeconds: cooldownInput,
           proxy: data?.proxy
@@ -1362,6 +1365,34 @@ export default function App() {
                         {lib}
                       </button>
                     ))}
+                  </div>
+                </div>
+              </div>
+
+              {/* Upload Method Selection */}
+              <div className="pt-4 border-t border-slate-100 dark:border-slate-800/80">
+                <label className="block text-[10px] font-bold text-sky-500 uppercase tracking-widest mb-3">Upload Method (Who performs the upload?)</label>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <p className="text-[10px] text-slate-500 leading-relaxed">
+                      Select if files should be uploaded by the Telegram Bot (Bot Token) or by your connected User ID (Session).
+                    </p>
+                    <div className="flex gap-2">
+                      {['bot', 'user'].map((method) => (
+                        <button
+                          key={method}
+                          type="button"
+                          onClick={() => setUploadMethodSelection(method)}
+                          className={`flex-1 py-3 rounded-2xl text-[10px] font-bold border transition-all ${
+                            uploadMethodSelection === method 
+                              ? 'bg-sky-600 border-sky-500 text-white shadow-md' 
+                              : 'bg-slate-100 dark:bg-slate-800/80 border-slate-200 dark:border-slate-800 text-slate-500 hover:border-slate-400 dark:hover:border-slate-700'
+                          }`}
+                        >
+                          {method === 'bot' ? 'Bot Account' : 'User Account'}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 </div>
               </div>
