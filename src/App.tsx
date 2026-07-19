@@ -160,9 +160,14 @@ export default function App() {
       }
     };
 
-    fetchData();
-    const interval = setInterval(fetchData, 3000); // Fast feed updates
-    return () => clearInterval(interval);
+    let timeoutId: any;
+    const poll = async () => {
+      await fetchData();
+      timeoutId = setTimeout(poll, 5000);
+    };
+
+    poll();
+    return () => clearTimeout(timeoutId);
   }, []);
 
   // Real-time local countdown ticker for smooth, responsive decrementing on Dashboard

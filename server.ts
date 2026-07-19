@@ -192,9 +192,9 @@ async function getConnectedBotClient(): Promise<TelegramClient | null> {
             apiIdValue,
             apiHashValue,
             {
-                connectionRetries: 10,
-                timeout: 300000,
-                requestRetries: 10,
+                connectionRetries: 30,
+                timeout: 600000,
+                requestRetries: 25,
                 ...getRandomDeviceProps(),
                 useWSS: false,
                 autoReconnect: true,
@@ -206,7 +206,7 @@ async function getConnectedBotClient(): Promise<TelegramClient | null> {
         });
         let timeoutId: any;
         const timeoutPromise = new Promise((_, reject) => {
-            timeoutId = setTimeout(() => reject(new Error("GramJS bot start timeout after 300000ms")), 300000);
+            timeoutId = setTimeout(() => reject(new Error("GramJS bot start timeout after 600000ms")), 600000);
         });
         await Promise.race([startPromise, timeoutPromise]);
         clearTimeout(timeoutId);
@@ -350,6 +350,7 @@ interface Task {
     overrideTargetId?: any;
     isMirror?: boolean;
     isForwardOnly?: boolean;
+    skipForwarding?: boolean;
     retries?: number;
     fullMirrorSessionId?: string;
     topicCloneSessionId?: string;
@@ -1578,7 +1579,7 @@ async function safelyResolveFullEntity(client: TelegramClient, entity: any): Pro
 const adminActiveSession = new Map<number, number>(); // adminTelegramId -> activeUserbotUserId
 
 const userActionStates: Record<number, { 
-    type: 'batch_start' | 'batch_end' | 'mirror_target' | 'set_thumb' | 'set_cap' | 'set_path' | 'mirror_choice' | 'set_mirror_source' | 'enter_topic_id' | 'mirror_path_add_source' | 'mirror_path_await_dest' | 'topic_clone_group' | 'topic_clone_topic_id' | 'topic_clone_start_link' | 'add_rename_rule' | 'set_api_id' | 'set_api_hash' | 'full_mirror_group' | 'full_mirror_dest_select' | 'live_mirror_dest_select' | 'set_cooldown_secs' | 'set_concurrency_val' | 'topic_clone_dest_select' | 'enter_clone_dest_id' | 'set_jump_to_path' | 'add_blocked_topic' | 'enter_manual_specific_topic' | 'forward_start_link' | 'set_source_id' | 'set_dest_id' | 'forward_end_link', 
+    type: 'batch_start' | 'batch_end' | 'mirror_target' | 'set_thumb' | 'set_cap' | 'set_path' | 'mirror_choice' | 'set_mirror_source' | 'enter_topic_id' | 'mirror_path_add_source' | 'mirror_path_await_dest' | 'topic_clone_group' | 'topic_clone_topic_id' | 'topic_clone_start_link' | 'topic_clone_mode_select' | 'add_rename_rule' | 'set_api_id' | 'set_api_hash' | 'full_mirror_group' | 'full_mirror_dest_select' | 'full_mirror_mode_select' | 'live_mirror_dest_select' | 'set_cooldown_secs' | 'set_concurrency_val' | 'topic_clone_dest_select' | 'enter_clone_dest_id' | 'set_jump_to_path' | 'add_blocked_topic' | 'enter_manual_specific_topic' | 'forward_start_link' | 'set_source_id' | 'set_dest_id' | 'forward_end_link', 
     startLink?: string,
     mirrorTarget?: any,
     pendingMirrorDest?: string,
@@ -1589,6 +1590,9 @@ const userActionStates: Record<number, {
     cloneSourceGroupId?: string,
     cloneTopicId?: number,
     cloneStartMsgId?: number,
+    startMsgId?: number,
+    isLiveOption?: boolean,
+    destIdx?: number,
     pendingSourceName?: string
 }> = {};
 
@@ -1672,9 +1676,9 @@ async function runActiveWatchdog() {
 // MongoDB Connection & Settings Loading
 if (mongoUri) {
   client = new MongoClient(mongoUri, {
-    connectTimeoutMS: 5000,
-    socketTimeoutMS: 5000,
-    serverSelectionTimeoutMS: 5000,
+    connectTimeoutMS: 30000,
+    socketTimeoutMS: 30000,
+    serverSelectionTimeoutMS: 30000,
   });
   client.connect()
     .then(async () => {
@@ -1767,6 +1771,8 @@ if (mongoUri) {
                       isMirror: dbTask.isMirror,
                       fullMirrorSessionId: dbTask.fullMirrorSessionId,
                       topicCloneSessionId: dbTask.topicCloneSessionId,
+                      isForwardOnly: dbTask.isForwardOnly,
+                      skipForwarding: dbTask.skipForwarding,
                       retries: dbTask.retries !== undefined ? Number(dbTask.retries) : 0
                   };
                   taskQueue.push(restored);
@@ -1781,7 +1787,7 @@ if (mongoUri) {
       }
 
       // Load persistent settings first
-      const settings = await settingsCollection.findOne({ type: 'global_config' });
+      const settings = await settingsCollection.findOne({ type: 'global_config' }, { maxTimeMS: 20000 });
       if (settings) {
         if (settings.adminId) currentAdminId = settings.adminId;
         if (settings.destinationChatId) destinationChatId = settings.destinationChatId;
@@ -3258,16 +3264,20 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
           return bot?.answerCallbackQuery(query.id, { text: '❌ Session expired.', show_alert: true });
       }
 
-      const sourceGroupId = state.cloneSourceGroupId!;
-      const destGroupId = state.pendingCloneDest!;
-      const topicId = state.cloneTopicId!;
-      delete userActionStates[query.from.id];
+      state.type = 'topic_clone_mode_select';
+      state.startMsgId = undefined;
 
       bot?.answerCallbackQuery(query.id);
-      // Remove inline keyboard by editing
-      safeEditMessage(`🎯 **Clone Specific Topic**\n\nStarting from the beginning...`, { chat_id: chatId, message_id: query.message!.message_id });
-      
-      startTopicClone(chatId, query.from.id, sourceGroupId, destGroupId, topicId, undefined);
+      safeEditMessage(`🎯 **Select Download Mode**\n\nHow do you want to clone the content?\n\n• **Fast Mode**: Uses direct Telegram forwarding.\n• **Normal Mode**: Bot downloads and then uploads each file.`, {
+          chat_id: chatId,
+          message_id: query.message!.message_id,
+          reply_markup: {
+              inline_keyboard: [
+                  [{ text: '⚡ Fast Download (Forward)', callback_data: `tc_mode_fast` }],
+                  [{ text: '📥 Normal Download (Bot)', callback_data: `tc_mode_normal` }]
+              ]
+          }
+      });
       return;
   }
 
@@ -3895,23 +3905,81 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
 
           const isLiveOption = query.data.startsWith('fmlive_yes_');
           const idx = parseInt(query.data.split('_')[2]);
-          const settingsUid = await resolveSettingsUserId(query.from.id);
-          const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
-          const dest = (userDoc?.savedDestinations || [])[idx];
-          if (!dest) {
-              return bot?.answerCallbackQuery(query.id, { text: '❌ Destination not found.', show_alert: true });
+          
+          state.type = 'full_mirror_mode_select';
+          state.isLiveOption = isLiveOption;
+          state.destIdx = idx;
+
+          await safeEditMessage(`🔄 **Select Mirror Mode**\n\nHow do you want to copy the history?\n\n• **Fast Mode**: Uses direct Telegram forwarding (Fastest).\n• **Normal Mode**: Bot downloads and uploads each file (Compatible).`, {
+              chat_id: chatId,
+              message_id: query.message!.message_id,
+              reply_markup: {
+                  inline_keyboard: [
+                      [{ text: '⚡ Fast Mode (Forward)', callback_data: `fm_mode_fast` }],
+                      [{ text: '📥 Normal Mode (Bot)', callback_data: `fm_mode_normal` }]
+                  ]
+              }
+          });
+          bot?.answerCallbackQuery(query.id);
+          return;
+      }
+
+      if (query.data === 'tc_mode_fast' || query.data === 'tc_mode_normal') {
+          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+          const state = userActionStates[query.from.id];
+          if (!state || state.type !== 'topic_clone_mode_select') {
+              return bot?.answerCallbackQuery(query.id, { text: '❌ Session expired.', show_alert: true });
           }
 
-          const sourceId = state.pendingSourceId!;
+          const mode = query.data === 'tc_mode_fast' ? 'fast' : 'normal';
+          const sourceGroupId = state.cloneSourceGroupId!;
+          const destGroupId = state.pendingCloneDest!;
+          const topicId = state.cloneTopicId!;
+          const startMsgId = state.startMsgId;
           delete userActionStates[query.from.id];
 
-          const statusMsg = await safeSendMessage(chatId, `📂 **Starting Full Mirror...**\nSource Group: \`${sourceId}\`\nFetching history, this may take a moment depending on the group size.`);
+          bot?.answerCallbackQuery(query.id);
+          safeEditMessage(`🎯 **Clone Specific Topic**\n\nMode: **${mode === 'fast' ? 'Fast (Forward)' : 'Normal (Download)'}**\nStarting...`, { chat_id: chatId, message_id: query.message!.message_id });
+          
+          startTopicClone(chatId, query.from.id, sourceGroupId, destGroupId, topicId, startMsgId, mode);
+          return;
+      }
+
+      if (query.data === 'fm_mode_fast' || query.data === 'fm_mode_normal') {
+          if (!isAdmin(query.from.id)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
+          const state = userActionStates[query.from.id];
+          if (!state || state.type !== 'full_mirror_mode_select') {
+              return bot?.answerCallbackQuery(query.id, { text: '❌ Session expired.', show_alert: true });
+          }
+
+          const mode = query.data === 'fm_mode_fast' ? 'fast' : 'normal';
+          const sourceId = state.pendingSourceId!;
+          const destIdx = state.destIdx!;
+          const isLiveOption = state.isLiveOption!;
+          delete userActionStates[query.from.id];
+
+          bot?.answerCallbackQuery(query.id);
+          safeEditMessage(`🔄 **Full Mirror**\n\nMode: **${mode === 'fast' ? 'Fast (Forward)' : 'Normal (Download)'}**\nStarting...`, { chat_id: chatId, message_id: query.message!.message_id });
+          
+          startFullMirror(chatId, query.from.id, sourceId, destIdx, isLiveOption, mode);
+          return;
+      }
+
+      async function startFullMirror(chatId: number, fromId: number, sourceId: string, destIdx: number, isLiveOption: boolean, mirrorMode: 'fast' | 'normal' = 'fast') {
+          const statusMsg = await safeSendMessage(chatId, `📂 **Starting Full Mirror (${mirrorMode === 'fast' ? 'Fast' : 'Normal'} Mode)...**\nSource Group: \`${sourceId}\`\nFetching history, this may take a moment depending on the group size.`);
+          const isForwardOnly = mirrorMode === 'fast';
+          const skipForwarding = mirrorMode === 'normal';
           
           try {
-              const targetUid = Number(await resolveSettingsUserId(query.from.id));
+              const targetUid = Number(await resolveSettingsUserId(fromId));
               const client = await getConnectedUserbotClient(targetUid);
               if (!client) throw new Error("Your Userbot session is not active. Please /login first.");
               
+              const settingsUid = await resolveSettingsUserId(fromId);
+              const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
+              const dest = (userDoc?.savedDestinations || [])[destIdx];
+              if (!dest) throw new Error("Destination not found.");
+
               let sourceEntity: any;
               try {
                   sourceEntity = await safelyResolveFullEntity(client, sourceId);
@@ -3979,8 +4047,7 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
               const alreadyMirroredLinks = new Set(alreadyMirroredDocs.map((doc: any) => doc.link));
 
               // Load blocked topics to skip
-              const settingsUidForBlock = await resolveSettingsUserId(query.from.id);
-              const userDocForBlock = await approvedUsersCollection?.findOne({ userId: settingsUidForBlock });
+              const userDocForBlock = await approvedUsersCollection?.findOne({ userId: settingsUid });
               const blockedTopics = (userDocForBlock?.blockedTopics || []).map((t: string) => t.trim().toLowerCase());
 
               let skippedCount = 0;
@@ -4067,12 +4134,13 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                   msgsToQueue.push({ 
                       chatId, 
                       link: virtualLink, 
-                       userId: query.from.id,
+                      userId: fromId,
                       forceGeneralPath: true,
                       overrideThreadId,
                       overrideTargetId: destPath,
                       isMirror: true,
-                      isForwardOnly: true
+                      isForwardOnly,
+                      skipForwarding
                    });
               }
 
@@ -4196,61 +4264,79 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                   }
               }
 
-              // Launch background high-speed bulk forwarding
-              (async () => {
-                  try {
-                      // Use the initiating client (Userbot) for forwarding
-                      let forwardingClient = client;
-                      let fSourceEntity = sourceEntity;
-                      let fDestEntity = destEntity;
+              if (isForwardOnly) {
+                  // Launch background high-speed bulk forwarding (FAST MODE)
+                  (async () => {
+                      try {
+                          // Use the initiating client (Userbot) for forwarding
+                          let forwardingClient = client;
+                          let fSourceEntity = sourceEntity;
+                          let fDestEntity = destEntity;
 
-                      // 1. Process General Tasks (no specific sub-topic in source)
-                      if (generalTasks.length > 0) {
-                          const ids = generalTasks.map(t => parseInt(t.link.split('/').pop() || '0'));
-                          await processBulkForward(forwardingClient, fSourceEntity, fDestEntity, ids, dest.destThreadId, async (done) => {
-                              const session = activeFullMirrorSessions.get(sessionId);
-                              if (session) {
-                                  const prevDone = session.topicStats['general']?.processed || 0;
-                                  const delta = done - prevDone;
-                                  session.processedFiles += delta;
-                                  session.successCount += delta;
-                                  if (!session.topicStats['general']) session.topicStats['general'] = { processed: 0, total: generalTasks.length, title: 'General Discussion', isMarkedCompleted: false };
-                                  session.topicStats['general'].processed = done;
-                                  await updateGlobalMirrorProgress(sessionId);
-                              }
-                          });
+                          // 1. Process General Tasks (no specific sub-topic in source)
+                          if (generalTasks.length > 0) {
+                              const ids = generalTasks.map(t => parseInt(t.link.split('/').pop() || '0'));
+                              await processBulkForward(forwardingClient, fSourceEntity, fDestEntity, ids, dest.destThreadId, async (done) => {
+                                  const session = activeFullMirrorSessions.get(sessionId);
+                                  if (session) {
+                                      const prevDone = session.topicStats['general']?.processed || 0;
+                                      const delta = done - prevDone;
+                                      session.processedFiles += delta;
+                                      session.successCount += delta;
+                                      if (!session.topicStats['general']) session.topicStats['general'] = { processed: 0, total: generalTasks.length, title: 'General Discussion', isMarkedCompleted: false };
+                                      session.topicStats['general'].processed = done;
+                                      await updateGlobalMirrorProgress(sessionId);
+                                  }
+                              });
+                          }
+                          
+                          // 2. Process Topic Tasks
+                          for (const [topicId, tasks] of tasksByTopic.entries()) {
+                              const ids = tasks.map(t => parseInt(t.link.split('/').pop() || '0'));
+                              await processBulkForward(forwardingClient, fSourceEntity, fDestEntity, ids, topicId as number, async (done) => {
+                                  const session = activeFullMirrorSessions.get(sessionId);
+                                  if (session) {
+                                      const prevDone = session.topicStats[topicId]?.processed || 0;
+                                      const delta = done - prevDone;
+                                      session.processedFiles += delta;
+                                      session.successCount += delta;
+                                      session.topicStats[topicId].processed = done;
+                                      await updateGlobalMirrorProgress(sessionId);
+                                  }
+                              });
+                          }
+                          
+                          // Final notification
+                          safeSendMessage(chatId, `🎊 **Full Mirror Completed!**\n\n✅ Successfully mirrored **${orderedTasks.length}** messages from \`${sourceId}\` to \`${dest.groupName}\`.\n\nEnjoy your content! 🚀`);
+                          
+                          // Clean up session from active map after a short delay
+                          setTimeout(() => activeFullMirrorSessions.delete(sessionId), 60000);
+                      } catch (e: any) {
+                          console.error("[Full Mirror Bulk] Background error:", e.message);
+                          safeSendMessage(chatId, `⚠️ **Mirror interrupted:** ${e.message}`);
                       }
-                      
-                      // 2. Process Topic Tasks
-                      for (const [topicId, tasks] of tasksByTopic.entries()) {
-                          const ids = tasks.map(t => parseInt(t.link.split('/').pop() || '0'));
-                          await processBulkForward(forwardingClient, fSourceEntity, fDestEntity, ids, topicId as number, async (done) => {
-                              const session = activeFullMirrorSessions.get(sessionId);
-                              if (session) {
-                                  const prevDone = session.topicStats[topicId]?.processed || 0;
-                                  const delta = done - prevDone;
-                                  session.processedFiles += delta;
-                                  session.successCount += delta;
-                                  session.topicStats[topicId].processed = done;
-                                  await updateGlobalMirrorProgress(sessionId);
-                              }
-                          });
-                      }
-                      
-                      // Final notification
-                      safeSendMessage(chatId, `🎊 **Full Mirror Completed!**\n\n✅ Successfully mirrored **${orderedTasks.length}** messages from \`${sourceId}\` to \`${dest.groupName}\`.\n\nEnjoy your content! 🚀`);
-                      
-                      // Clean up session from active map after a short delay
-                      setTimeout(() => activeFullMirrorSessions.delete(sessionId), 60000);
-                  } catch (e: any) {
-                      console.error("[Full Mirror Bulk] Background error:", e.message);
-                      safeSendMessage(chatId, `⚠️ **Mirror interrupted:** ${e.message}`);
+                  })();
+              } else {
+                  // NORMAL MODE: Add to processing queue
+                  if (queuedTasksCollection) {
+                      await queuedTasksCollection.insertMany(orderedTasks.map(t => ({
+                          ...t,
+                          status: 'queued',
+                          addedAt: new Date().toISOString(),
+                          retries: 0
+                      })));
                   }
-              })();
+                  for (const t of orderedTasks) {
+                      taskQueue.push(t);
+                  }
+                  runNextTask();
+              }
 
               if (statusMsg) {
                   const skipText = skippedCount > 0 ? ` (Skipped **${skippedCount}** already mirrored previously)` : '';
-                  await safeEditMessage(`⚡ **Full Mirror Started (Fast Mode)**\n\nProcessing **${orderedTasks.length}** items using direct batch forwarding.${skipText}\nDestination path: \`${destPath}\`.${liveMirrorSuccessInfo}`, {
+                  const modeText = isForwardOnly ? 'Fast Mode' : 'Normal Mode';
+                  const methodText = isForwardOnly ? 'direct batch forwarding' : 'standard download/upload queue';
+                  await safeEditMessage(`⚡ **Full Mirror Started (${modeText})**\n\nProcessing **${orderedTasks.length}** items using ${methodText}.${skipText}\nDestination path: \`${destPath}\`.${liveMirrorSuccessInfo}`, {
                       chat_id: chatId,
                       message_id: statusMsg.message_id
                   });
@@ -6787,6 +6873,8 @@ async function dbEnqueueTask(task: Task) {
                 isMirror: task.isMirror,
                 fullMirrorSessionId: task.fullMirrorSessionId,
                 topicCloneSessionId: task.topicCloneSessionId,
+                isForwardOnly: task.isForwardOnly,
+                skipForwarding: task.skipForwarding,
                 createdAt: new Date()
             });
         } catch (err) {
@@ -7169,7 +7257,7 @@ runNextTask = async () => {
                 finalDone = true;
             } else {
                 // Task timeout is completely removed as requested, allowing unlimited download time for large content.
-                success = await processTask(task.chatId, task.link, statusMsgId, fromId, task.overrideThreadId, task.forceGeneralPath, task.overrideTargetId, task.isMirror, task.isForwardOnly);
+                success = await processTask(task.chatId, task.link, statusMsgId, fromId, task.overrideThreadId, task.forceGeneralPath, task.overrideTargetId, task.isMirror, task.isForwardOnly, task.skipForwarding);
                 finalDone = true;
             }
         } catch (taskErr: any) {
@@ -7512,6 +7600,9 @@ async function catchUpLiveMirrors(userId: number, client: TelegramClient) {
                             }
                         }
 
+                        // Small delay between processing catch-up items to prevent TIMEOUTs
+                        await sleep(300);
+                        
                         const destId = pathObj.destId;
                         let destTopicId = pathObj.destThreadId ? Number(pathObj.destThreadId) : undefined;
 
@@ -7896,9 +7987,9 @@ getConnectedUserbotClient = async (userId: number) => {
                 apiIdValue,
                 apiHashValue,
                 {
-                    connectionRetries: 20,
+                    connectionRetries: 30,
                     timeout: 600000,
-                    requestRetries: 15,
+                    requestRetries: 25,
                     ...getRandomDeviceProps(),
                     useWSS: false,
                     autoReconnect: true,
@@ -8200,7 +8291,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
         return { client: prefClient, userId: preferredUserId, peer: null };
     };
 
-    const processTask = async (chatId: number, link: string, statusMsgId: number, userId: number, threadIdOverride?: number, forceGeneralPath?: boolean, targetIdOverride?: any, isMirror?: boolean, isForwardOnly?: boolean): Promise<boolean> => {
+    const processTask = async (chatId: number, link: string, statusMsgId: number, userId: number, threadIdOverride?: number, forceGeneralPath?: boolean, targetIdOverride?: any, isMirror?: boolean, isForwardOnly?: boolean, skipForwarding?: boolean): Promise<boolean> => {
         let cleanLink = link.trim();
         let destTargetStr = (targetIdOverride || "Default").toString();
         let tempFilePath: string | undefined = undefined;
@@ -8498,7 +8589,11 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
             }
 
             // Attempt direct forward first as requested by user
-            let canForward = true;
+            let canForward = (skipForwarding === true) ? false : true;
+            if (isForwardOnly === false && skipForwarding === true) {
+                canForward = false;
+            }
+            
             let forwardAttempted = false;
             let forwardErrorMsg: string | null = null;
             if (msg.noforwards || (msg as any).noforwards) {
@@ -9137,8 +9232,10 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
         }
     };
 
-const startTopicClone = async (chatId: number, fromId: number, sourceGroupId: string, destGroupId: string, topicId: number, startMsgId?: number) => {
-    await safeSendMessage(chatId, `📂 **Starting Specific Topic Clone...**\nSource: \`${sourceGroupId}\`\nTopic ID: \`${topicId}\`\nDest: \`${destGroupId}\`${startMsgId ? `\nStart Msg ID: \`${startMsgId}\`` : ''}`);
+async function startTopicClone(chatId: number, fromId: number, sourceGroupId: string, destGroupId: string, topicId: number, startMsgId?: number, mirrorMode: 'fast' | 'normal' = 'fast') {
+    const isForwardOnly = mirrorMode === 'fast';
+    const skipForwarding = mirrorMode === 'normal';
+    await safeSendMessage(chatId, `📂 **Starting Specific Topic Clone (${mirrorMode === 'fast' ? 'Fast' : 'Normal'} Mode)...**\nSource: \`${sourceGroupId}\`\nTopic ID: \`${topicId}\`\nDest: \`${destGroupId}\`${startMsgId ? `\nStart Msg ID: \`${startMsgId}\`` : ''}`);
     try {
         const targetUid = Number(await resolveSettingsUserId(fromId));
         const client = await getConnectedUserbotClient(targetUid);
@@ -9208,7 +9305,8 @@ const startTopicClone = async (chatId: number, fromId: number, sourceGroupId: st
                 overrideTargetId: resolvedDestId, 
                 overrideThreadId: destTopicId,
                 isMirror: true,
-                isForwardOnly: true
+                isForwardOnly,
+                skipForwarding
             });
             queuedCount++;
         }
@@ -9254,52 +9352,71 @@ const startTopicClone = async (chatId: number, fromId: number, sourceGroupId: st
                 }
             }
 
-            // Launch background high-speed bulk forwarding
-            (async () => {
-                try {
-                    // Get client for forwarding (User preference: UserBot vs Bot)
-                    let forwardingClient = client;
-                    let fSourceEntity = sourceEntity;
-                    let fDestEntity = destEntity;
+            if (isForwardOnly) {
+                // Launch background high-speed bulk forwarding (FAST MODE)
+                (async () => {
+                    try {
+                        // Get client for forwarding (User preference: UserBot vs Bot)
+                        let forwardingClient = client;
+                        let fSourceEntity = sourceEntity;
+                        let fDestEntity = destEntity;
 
-                    const userDoc = await approvedUsersCollection?.findOne({ userId: targetUid });
-                    if (true) {
-                          const botClient = await getConnectedBotClient();
-                          if (!botClient) throw new Error("Bot client not available for forced bot mirroring.");
-                          forwardingClient = botClient;
-                             // Re-resolve entities for Bot client
-                             try {
-                                 fSourceEntity = await safelyResolveFullEntity(forwardingClient, resolvedSourceId);
-                                 fDestEntity = await safelyResolveFullEntity(forwardingClient, resolvedDestId);
-                             } catch (e) {
-                                 console.warn("[BulkForward Topic] Bot failed to resolve source/dest:", e.message);
-                             }
-                        }
+                        const userDoc = await approvedUsersCollection?.findOne({ userId: targetUid });
+                        if (true) {
+                              const botClient = await getConnectedBotClient();
+                              if (!botClient) throw new Error("Bot client not available for forced bot mirroring.");
+                              forwardingClient = botClient;
+                                 // Re-resolve entities for Bot client
+                                 try {
+                                     fSourceEntity = await safelyResolveFullEntity(forwardingClient, resolvedSourceId);
+                                     fDestEntity = await safelyResolveFullEntity(forwardingClient, resolvedDestId);
+                                 } catch (e) {
+                                     console.warn("[BulkForward Topic] Bot failed to resolve source/dest:", e.message);
+                                 }
+                            }
 
-                    const ids = topicTasksToQueue.map(t => parseInt(t.link.split('/').pop() || '0'));
-                    await processBulkForward(forwardingClient, fSourceEntity, fDestEntity, ids, destTopicId, async (done) => {
-                        const session = activeTopicCloneSessions.get(topicCloneSessionId);
-                        if (session) {
-                            const delta = done - session.processedFiles;
-                            session.processedFiles = done;
-                            session.successCount += delta;
-                            await updateTopicCloneProgress(topicCloneSessionId);
-                        }
-                    });
-                    
-                    // Final notification
-                    safeSendMessage(chatId, `🎊 **Topic Clone Completed!**\n\n✅ Successfully cloned **${queuedCount}** messages from Topic \`${topicTitle}\` to \`${resolvedDestId}\`.\n\nEnjoy! 🚀`);
-                    
-                    // Clean up session from active map after a short delay
-                    setTimeout(() => activeTopicCloneSessions.delete(topicCloneSessionId), 60000);
-                } catch (e: any) {
-                    console.error("[Topic Clone Bulk] Background error:", e.message);
-                    safeSendMessage(chatId, `⚠️ **Clone interrupted:** ${e.message}`);
+                        const ids = topicTasksToQueue.map(t => parseInt(t.link.split('/').pop() || '0'));
+                        await processBulkForward(forwardingClient, fSourceEntity, fDestEntity, ids, destTopicId, async (done) => {
+                            const session = activeTopicCloneSessions.get(topicCloneSessionId);
+                            if (session) {
+                                const delta = done - session.processedFiles;
+                                session.processedFiles = done;
+                                session.successCount += delta;
+                                await updateTopicCloneProgress(topicCloneSessionId);
+                            }
+                        });
+                        
+                        // Final notification
+                        safeSendMessage(chatId, `🎊 **Topic Clone Completed!**\n\n✅ Successfully cloned **${queuedCount}** messages from Topic \`${topicTitle}\` to \`${resolvedDestId}\`.\n\nEnjoy! 🚀`);
+                        
+                        // Clean up session from active map after a short delay
+                        setTimeout(() => activeTopicCloneSessions.delete(topicCloneSessionId), 60000);
+                    } catch (e: any) {
+                        console.error("[Topic Clone Bulk] Background error:", e.message);
+                        safeSendMessage(chatId, `⚠️ **Clone interrupted:** ${e.message}`);
+                    }
+                })();
+            } else {
+                // NORMAL MODE: Add to processing queue
+                if (queuedTasksCollection) {
+                    await queuedTasksCollection.insertMany(topicTasksToQueue.map(t => ({
+                        ...t,
+                        status: 'queued',
+                        topicCloneSessionId,
+                        addedAt: new Date().toISOString(),
+                        retries: 0
+                    })));
                 }
-            })();
+                for (const t of topicTasksToQueue) {
+                    taskQueue.push({ ...t, topicCloneSessionId });
+                }
+                runNextTask();
+            }
 
             const skipText = skippedCount > 0 ? ` (Skipped **${skippedCount}** already mirrored previously)` : '';
-            safeSendMessage(chatId, `⚡ **Topic Clone Started (Fast Mode)**\n\nProcessing **${queuedCount}** items from Topic ID \`${topicId}\` using direct batch forwarding${skipText} for destination: \`${resolvedDestId}\` (Topic: \`${topicTitle}\`).`);
+            const modeText = isForwardOnly ? 'Fast Mode' : 'Normal Mode';
+            const methodText = isForwardOnly ? 'direct batch forwarding' : 'standard download/upload queue';
+            safeSendMessage(chatId, `⚡ **Topic Clone Started (${modeText})**\n\nProcessing **${queuedCount}** items from Topic ID \`${topicId}\` using ${methodText}${skipText} for destination: \`${resolvedDestId}\` (Topic: \`${topicTitle}\`).`);
         }
     } catch (err: any) {
         safeSendMessage(chatId, `❌ **Clone Error:** ${err.message}`);
@@ -10191,7 +10308,6 @@ const startTopicClone = async (chatId: number, fromId: number, sourceGroupId: st
               const sourceGroupId = state.cloneSourceGroupId!;
               const destGroupId = state.pendingCloneDest!;
               const topicId = state.cloneTopicId!;
-              delete userActionStates[fromId];
 
               let startMsgId: number | undefined = undefined;
               if (text.toLowerCase() !== 'all') {
@@ -10207,7 +10323,17 @@ const startTopicClone = async (chatId: number, fromId: number, sourceGroupId: st
                   }
               }
 
-              startTopicClone(chatId, fromId, sourceGroupId, destGroupId, topicId, startMsgId);
+              state.type = 'topic_clone_mode_select';
+              state.startMsgId = startMsgId;
+
+              safeSendMessage(chatId, `🎯 **Select Download Mode**\n\nHow do you want to clone the content?\n\n• **Fast Mode**: Uses direct Telegram forwarding (Fastest, but subject to content restrictions).\n• **Normal Mode**: Bot downloads and then uploads each file (Slower, but works on restricted content).`, {
+                  reply_markup: {
+                      inline_keyboard: [
+                          [{ text: '⚡ Fast Download (Forward)', callback_data: `tc_mode_fast` }],
+                          [{ text: '📥 Normal Download (Bot)', callback_data: `tc_mode_normal` }]
+                      ]
+                  }
+              });
               return;
           }
 
@@ -10423,9 +10549,9 @@ const startTopicClone = async (chatId: number, fromId: number, sourceGroupId: st
                 }
 
                 const client = new TelegramClient(new StringSession(""), apiIdValue, apiHashValue, {
-                    connectionRetries: 20,
+                    connectionRetries: 30,
                     timeout: 600000,
-                    requestRetries: 15,
+                    requestRetries: 25,
                     ...getRandomDeviceProps(),
                     floodSleepThreshold: 300,
                     proxy: undefined,
@@ -10930,7 +11056,7 @@ app.get('/api/status', async (req, res) => {
 app.get('/api/settings/mirror-paths', async (req, res) => {
     try {
         if (!approvedUsersCollection || dbStatus !== 'Connected') return res.json([]);
-        const adminDoc = await approvedUsersCollection.findOne({userId: ALLOWED_ADMIN_IDS[0].toString()}, { maxTimeMS: 3000 });
+        const adminDoc = await approvedUsersCollection.findOne({userId: ALLOWED_ADMIN_IDS[0].toString()}, { maxTimeMS: 15000 });
         res.json(adminDoc?.mirrorPaths || []);
     } catch (e) {
         res.json([]);
@@ -10985,7 +11111,7 @@ app.post('/api/queue/prioritize-item', (req, res) => {
 
 app.get('/api/failed/list', async (req, res) => {
   try {
-     const failed = (failedTasksCollection && dbStatus === 'Connected') ? await failedTasksCollection.find({}, { maxTimeMS: 4000 }).sort({ failedAt: -1 }).toArray() : [];
+     const failed = (failedTasksCollection && dbStatus === 'Connected') ? await failedTasksCollection.find({}, { maxTimeMS: 20000 }).sort({ failedAt: -1 }).toArray() : [];
      res.json({ failed });
   } catch (err: any) {
      res.status(500).json({ error: err.message });
@@ -11025,7 +11151,7 @@ app.get('/api/mirrored/history', async (req, res) => {
     let logs = [...inMemoryMirrorLogs];
     if (mirroredMessagesCollection && dbStatus === 'Connected') {
       try {
-        const dbLogs = await mirroredMessagesCollection.find({}, { maxTimeMS: 4000 }).sort({ mirroredAt: -1 }).limit(100).toArray();
+        const dbLogs = await mirroredMessagesCollection.find({}, { maxTimeMS: 20000 }).sort({ mirroredAt: -1 }).limit(100).toArray();
         const mappedDbLogs = dbLogs.map((log: any) => ({
           link: log.link,
           destId: log.destId,
@@ -11290,7 +11416,7 @@ app.post('/api/setpath', async (req, res) => {
 
 app.post('/api/settings', async (req, res) => {
   if (!settingsCollection) return res.status(503).json({ error: 'Database not ready' });
-  const { adminId, stringSession, destinationChatId: newDestId, apiId: newApiId, apiHash: newApiHash, downloadLibrary, uploadEngine, renameRules, proxy, cooldownSeconds } = req.body;
+  const { adminId, stringSession, destinationChatId: newDestId, apiId: newApiId, apiHash: newApiHash, downloadLibrary, uploadEngine, uploadMethod, renameRules, proxy, cooldownSeconds } = req.body;
   try {
     const updateData: any = {};
     if (adminId) updateData.adminId = adminId;
@@ -11441,7 +11567,9 @@ async function startServer() {
     app.use(express.static(distPath));
     app.get('*', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
   }
-  app.listen(port, '0.0.0.0', () => console.log(`Server: http://0.0.0.0:${port}`));
+  const server = app.listen(port, '0.0.0.0', () => console.log(`Server: http://0.0.0.0:${port}`));
+  server.timeout = 600000;
+  server.keepAliveTimeout = 650000;
 }
 
 startServer();
