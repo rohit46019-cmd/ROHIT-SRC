@@ -10,7 +10,10 @@ export default function SystemStatusBar() {
     const fetchSystemStatus = async () => {
       try {
         const [logsRes, sessionsRes] = await Promise.all([fetch('/api/logs'), fetch('/api/sessions')]);
-        if (logsRes.ok) setLogs(await logsRes.json());
+        if (logsRes.ok) {
+          const data = await logsRes.json();
+          setLogs(data.logs || []);
+        }
         if (sessionsRes.ok) setSessions(await sessionsRes.json());
       } catch (e) { console.error(e); }
     };

@@ -7,3 +7,42 @@
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
 }
 
+:root {
+  font-size: 13px; /* Slightly smaller base font as requested */
+}
+
+@layer base {
+  body {
+    @apply bg-slate-50 text-slate-900 dark:bg-[#020617] dark:text-slate-200 antialiased selection:bg-sky-500/30;
+  }
+}
+
+.custom-scrollbar::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  @apply bg-transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  @apply bg-slate-300 dark:bg-slate-800 rounded-full;
+}
+
+.glass-panel {
+  @apply bg-white/80 dark:bg-slate-900/80 backdrop-blur-md border border-slate-200 dark:border-slate-800 shadow-sm;
+}
+
+.btn-primary {
+  @apply px-3 py-1.5 bg-sky-500 hover:bg-sky-600 text-white rounded-lg font-semibold text-[11px] transition-all active:scale-95 disabled:opacity-50;
+}
+
+.btn-secondary {
+  @apply px-3 py-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 rounded-lg font-semibold text-[11px] transition-all active:scale-95 disabled:opacity-50 border border-slate-200 dark:border-slate-700;
+}
+
+.btn-danger {
+  @apply px-3 py-1.5 bg-rose-500 hover:bg-rose-600 text-white rounded-lg font-semibold text-[11px] transition-all active:scale-95 disabled:opacity-50;
+}
+

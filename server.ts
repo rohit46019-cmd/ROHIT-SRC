@@ -12,7 +12,7 @@ import { StringSession } from 'telegram/sessions';
 import bigInt from 'big-integer';
 import { NewMessage } from 'telegram/events';
 
-let MAX_CONCURRENT_TASKS = 1; 
+let MAX_CONCURRENT_TASKS = 2; 
 let MAX_TASKS_PER_USER = 1;
 let activeTasksCount = 0;
 const activeTasksPerUser = new Map<number, number>();
@@ -208,8 +208,13 @@ async function getConnectedBotClient(): Promise<TelegramClient | null> {
         const timeoutPromise = new Promise((_, reject) => {
             timeoutId = setTimeout(() => reject(new Error("GramJS bot start timeout after 600000ms")), 600000);
         });
-        await Promise.race([startPromise, timeoutPromise]);
-        clearTimeout(timeoutId);
+        try {
+            await Promise.race([startPromise, timeoutPromise]);
+        } finally {
+            clearTimeout(timeoutId);
+            startPromise.catch(() => {});
+            timeoutPromise.catch(() => {});
+        }
         (client as any)._isBotInApp = true;
         connectedBotClient = client;
         console.log("[Bot GramJS Client] Successfully connected!");
@@ -526,9 +531,11 @@ async function resumeDownloadFile(
     let isFinished = false;
 
     let stallInterval: NodeJS.Timeout | null = null;
+    let downloadPromise: Promise<any> | null = null;
+    let monitorPromise: Promise<void> | null = null;
     try {
         await ensureClientConnected(client);
-        const downloadPromise = client.downloadMedia(msg, {
+        downloadPromise = client.downloadMedia(msg, {
             outputFile: tempFilePath,
             workers: downloadWorkers,
             partSizeKb: partSizeKb,
@@ -542,7 +549,7 @@ async function resumeDownloadFile(
             }
         });
 
-        const monitorPromise = new Promise<void>((_, reject) => {
+        monitorPromise = new Promise<void>((_, reject) => {
             stallInterval = setInterval(() => {
                 if (isFinished) {
                     if (stallInterval) clearInterval(stallInterval);
@@ -561,9 +568,12 @@ async function resumeDownloadFile(
         });
 
         await Promise.race([downloadPromise, monitorPromise]);
-        isFinished = true;
     } finally {
+        isFinished = true;
         if (stallInterval) clearInterval(stallInterval);
+        // Suppress unhandled rejections from whichever promise didn't finish first in the race
+        if (downloadPromise) downloadPromise.catch(() => {});
+        if (monitorPromise) monitorPromise.catch(() => {});
     }
 }
 
@@ -612,10 +622,14 @@ const safeBotCall = async (method: string, ...args: any[]) => {
                 if (lastArg && typeof lastArg === 'object' && lastArg.reply_markup) {
                     if (Object.keys(lastArg.reply_markup).length === 0) {
                         delete lastArg.reply_markup;
-                    } else if (lastArg.reply_markup.inline_keyboard && Array.isArray(lastArg.reply_markup.inline_keyboard)) {
-                        // Ensure no empty rows or invalid buttons
-                        lastArg.reply_markup.inline_keyboard = lastArg.reply_markup.inline_keyboard.filter((row: any) => Array.isArray(row) && row.length > 0);
-                        if (lastArg.reply_markup.inline_keyboard.length === 0) delete lastArg.reply_markup;
+                    } else if (typeof lastArg.reply_markup === 'object') {
+                        if (lastArg.reply_markup.inline_keyboard && Array.isArray(lastArg.reply_markup.inline_keyboard)) {
+                            // Ensure no empty rows or invalid buttons
+                            lastArg.reply_markup.inline_keyboard = lastArg.reply_markup.inline_keyboard.filter((row: any) => Array.isArray(row) && row.length > 0);
+                            if (lastArg.reply_markup.inline_keyboard.length === 0) {
+                                delete lastArg.reply_markup;
+                            }
+                        }
                     }
                 }
             }
@@ -1635,13 +1649,18 @@ async function runActiveWatchdog() {
                     try {
                         // Heartbeat ping check (10s timeout)
                         let timeoutId: any;
-                        await Promise.race([
-                            existingClient.getMe(),
-                            new Promise((_, reject) => {
-                                timeoutId = setTimeout(() => reject(new Error("Heartbeat Timeout")), 30000);
-                            })
-                        ]);
-                        clearTimeout(timeoutId);
+                        const heartbeatPromise = existingClient.getMe();
+                        const heartbeatTimeoutPromise = new Promise((_, reject) => {
+                            timeoutId = setTimeout(() => reject(new Error("Heartbeat Timeout")), 30000);
+                        });
+
+                        try {
+                            await Promise.race([heartbeatPromise, heartbeatTimeoutPromise]);
+                        } finally {
+                            clearTimeout(timeoutId);
+                            heartbeatPromise.catch(() => {});
+                            heartbeatTimeoutPromise.catch(() => {});
+                        }
                         healthy = true;
                     } catch (heartbeatErr: any) {
                         console.warn(`[Watchdog] User ${userId} heartbeat check failed: ${heartbeatErr.message}`);
@@ -1674,6 +1693,519 @@ async function runActiveWatchdog() {
 }
 
 // MongoDB Connection & Settings Loading
+// API Route registration block moved earlier for robustness
+app.use(express.json());
+
+// Request logger for API routes
+app.use('/api', (req, res, next) => {
+    console.log(`[API Request] ${req.method} ${req.url}`);
+    next();
+});
+
+app.get('/api/logs', (req, res) => res.json({ logs: sysLogs }));
+app.post('/api/logs/clear', (req, res) => {
+    sysLogs.length = 0;
+    res.json({ status: 'ok' });
+});
+app.get('/api/sessions', (req, res) => res.json(Array.from(userClients.keys())));
+
+app.get('/api/status', async (req, res) => {
+  try {
+    res.json({
+      status: botStatus,
+      dbStatus: dbStatus,
+      adminConfigured: !!currentAdminId,
+      botInfo: botInfo,
+      queueSize: taskQueue.length,
+      nextTaskIn: nextTaskRunAt ? Math.max(0, Math.round((nextTaskRunAt - Date.now()) / 1000)) : 0,
+      proxy: undefined,
+      isQueuePaused: isQueuePaused,
+      activeJobs: Array.from(activeTaskJobs.values()).map(job => ({
+        link: job.link,
+        phase: job.phase,
+        progress: job.progress ? {
+          percent: job.progress.percent,
+          current: job.progress.current,
+          total: job.progress.total,
+          speed: job.progress.speed,
+          elapsed: job.progress.elapsed,
+          eta: job.progress.eta
+        } : null,
+        cooldownRemaining: job.cooldownRemaining,
+        isMirror: job.isMirror
+      })),
+      batches: Array.from(batchStatusMap.entries()).map(([batchId, info]) => {
+        const remaining = info.total - info.processed;
+        const progress = info.total > 0 ? Math.floor((info.processed / info.total) * 100) : 0;
+        return {
+          batchId,
+          total: info.total,
+          processed: info.processed,
+          success: info.success,
+          failed: info.failed,
+          currentLink: info.currentLink,
+          startTime: info.startTime,
+          progress,
+          isActive: remaining > 0
+        };
+      }),
+      taskQueue: taskQueue.map(t => ({
+        link: t.link,
+        isMirror: t.isMirror,
+        userId: t.userId
+      })),
+      config: {
+        hasToken: !!token,
+        hasMongo: !!mongoUri,
+        hasTarget: !!destinationChatId
+      },
+      settings: {
+        adminId: currentAdminId,
+        destinationChatId: destinationChatId,
+        apiId: apiIdValue || null,
+        apiHash: apiHashValue || null,
+        downloadLibrary: currentDownloadLibrary,
+        uploadEngine: currentUploadEngine,
+        uploadMethod: currentUploadMethod,
+        renameRules: globalRenameRules,
+        cooldownSeconds: globalCooldownSeconds,
+        mirrorPaths: [] // Simplified to avoid hanging status check
+      }
+    });
+  } catch (err: any) {
+    console.error('[API Status] Error:', err);
+    if (!res.headersSent) {
+        res.status(500).json({ error: err.message });
+    }
+  }
+});
+
+// Separate route for heavy settings if needed
+app.get('/api/settings/mirror-paths', async (req, res) => {
+    try {
+        if (!approvedUsersCollection || dbStatus !== 'Connected') return res.json([]);
+        const adminDoc = await approvedUsersCollection.findOne({userId: ALLOWED_ADMIN_IDS[0].toString()}, { maxTimeMS: 15000 });
+        res.json(adminDoc?.mirrorPaths || []);
+    } catch (e) {
+        res.json([]);
+    }
+});
+
+app.post('/api/queue/pause', (req, res) => {
+  isQueuePaused = true;
+  res.json({ success: true });
+});
+
+app.post('/api/queue/resume', (req, res) => {
+  isQueuePaused = false;
+  if (typeof runNextTask === 'function') {
+    runNextTask();
+  }
+  res.json({ success: true });
+});
+
+app.post('/api/queue/clear', (req, res) => {
+  taskQueue.length = 0;
+  if (typeof dbClearAllTasks === 'function') {
+    dbClearAllTasks().catch(e => console.error("[Queue DB] Clear cancel-all error:", e));
+  }
+  res.json({ success: true });
+});
+
+app.post('/api/queue/cancel-item', (req, res) => {
+  const { index } = req.body;
+  if (index === undefined || index < 0 || index >= taskQueue.length) {
+    return res.status(400).json({ error: 'Invalid task queue index' });
+  }
+  const removed = taskQueue.splice(index, 1)[0];
+  if (typeof dbDequeueTask === 'function') {
+    dbDequeueTask(removed).catch(e => console.error("[Queue DB] Dequeue cancelled task error:", e));
+  }
+  res.json({ success: true, removed });
+});
+
+app.post('/api/queue/prioritize-item', (req, res) => {
+  const { index } = req.body;
+  if (index === undefined || index < 0 || index >= taskQueue.length) {
+    return res.status(400).json({ error: 'Invalid task queue index' });
+  }
+  if (index === 0) {
+    return res.json({ success: true, info: 'Task already at top' });
+  }
+  const chosen = taskQueue.splice(index, 1)[0];
+  taskQueue.unshift(chosen);
+  res.json({ success: true, chosen });
+});
+
+app.get('/api/failed/list', async (req, res) => {
+  try {
+     const failed = (failedTasksCollection && dbStatus === 'Connected') ? await failedTasksCollection.find({}, { maxTimeMS: 20000 }).sort({ failedAt: -1 }).toArray() : [];
+     res.json({ failed });
+  } catch (err: any) {
+     res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/failed/retry-all', async (req, res) => {
+  try {
+     const count = await retryAllFailedTasks();
+     res.json({ success: true, count });
+  } catch (err: any) {
+     res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/failed/retry-item', async (req, res) => {
+  const { id } = req.body;
+  try {
+     const success = await retryFailedTask(id);
+     res.json({ success });
+  } catch (err: any) {
+     res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/failed/clear', async (req, res) => {
+  try {
+     await clearAllFailedTasks();
+     res.json({ success: true });
+  } catch (err: any) {
+     res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/mirrored/history', async (req, res) => {
+  try {
+    let logs = [...inMemoryMirrorLogs];
+    if (mirroredMessagesCollection && dbStatus === 'Connected') {
+      try {
+        const dbLogs = await mirroredMessagesCollection.find({}, { maxTimeMS: 20000 }).sort({ mirroredAt: -1 }).limit(100).toArray();
+        const mappedDbLogs = dbLogs.map((log: any) => ({
+          link: log.link,
+          destId: log.destId,
+          mirroredAt: log.mirroredAt ? new Date(log.mirroredAt).toISOString() : new Date().toISOString(),
+          status: 'Success',
+          info: 'Fetched from database collection'
+        }));
+        
+        // Merge list preventing duplicates
+        const seen = new Set();
+        const merged = [];
+        for (const log of [...logs, ...mappedDbLogs]) {
+          const key = `${log.link}-${log.destId}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            merged.push(log);
+          }
+        }
+        return res.json({ logs: merged.slice(0, 100) });
+      } catch (dbErr) {
+        console.error("Database logs fetching error:", dbErr);
+      }
+    }
+    res.json({ logs });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message, logs: inMemoryMirrorLogs });
+  }
+});
+
+app.post('/api/mirrored/clear', async (req, res) => {
+  inMemoryMirrorLogs.length = 0;
+  if (mirroredMessagesCollection) {
+    try {
+      // Export before clearing
+      const data = await mirroredMessagesCollection.find({}).toArray();
+      const backupFilename = `/tmp/backup_mirrored_${Date.now()}.json`;
+      fs.writeFileSync(backupFilename, JSON.stringify(data, null, 2));
+      console.log(`[API clear history] Backup created at ${backupFilename}`);
+      
+      await mirroredMessagesCollection.deleteMany({});
+    } catch (err: any) {
+      console.error("[API clear history] Error clearing/backing up Mongo mirror history:", err);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+  res.json({ success: true });
+});
+
+app.post('/api/mirrored/export', async (req, res) => {
+  if (mirroredMessagesCollection) {
+    try {
+      const data = await mirroredMessagesCollection.find({}).toArray();
+      res.json({ success: true, data });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  } else {
+    res.status(500).json({ error: "No collection" });
+  }
+});
+
+app.post('/api/mirrored/import', async (req, res) => {
+  const { data } = req.body;
+  if (mirroredMessagesCollection && Array.isArray(data)) {
+    try {
+      await mirroredMessagesCollection.insertMany(data);
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  } else {
+    res.status(400).json({ error: "Invalid data" });
+  }
+});
+
+app.post('/api/queue/add', async (req, res) => {
+  const { link, isMirror } = req.body;
+  if (!link) return res.status(400).json({ error: 'Missing link' });
+  try {
+    const systemAdminId = Number(currentAdminId || ALLOWED_ADMIN_IDS[0] || 0);
+    const task: Task = {
+      chatId: systemAdminId,
+      userId: systemAdminId,
+      link,
+      isMirror: !!isMirror
+    };
+    taskQueue.push(task);
+    if (approvedUsersCollection) {
+      dbEnqueueTasks([task]).catch(e => console.error("[Queue DB] enqueue error:", e));
+    }
+    if (typeof runNextTask === 'function') {
+      runNextTask();
+    }
+    res.json({ success: true, task });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/system/restart', (req, res) => {
+  res.json({ success: true, message: 'Restarting bot server...' });
+  setTimeout(() => process.exit(0), 1000);
+});
+
+app.post('/api/system/reset', async (req, res) => {
+  try {
+    const stats = await performSystemReset();
+    res.json({ 
+      success: true, 
+      message: 'System reset performed successfully! Bot process is rebooting to start completely fresh...',
+      stats
+    });
+    setTimeout(() => {
+      console.log("[Reset API] Process restarting on admin request...");
+      process.exit(0);
+    }, 1500);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/system/ping', (req, res) => {
+  res.json({ success: true, message: 'Pong! Bot is active.' });
+});
+
+app.post('/api/system/cleartopics', (req, res) => {
+  topicMappingCache.clear();
+  res.json({ success: true, message: 'Topic cache cleared.' });
+});
+
+app.post('/api/system/logout', async (req, res) => {
+  const { adminId } = req.body;
+  if (!approvedUsersCollection) return res.status(503).json({ error: 'Database not ready' });
+  try {
+     const settingsUid = adminId || currentAdminId || ALLOWED_ADMIN_IDS[0]?.toString();
+     await approvedUsersCollection.updateOne({ userId: settingsUid }, { $unset: { stringSession: "" } });
+     userSessions.delete(Number(settingsUid));
+     res.json({ success: true, message: 'Logged out successfully.' });
+  } catch(e: any) {
+     res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/mirror/add-path', async (req, res) => {
+  const { sourceId, destId, groupName, destThreadId, destTopicName } = req.body;
+  if (!approvedUsersCollection) return res.status(503).json({ error: 'Database not ready' });
+  try {
+     const settingsUid = currentAdminId || ALLOWED_ADMIN_IDS[0]?.toString();
+     const newPath = { sourceId, destId, groupName: groupName || "App Mirror Target", destThreadId, destTopicName };
+     await approvedUsersCollection.updateOne(
+        { userId: settingsUid },
+        { $push: { mirrorPaths: newPath } } as any,
+        { upsert: true }
+     );
+     res.json({ success: true, message: 'Mirror path added.' });
+  } catch(e: any) {
+     res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/mirror/delete-path', async (req, res) => {
+  const { index } = req.body;
+  if (!approvedUsersCollection) return res.status(503).json({ error: 'Database not ready' });
+  try {
+     const settingsUid = currentAdminId || ALLOWED_ADMIN_IDS[0]?.toString();
+     const userDoc = await approvedUsersCollection.findOne({ userId: settingsUid });
+     const paths = userDoc?.mirrorPaths || [];
+     if (paths[index]) {
+         paths.splice(index, 1);
+         await approvedUsersCollection.updateOne({ userId: settingsUid }, { $set: { mirrorPaths: paths } });
+     }
+     res.json({ success: true, message: 'Mirror path removed.' });
+  } catch(e: any) {
+     res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/batch/start', async (req, res) => {
+  const { startLink, endLink, isMirror } = req.body;
+  if (!startLink || !endLink) return res.status(400).json({ error: 'Missing startLink or endLink' });
+  
+  try {
+    const startId = getMsgId(startLink);
+    const endId = getMsgId(endLink);
+    const baseUrl = startLink.substring(0, startLink.lastIndexOf('/') + 1);
+
+    if (isNaN(startId) || isNaN(endId)) throw new Error("Invalid range message IDs.");
+    if (endId < startId) throw new Error("End link ID must be greater than start link ID.");
+
+    const count = endId - startId + 1;
+    // Unlimited batch size as requested by user
+
+    const systemAdminId = Number(currentAdminId || ALLOWED_ADMIN_IDS[0] || 0);
+    const batchId = `batch_${Date.now()}_web`;
+
+    batchStatusMap.set(batchId, {
+      total: count,
+      processed: 0,
+      success: 0,
+      failed: 0,
+      startTime: Date.now(),
+      summaryMsgId: 0,
+      chatId: systemAdminId
+    });
+
+    const batchTasksToQueue: Task[] = [];
+    for (let i = startId; i <= endId; i++) {
+        const link = `${baseUrl}${i}`;
+        batchTasksToQueue.push({ 
+          chatId: systemAdminId, 
+          link, 
+          batchId, 
+          userId: systemAdminId,
+          isMirror: !!isMirror,
+          forceGeneralPath: !isMirror
+        });
+    }
+
+    if (batchTasksToQueue.length > 0) {
+        taskQueue.push(...batchTasksToQueue);
+        if (approvedUsersCollection) {
+          dbEnqueueTasks(batchTasksToQueue).catch(e => console.error("[Queue DB] Bulk enqueue error:", e));
+        }
+    }
+    
+    if (typeof runNextTask === 'function') {
+      runNextTask();
+    }
+    res.json({ success: true, count, batchId });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/setpath', async (req, res) => {
+    if (!approvedUsersCollection) return res.status(503).json({ error: 'Database not ready' });
+    const { chatId, topicId, groupTitle, topicName, userId } = req.body;
+    
+    try {
+        const adminIdStr = userId.toString();
+        const settingsUid = await resolveSettingsUserId(Number(userId));
+        
+        const update = { 
+            $set: { 
+                uploadPath: chatId.toString(),
+                uploadTopicId: topicId || null,
+                uploadGroupName: groupTitle,
+                uploadTopicName: topicName || ''
+            } 
+        };
+        
+        // Update both the admin's doc AND the session's doc to ensure settings persist
+        await approvedUsersCollection.updateOne({ userId: adminIdStr }, update);
+        if (settingsUid !== adminIdStr) {
+             await approvedUsersCollection.updateOne({ userId: settingsUid }, update);
+        }
+        res.json({ success: true });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/settings', async (req, res) => {
+  if (!settingsCollection) return res.status(503).json({ error: 'Database not ready' });
+  const { adminId, stringSession, destinationChatId: newDestId, apiId: newApiId, apiHash: newApiHash, downloadLibrary, uploadEngine, uploadMethod, renameRules, proxy, cooldownSeconds } = req.body;
+  try {
+    const updateData: any = {};
+    if (adminId) updateData.adminId = adminId;
+        if (stringSession) {
+            updateData.stringSession = stringSession;
+            const activeAdminId = adminId || currentAdminId || ALLOWED_ADMIN_IDS[0];
+            if (activeAdminId && approvedUsersCollection) {
+                await approvedUsersCollection.updateOne(
+                    { userId: activeAdminId.toString() },
+                    { $set: { stringSession } },
+                    { upsert: true }
+                );
+                userSessions.set(Number(activeAdminId), stringSession);
+                approvedUsersCache.add(activeAdminId.toString());
+            }
+        }
+    if (newDestId) updateData.destinationChatId = newDestId;
+        if (newApiId) {
+            updateData.apiId = newApiId;
+            apiIdValue = Number(newApiId);
+        }
+        if (newApiHash) {
+            updateData.apiHash = newApiHash;
+            apiHashValue = newApiHash;
+        }
+        if (downloadLibrary) {
+            updateData.downloadLibrary = downloadLibrary;
+            currentDownloadLibrary = downloadLibrary;
+        }
+        if (uploadEngine) {
+            updateData.uploadEngine = uploadEngine;
+            currentUploadEngine = uploadEngine;
+        }
+        if (uploadMethod) {
+            updateData.uploadMethod = uploadMethod;
+            currentUploadMethod = uploadMethod;
+        }
+        if (cooldownSeconds !== undefined) {
+             updateData.cooldownSeconds = Number(cooldownSeconds);
+             globalCooldownSeconds = Number(cooldownSeconds);
+        }
+        if (Array.isArray(renameRules)) {
+            updateData.renameRules = renameRules;
+            globalRenameRules = renameRules;
+        }
+
+        await settingsCollection.updateOne({ type: 'global_config' }, { $set: updateData }, { upsert: true });
+        
+        if (adminId) currentAdminId = adminId;
+        if (newDestId) destinationChatId = newDestId;
+        res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 404 handler for API routes to prevent falling through to Vite HTML
+app.all('/api/*', (req, res) => {
+    res.status(404).json({ error: `API route not found: ${req.method} ${req.url}` });
+});
+
 if (mongoUri) {
   client = new MongoClient(mongoUri, {
     connectTimeoutMS: 30000,
@@ -2190,12 +2722,16 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
             pathDisplay = `${name}${topic}`;
         }
 
+        const escapeMd = (str: string) => (str || '').replace(/[_*`[\]()]/g, '\\$&');
+
         let mirrorPathsText = '';
         if (userDoc?.mirrorPaths && userDoc.mirrorPaths.length > 0) {
             mirrorPathsText = `\n📂 **Mirror Pairings (${userDoc.mirrorPaths.length}):**\n`;
             userDoc.mirrorPaths.slice(0, 5).forEach((p: any, i: number) => {
-                const sourceName = p.sourceName || 'Target Group';
-                mirrorPathsText += `${i + 1}. **(${sourceName}) (${p.sourceId}) ➔ ${p.groupName}**${p.topicName !== 'General' ? ' (' + p.topicName + ')' : ''}\n`;
+                const sName = escapeMd(p.sourceName || 'Target Group');
+                const gName = escapeMd(p.groupName || 'Dest Group');
+                const tName = p.topicName && p.topicName !== 'General' ? ` (${escapeMd(p.topicName)})` : '';
+                mirrorPathsText += `${i + 1}. **(${sName})** (\`${p.sourceId}\`) ➔ **${gName}**${tName}\n`;
             });
             if (userDoc.mirrorPaths.length > 5) mirrorPathsText += `_...and ${userDoc.mirrorPaths.length - 5} more_\n`;
         }
@@ -2233,37 +2769,37 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                 { text: '➕ Add Bot to Group (With All Perms)', url: `https://t.me/${botInfo?.username || 'bot'}?startgroup=true&admin=post_messages+edit_messages+delete_messages+invite_users+pin_messages+manage_chat+manage_video_chats` }
               ],
               [
-                { text: '🖼️ 𝗧𝗵𝘂𝗺𝗯', callback_data: 'set_thumb' },
-                { text: '🗑️ 𝗧𝗵𝘂𝗺𝗯', callback_data: 'clr_thumb' },
-                { text: '📝 𝗖𝗮𝗽𝘁𝗶𝗼𝗻', callback_data: 'set_cap' }
+                { text: '🖼️ Thumb', callback_data: 'set_thumb' },
+                { text: '🗑️ Thumb', callback_data: 'clr_thumb' },
+                { text: '📝 Caption', callback_data: 'set_cap' }
               ],
               [
-                { text: '📂 𝗣𝗮𝘁𝗵', callback_data: 'set_path_cmd' },
-                { text: '🗑️ 𝗣𝗮𝘁𝗵', callback_data: 'clr_path_cmd' },
-                { text: '🔄 𝗠𝗶𝗿𝗿𝗼𝗿𝘀', callback_data: 'manage_mirror_paths' }
+                { text: '📂 Path', callback_data: 'set_path_cmd' },
+                { text: '🗑️ Path', callback_data: 'clr_path_cmd' },
+                { text: '🔄 Mirrors', callback_data: 'manage_mirror_paths' }
               ],
               [
-                { text: `🚀 𝗨𝗽: ${currentUploadEngine}`, callback_data: 'toggle_engine' },
-                { text: `📥 𝗗𝗼𝘄𝗻: ${currentDownloadLibrary}`, callback_data: 'toggle_down_library' }
+                { text: `🚀 Up: ${currentUploadEngine}`, callback_data: 'toggle_engine' },
+                { text: `📥 Down: ${currentDownloadLibrary}`, callback_data: 'toggle_down_library' }
               ],
               [
-                { text: userDoc?.uploadMode === 'document' ? '📁 𝗙𝗶𝗹𝗲 𝗠𝗼𝗱𝗲' : '📹 𝗩𝗶𝗱𝗲𝗼 𝗠𝗼𝗱𝗲', callback_data: 'toggle_mode' }
+                { text: userDoc?.uploadMode === 'document' ? '📁 File Mode' : '📹 Video Mode', callback_data: 'toggle_mode' }
               ],
               [
-                { text: '✏️ 𝗥𝗲𝗻𝗮𝗺𝗲', callback_data: 'toggle_rename' },
-                { text: `⏱️ 𝗗𝗲𝗹𝗮𝘆 ${cooldownSecs}`, callback_data: 'change_cooldown_start' },
-                { text: `⚡ 𝗠𝗮𝘅 ${MAX_CONCURRENT_TASKS}`, callback_data: 'change_concurrency_start' }
+                { text: '✏️ Rename', callback_data: 'toggle_rename' },
+                { text: `⏱️ Delay ${cooldownSecs}`, callback_data: 'change_cooldown_start' },
+                { text: `⚡ Max ${MAX_CONCURRENT_TASKS}`, callback_data: 'change_concurrency_start' }
               ],
               [
-                { text: '🔄 𝗦𝘆𝗻𝗰', callback_data: 're_login' },
-                { text: '📜 𝗟𝗼𝗴𝘀', callback_data: 'view_logs' },
-                { text: '🛡️ 𝗔𝘂𝗱𝗶𝘁', callback_data: 'check_perms' }
+                { text: '🔄 Sync', callback_data: 're_login' },
+                { text: '📜 Logs', callback_data: 'view_logs' },
+                { text: '🛡️ Audit', callback_data: 'check_perms' }
               ],
               [
-                { text: '🚫 𝗕𝗮𝗻', callback_data: 'blocked_topics_panel' },
-                { text: userDoc?.cacheEnabled !== false ? '✅ 𝗖𝗮𝗰𝗵𝗲 𝗢𝗡' : '❌ 𝗖𝗮𝗰𝗵𝗲 𝗢𝗙𝗙', callback_data: 'toggle_cache' }
+                { text: '🚫 Ban', callback_data: 'blocked_topics_panel' },
+                { text: userDoc?.cacheEnabled !== false ? '✅ Cache ON' : '❌ Cache OFF', callback_data: 'toggle_cache' }
               ],
-              [{ text: '⬅️ 𝗕𝗮𝗰𝗸', callback_data: 'menu_back' }]
+              [{ text: '⬅️ Back', callback_data: 'menu_back' }]
             ]
         };
 
@@ -2274,7 +2810,10 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
             if (hasLogo) {
                 // Delete the old message (likely text-only) and send a new one with photo to ensure logo is shown
                 await safeBotCall('deleteMessage', chatId, messageId).catch(() => {});
-                await safeBotCall('sendPhoto', chatId, SETTINGS_LOGO_PATH, { caption: text, parse_mode: 'Markdown', reply_markup: markup });
+                await safeBotCall('sendPhoto', chatId, SETTINGS_LOGO_PATH, { caption: text, parse_mode: 'Markdown', reply_markup: markup }).catch(async (err) => {
+                    console.error("[Settings] sendPhoto failed, falling back to sendMessage:", err.message);
+                    await safeSendMessage(chatId, text, { reply_markup: markup, parse_mode: 'Markdown' });
+                });
             } else {
                 await safeEditMessage(text, { 
                     chat_id: chatId, 
@@ -2285,7 +2824,10 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
             }
         } else {
             if (hasLogo) {
-                await safeBotCall('sendPhoto', chatId, SETTINGS_LOGO_PATH, { caption: text, parse_mode: 'Markdown', reply_markup: markup });
+                await safeBotCall('sendPhoto', chatId, SETTINGS_LOGO_PATH, { caption: text, parse_mode: 'Markdown', reply_markup: markup }).catch(async (err) => {
+                    console.error("[Settings] sendPhoto failed, falling back to sendMessage:", err.message);
+                    await safeSendMessage(chatId, text, { reply_markup: markup, parse_mode: 'Markdown' });
+                });
             } else {
                 await safeSendMessage(chatId, text, {
                     parse_mode: 'Markdown',
@@ -4499,7 +5041,16 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
               delete userActionStates[fromId];
               await safeSendMessage(chatId, "✅ **Starting Recent Content Mirror...**");
               const statusMsg = await safeSendMessage(chatId, "🔍 **Processing Latest...**", { parse_mode: 'Markdown' });
-              const newTask = { chatId, link, statusMsgId: statusMsg?.message_id || 0, userId: fromId, isMirror: true, retries: 0 };
+              const newTask = { 
+                  chatId, 
+                  link, 
+                  statusMsgId: statusMsg?.message_id || 0, 
+                  userId: fromId, 
+                  isMirror: true, 
+                  isForwardOnly: false,
+                  skipForwarding: true,
+                  retries: 0 
+              };
               taskQueue.push(newTask);
               dbEnqueueTask(newTask).catch(e => console.error("[Queue DB] enqueue error:", e));
               runNextTask();
@@ -5623,7 +6174,8 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
 
       if (data.startsWith("pause_") || data.startsWith("resume_")) {
           if (!isAdmin(fromId)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
-          const jobKey = data.substring(data.indexOf('_') + 1);
+          const shortId = data.substring(data.indexOf('_') + 1);
+          const jobKey = getJobKeyFromIndex(shortId) || shortId;
           const isPause = data.startsWith("pause_");
           
           const taskState = taskControlMap.get(jobKey) || { isPaused: false, shouldRetry: false };
@@ -5645,7 +6197,8 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
 
       if (data.startsWith("retry_")) {
           if (!isAdmin(fromId)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
-          const jobKey = data.substring(data.indexOf('_') + 1);
+          const shortId = data.substring(data.indexOf('_') + 1);
+          const jobKey = getJobKeyFromIndex(shortId) || shortId;
           const taskState = taskControlMap.get(jobKey) || { isPaused: false, shouldRetry: false };
           taskState.shouldRetry = true;
           taskControlMap.set(jobKey, taskState);
@@ -5655,7 +6208,8 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
 
       if (data.startsWith("skip_")) {
           if (!isAdmin(fromId)) return bot?.answerCallbackQuery(query.id, { text: '❌ Admin only', show_alert: true });
-          const jobKey = data.substring(data.indexOf('_') + 1);
+          const shortId = data.substring(data.indexOf('_') + 1);
+          const jobKey = getJobKeyFromIndex(shortId) || shortId;
           const taskState = taskControlMap.get(jobKey) || { isPaused: false, shouldRetry: false, isSkipped: false };
           taskState.isSkipped = true;
           taskControlMap.set(jobKey, taskState);
@@ -7092,11 +7646,7 @@ runNextTask = async () => {
         return;
     }
 
-    // Force sequential: if any task is already active globally, do not start
-    if (activeTasksCount > 0) {
-        console.log(`[Queue] Another task is already active. Sequential mode enforced.`);
-        return;
-    }
+    // Sequential mode check removed to allow configured concurrency
 
     // Check if the task is stuck (if it takes too long or failed before)
     // Here we can just ensure that if the queue runner is called, 
@@ -7395,8 +7945,7 @@ runNextTask = async () => {
             taskQueue.unshift(task);
             dbRequeueFrontTask(task).catch(e => console.error("[Queue DB] requeue front error:", e));
             setTimeout(runNextTask, retryAfter * 1000);
-            // activeTasksCount-- needs to be removed from here because it's handled in finally
-            activeTasksPerUser.set(fromIdKey, Math.max(0, (activeTasksPerUser.get(fromIdKey) || 1) - 1));
+            // finally block will handle count decrementing
             return;
         }
     } finally {
@@ -7630,15 +8179,17 @@ async function catchUpLiveMirrors(userId: number, client: TelegramClient) {
                         // Notify user about start
                         bot?.sendMessage(userId, `🚀 **Live Mirror Detected New Content!**\n\nStarting download for: ${virtualLink}`, { parse_mode: 'Markdown' }).catch(() => {});
 
-                        const newTask = {
-                            chatId: userId,
-                            link: virtualLink,
-                            userId: userId,
-                            overrideThreadId: destTopicId,
-                            overrideTargetId: destId,
-                            isMirror: true,
-                            retries: 0
-                        };
+                const newTask = {
+                    chatId: userId,
+                    link: virtualLink,
+                    userId: userId,
+                    overrideThreadId: destTopicId,
+                    overrideTargetId: destId,
+                    isMirror: true,
+                    isForwardOnly: false,
+                    skipForwarding: true,
+                    retries: 0
+                };
                         taskQueue.push(newTask);
                         dbEnqueueTask(newTask).catch(e => console.error("[Queue DB] enqueue error:", e));
 
@@ -7908,6 +8459,8 @@ startAutoMirrorWatcher = async (userId: number, client: TelegramClient) => {
                     overrideThreadId: destTopicId,
                     overrideTargetId: match.destId,
                     isMirror: true,
+                    isForwardOnly: false,
+                    skipForwarding: true,
                     retries: 0
                 };
                 taskQueue.push(newTask);
@@ -8172,6 +8725,8 @@ createProgressBar = (total: number, current: number, label: string, startTime: n
     const icon = label === "Downloading" ? "⬇️" : "⬆️";
     const meta = label === "Downloading" ? "Server ⟿ Bot" : "Bot ⟿ Your Chat";
 
+    const safePathStr = (pathStr || 'N/A').replace(/[_*`[\]()]/g, '\\$&');
+
     // Enhanced progress tracker
     const text = `╔═══ ${icon} ${label.toUpperCase()} ═══╗\n` +
            `║ ${progressBar} ${percentage}%\n` +
@@ -8182,18 +8737,37 @@ createProgressBar = (total: number, current: number, label: string, startTime: n
            `╠══════════════════════╣\n` +
            `║ 🚀 𝗠𝗼𝗱𝗲   : ${currentUploadEngine}\n` +
            `║ 🛰 𝗥𝗼𝘂𝘁𝗲  : ${meta}\n` +
-           `║ 👣 𝗣𝗮𝘁𝗵    : ${pathStr || 'N/A'}\n` +
+           `║ 👣 𝗣𝗮𝘁𝗵    : ${safePathStr}\n` +
            `╚══════════════════════╝`;
     return text;
 };
 
-createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
-    inline_keyboard: [[
-        { text: isPaused ? '▶️ Resume' : '⏸️ Pause', callback_data: `${isPaused ? 'resume' : 'pause'}_${jobKey}` },
-        { text: '🔁 Retry', callback_data: `retry_${jobKey}` },
-        { text: '⏭️ Skip Task', callback_data: `skip_${jobKey}` }
-    ]]
-});
+const activeJobIndices = new Map<string, string>(); // jobIndex -> jobKey
+const activeJobKeys = new Map<string, string>(); // jobKey -> jobIndex
+let jobIndexCounter = 0;
+
+function getShortJobId(jobKey: string): string {
+    if (activeJobKeys.has(jobKey)) return activeJobKeys.get(jobKey)!;
+    const index = (jobIndexCounter++).toString(36);
+    activeJobKeys.set(jobKey, index);
+    activeJobIndices.set(index, jobKey);
+    return index;
+}
+
+function getJobKeyFromIndex(index: string): string | undefined {
+    return activeJobIndices.get(index);
+}
+
+createProgressMarkup = (jobKey: string, isPaused: boolean) => {
+    const shortId = getShortJobId(jobKey);
+    return {
+        inline_keyboard: [[
+            { text: isPaused ? '▶️ Resume' : '⏸️ Pause', callback_data: `${isPaused ? 'resume' : 'pause'}_${shortId}` },
+            { text: '🔁 Retry', callback_data: `retry_${shortId}` },
+            { text: '⏭️ Skip Task', callback_data: `skip_${shortId}` }
+        ]]
+    };
+};
 
     const getBestClientForLinkData = async (linkData: any, preferredUserIdParam: number, statusMsgId?: number, chatId?: number) => {
         const preferredUserId = Number(await resolveSettingsUserId(preferredUserIdParam)) || preferredUserIdParam;
@@ -8589,10 +9163,7 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => ({
             }
 
             // Attempt direct forward first as requested by user
-            let canForward = (skipForwarding === true) ? false : true;
-            if (isForwardOnly === false && skipForwarding === true) {
-                canForward = false;
-            }
+            let canForward = (isForwardOnly === true);
             
             let forwardAttempted = false;
             let forwardErrorMsg: string | null = null;
@@ -10450,7 +11021,15 @@ async function startTopicClone(chatId: number, fromId: number, sourceGroupId: st
                       const batchTasksToQueue: Task[] = [];
                       for (let i = startId; i <= endId; i++) {
                           const link = `${baseUrl}${i}`;
-                          batchTasksToQueue.push({ chatId, link, batchId, userId: fromId, forceGeneralPath: true });
+                          batchTasksToQueue.push({ 
+                              chatId, 
+                              link, 
+                              batchId, 
+                              userId: fromId, 
+                              forceGeneralPath: true,
+                              isForwardOnly: false,
+                              skipForwarding: true
+                          });
                       }
                       if (batchTasksToQueue.length > 0) {
                           taskQueue.push(...batchTasksToQueue);
@@ -10975,503 +11554,6 @@ async function startTopicClone(chatId: number, fromId: number, sourceGroupId: st
     botStatus = 'Failed';
   }
 }
-
-app.use(express.json());
-
-app.get('/api/logs', (req, res) => res.json(sysLogs));
-app.get('/api/sessions', (req, res) => res.json(Array.from(userClients.keys())));
-
-app.get('/api/status', async (req, res) => {
-  try {
-    res.json({
-      status: botStatus,
-      dbStatus: dbStatus,
-      adminConfigured: !!currentAdminId,
-      botInfo: botInfo,
-      queueSize: taskQueue.length,
-      nextTaskIn: nextTaskRunAt ? Math.max(0, Math.round((nextTaskRunAt - Date.now()) / 1000)) : 0,
-      proxy: undefined,
-      isQueuePaused: isQueuePaused,
-      activeJobs: Array.from(activeTaskJobs.values()).map(job => ({
-        link: job.link,
-        phase: job.phase,
-        progress: job.progress ? {
-          percent: job.progress.percent,
-          current: job.progress.current,
-          total: job.progress.total,
-          speed: job.progress.speed,
-          elapsed: job.progress.elapsed,
-          eta: job.progress.eta
-        } : null,
-        cooldownRemaining: job.cooldownRemaining,
-        isMirror: job.isMirror
-      })),
-      batches: Array.from(batchStatusMap.entries()).map(([batchId, info]) => {
-        const remaining = info.total - info.processed;
-        const progress = info.total > 0 ? Math.floor((info.processed / info.total) * 100) : 0;
-        return {
-          batchId,
-          total: info.total,
-          processed: info.processed,
-          success: info.success,
-          failed: info.failed,
-          currentLink: info.currentLink,
-          startTime: info.startTime,
-          progress,
-          isActive: remaining > 0
-        };
-      }),
-      taskQueue: taskQueue.map(t => ({
-        link: t.link,
-        isMirror: t.isMirror,
-        userId: t.userId
-      })),
-      config: {
-        hasToken: !!token,
-        hasMongo: !!mongoUri,
-        hasTarget: !!destinationChatId
-      },
-      settings: {
-        adminId: currentAdminId,
-        destinationChatId: destinationChatId,
-        apiId: apiIdValue || null,
-        apiHash: apiHashValue || null,
-        downloadLibrary: currentDownloadLibrary,
-        uploadEngine: currentUploadEngine,
-        uploadMethod: currentUploadMethod,
-        renameRules: globalRenameRules,
-        cooldownSeconds: globalCooldownSeconds,
-        mirrorPaths: [] // Simplified to avoid hanging status check
-      }
-    });
-  } catch (err: any) {
-    console.error('[API Status] Error:', err);
-    if (!res.headersSent) {
-        res.status(500).json({ error: err.message });
-    }
-  }
-});
-
-// Separate route for heavy settings if needed
-app.get('/api/settings/mirror-paths', async (req, res) => {
-    try {
-        if (!approvedUsersCollection || dbStatus !== 'Connected') return res.json([]);
-        const adminDoc = await approvedUsersCollection.findOne({userId: ALLOWED_ADMIN_IDS[0].toString()}, { maxTimeMS: 15000 });
-        res.json(adminDoc?.mirrorPaths || []);
-    } catch (e) {
-        res.json([]);
-    }
-});
-
-app.post('/api/queue/pause', (req, res) => {
-  isQueuePaused = true;
-  res.json({ success: true });
-});
-
-app.post('/api/queue/resume', (req, res) => {
-  isQueuePaused = false;
-  if (typeof runNextTask === 'function') {
-    runNextTask();
-  }
-  res.json({ success: true });
-});
-
-app.post('/api/queue/clear', (req, res) => {
-  taskQueue.length = 0;
-  if (typeof dbClearAllTasks === 'function') {
-    dbClearAllTasks().catch(e => console.error("[Queue DB] Clear cancel-all error:", e));
-  }
-  res.json({ success: true });
-});
-
-app.post('/api/queue/cancel-item', (req, res) => {
-  const { index } = req.body;
-  if (index === undefined || index < 0 || index >= taskQueue.length) {
-    return res.status(400).json({ error: 'Invalid task queue index' });
-  }
-  const removed = taskQueue.splice(index, 1)[0];
-  if (typeof dbDequeueTask === 'function') {
-    dbDequeueTask(removed).catch(e => console.error("[Queue DB] Dequeue cancelled task error:", e));
-  }
-  res.json({ success: true, removed });
-});
-
-app.post('/api/queue/prioritize-item', (req, res) => {
-  const { index } = req.body;
-  if (index === undefined || index < 0 || index >= taskQueue.length) {
-    return res.status(400).json({ error: 'Invalid task queue index' });
-  }
-  if (index === 0) {
-    return res.json({ success: true, info: 'Task already at top' });
-  }
-  const chosen = taskQueue.splice(index, 1)[0];
-  taskQueue.unshift(chosen);
-  res.json({ success: true, chosen });
-});
-
-app.get('/api/failed/list', async (req, res) => {
-  try {
-     const failed = (failedTasksCollection && dbStatus === 'Connected') ? await failedTasksCollection.find({}, { maxTimeMS: 20000 }).sort({ failedAt: -1 }).toArray() : [];
-     res.json({ failed });
-  } catch (err: any) {
-     res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/failed/retry-all', async (req, res) => {
-  try {
-     const count = await retryAllFailedTasks();
-     res.json({ success: true, count });
-  } catch (err: any) {
-     res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/failed/retry-item', async (req, res) => {
-  const { id } = req.body;
-  try {
-     const success = await retryFailedTask(id);
-     res.json({ success });
-  } catch (err: any) {
-     res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/failed/clear', async (req, res) => {
-  try {
-     await clearAllFailedTasks();
-     res.json({ success: true });
-  } catch (err: any) {
-     res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/mirrored/history', async (req, res) => {
-  try {
-    let logs = [...inMemoryMirrorLogs];
-    if (mirroredMessagesCollection && dbStatus === 'Connected') {
-      try {
-        const dbLogs = await mirroredMessagesCollection.find({}, { maxTimeMS: 20000 }).sort({ mirroredAt: -1 }).limit(100).toArray();
-        const mappedDbLogs = dbLogs.map((log: any) => ({
-          link: log.link,
-          destId: log.destId,
-          mirroredAt: log.mirroredAt ? new Date(log.mirroredAt).toISOString() : new Date().toISOString(),
-          status: 'Success',
-          info: 'Fetched from database collection'
-        }));
-        
-        // Merge list preventing duplicates
-        const seen = new Set();
-        const merged = [];
-        for (const log of [...logs, ...mappedDbLogs]) {
-          const key = `${log.link}-${log.destId}`;
-          if (!seen.has(key)) {
-            seen.add(key);
-            merged.push(log);
-          }
-        }
-        return res.json({ logs: merged.slice(0, 100) });
-      } catch (dbErr) {
-        console.error("Database logs fetching error:", dbErr);
-      }
-    }
-    res.json({ logs });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message, logs: inMemoryMirrorLogs });
-  }
-});
-
-app.post('/api/mirrored/clear', async (req, res) => {
-  inMemoryMirrorLogs.length = 0;
-  if (mirroredMessagesCollection) {
-    try {
-      // Export before clearing
-      const data = await mirroredMessagesCollection.find({}).toArray();
-      const backupFilename = `/tmp/backup_mirrored_${Date.now()}.json`;
-      fs.writeFileSync(backupFilename, JSON.stringify(data, null, 2));
-      console.log(`[API clear history] Backup created at ${backupFilename}`);
-      
-      await mirroredMessagesCollection.deleteMany({});
-    } catch (err: any) {
-      console.error("[API clear history] Error clearing/backing up Mongo mirror history:", err);
-      return res.status(500).json({ error: err.message });
-    }
-  }
-  res.json({ success: true });
-});
-
-app.post('/api/mirrored/export', async (req, res) => {
-  if (mirroredMessagesCollection) {
-    try {
-      const data = await mirroredMessagesCollection.find({}).toArray();
-      res.json({ success: true, data });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  } else {
-    res.status(500).json({ error: "No collection" });
-  }
-});
-
-app.post('/api/mirrored/import', async (req, res) => {
-  const { data } = req.body;
-  if (mirroredMessagesCollection && Array.isArray(data)) {
-    try {
-      await mirroredMessagesCollection.insertMany(data);
-      res.json({ success: true });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  } else {
-    res.status(400).json({ error: "Invalid data" });
-  }
-});
-
-app.post('/api/queue/add', async (req, res) => {
-  const { link, isMirror } = req.body;
-  if (!link) return res.status(400).json({ error: 'Missing link' });
-  try {
-    const systemAdminId = Number(currentAdminId || ALLOWED_ADMIN_IDS[0] || 0);
-    const task: Task = {
-      chatId: systemAdminId,
-      userId: systemAdminId,
-      link,
-      isMirror: !!isMirror
-    };
-    taskQueue.push(task);
-    if (approvedUsersCollection) {
-      dbEnqueueTasks([task]).catch(e => console.error("[Queue DB] enqueue error:", e));
-    }
-    if (typeof runNextTask === 'function') {
-      runNextTask();
-    }
-    res.json({ success: true, task });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/system/restart', (req, res) => {
-  res.json({ success: true, message: 'Restarting bot server...' });
-  setTimeout(() => process.exit(0), 1000);
-});
-
-app.post('/api/system/reset', async (req, res) => {
-  try {
-    const stats = await performSystemReset();
-    res.json({ 
-      success: true, 
-      message: 'System reset performed successfully! Bot process is rebooting to start completely fresh...',
-      stats
-    });
-    setTimeout(() => {
-      console.log("[Reset API] Process restarting on admin request...");
-      process.exit(0);
-    }, 1500);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/system/ping', (req, res) => {
-  res.json({ success: true, message: 'Pong! Bot is active.' });
-});
-
-app.post('/api/system/cleartopics', (req, res) => {
-  topicMappingCache.clear();
-  res.json({ success: true, message: 'Topic cache cleared.' });
-});
-
-app.post('/api/system/logout', async (req, res) => {
-  const { adminId } = req.body;
-  if (!approvedUsersCollection) return res.status(503).json({ error: 'Database not ready' });
-  try {
-     const settingsUid = adminId || currentAdminId || ALLOWED_ADMIN_IDS[0]?.toString();
-     await approvedUsersCollection.updateOne({ userId: settingsUid }, { $unset: { stringSession: "" } });
-     userSessions.delete(Number(settingsUid));
-     res.json({ success: true, message: 'Logged out successfully.' });
-  } catch(e: any) {
-     res.status(500).json({ error: e.message });
-  }
-});
-
-app.post('/api/mirror/add-path', async (req, res) => {
-  const { sourceId, destId, groupName, destThreadId, destTopicName } = req.body;
-  if (!approvedUsersCollection) return res.status(503).json({ error: 'Database not ready' });
-  try {
-     const settingsUid = currentAdminId || ALLOWED_ADMIN_IDS[0]?.toString();
-     const newPath = { sourceId, destId, groupName: groupName || "App Mirror Target", destThreadId, destTopicName };
-     await approvedUsersCollection.updateOne(
-        { userId: settingsUid },
-        { $push: { mirrorPaths: newPath } } as any,
-        { upsert: true }
-     );
-     res.json({ success: true, message: 'Mirror path added.' });
-  } catch(e: any) {
-     res.status(500).json({ error: e.message });
-  }
-});
-
-app.post('/api/mirror/delete-path', async (req, res) => {
-  const { index } = req.body;
-  if (!approvedUsersCollection) return res.status(503).json({ error: 'Database not ready' });
-  try {
-     const settingsUid = currentAdminId || ALLOWED_ADMIN_IDS[0]?.toString();
-     const userDoc = await approvedUsersCollection.findOne({ userId: settingsUid });
-     const paths = userDoc?.mirrorPaths || [];
-     if (paths[index]) {
-         paths.splice(index, 1);
-         await approvedUsersCollection.updateOne({ userId: settingsUid }, { $set: { mirrorPaths: paths } });
-     }
-     res.json({ success: true, message: 'Mirror path removed.' });
-  } catch(e: any) {
-     res.status(500).json({ error: e.message });
-  }
-});
-
-app.post('/api/batch/start', async (req, res) => {
-  const { startLink, endLink, isMirror } = req.body;
-  if (!startLink || !endLink) return res.status(400).json({ error: 'Missing startLink or endLink' });
-  
-  try {
-    const startId = getMsgId(startLink);
-    const endId = getMsgId(endLink);
-    const baseUrl = startLink.substring(0, startLink.lastIndexOf('/') + 1);
-
-    if (isNaN(startId) || isNaN(endId)) throw new Error("Invalid range message IDs.");
-    if (endId < startId) throw new Error("End link ID must be greater than start link ID.");
-
-    const count = endId - startId + 1;
-    // Unlimited batch size as requested by user
-
-    const systemAdminId = Number(currentAdminId || ALLOWED_ADMIN_IDS[0] || 0);
-    const batchId = `batch_${Date.now()}_web`;
-
-    batchStatusMap.set(batchId, {
-      total: count,
-      processed: 0,
-      success: 0,
-      failed: 0,
-      startTime: Date.now(),
-      summaryMsgId: 0,
-      chatId: systemAdminId
-    });
-
-    const batchTasksToQueue: Task[] = [];
-    for (let i = startId; i <= endId; i++) {
-        const link = `${baseUrl}${i}`;
-        batchTasksToQueue.push({ 
-          chatId: systemAdminId, 
-          link, 
-          batchId, 
-          userId: systemAdminId,
-          isMirror: !!isMirror,
-          forceGeneralPath: !isMirror
-        });
-    }
-
-    if (batchTasksToQueue.length > 0) {
-        taskQueue.push(...batchTasksToQueue);
-        if (approvedUsersCollection) {
-          dbEnqueueTasks(batchTasksToQueue).catch(e => console.error("[Queue DB] Bulk enqueue error:", e));
-        }
-    }
-    
-    if (typeof runNextTask === 'function') {
-      runNextTask();
-    }
-    res.json({ success: true, count, batchId });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/setpath', async (req, res) => {
-    if (!approvedUsersCollection) return res.status(503).json({ error: 'Database not ready' });
-    const { chatId, topicId, groupTitle, topicName, userId } = req.body;
-    
-    try {
-        const adminIdStr = userId.toString();
-        const settingsUid = await resolveSettingsUserId(Number(userId));
-        
-        const update = { 
-            $set: { 
-                uploadPath: chatId.toString(),
-                uploadTopicId: topicId || null,
-                uploadGroupName: groupTitle,
-                uploadTopicName: topicName || ''
-            } 
-        };
-        
-        // Update both the admin's doc AND the session's doc to ensure settings persist
-        await approvedUsersCollection.updateOne({ userId: adminIdStr }, update);
-        if (settingsUid !== adminIdStr) {
-             await approvedUsersCollection.updateOne({ userId: settingsUid }, update);
-        }
-        res.json({ success: true });
-    } catch (err: any) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.post('/api/settings', async (req, res) => {
-  if (!settingsCollection) return res.status(503).json({ error: 'Database not ready' });
-  const { adminId, stringSession, destinationChatId: newDestId, apiId: newApiId, apiHash: newApiHash, downloadLibrary, uploadEngine, uploadMethod, renameRules, proxy, cooldownSeconds } = req.body;
-  try {
-    const updateData: any = {};
-    if (adminId) updateData.adminId = adminId;
-        if (stringSession) {
-            updateData.stringSession = stringSession;
-            const activeAdminId = adminId || currentAdminId || ALLOWED_ADMIN_IDS[0];
-            if (activeAdminId && approvedUsersCollection) {
-                await approvedUsersCollection.updateOne(
-                    { userId: activeAdminId.toString() },
-                    { $set: { stringSession } },
-                    { upsert: true }
-                );
-                userSessions.set(Number(activeAdminId), stringSession);
-                approvedUsersCache.add(activeAdminId.toString());
-            }
-        }
-    if (newDestId) updateData.destinationChatId = newDestId;
-        if (newApiId) {
-            updateData.apiId = newApiId;
-            apiIdValue = Number(newApiId);
-        }
-        if (newApiHash) {
-            updateData.apiHash = newApiHash;
-            apiHashValue = newApiHash;
-        }
-        if (downloadLibrary) {
-            updateData.downloadLibrary = downloadLibrary;
-            currentDownloadLibrary = downloadLibrary;
-        }
-        if (uploadEngine) {
-            updateData.uploadEngine = uploadEngine;
-            currentUploadEngine = uploadEngine;
-        }
-        if (uploadMethod) {
-            updateData.uploadMethod = uploadMethod;
-            currentUploadMethod = uploadMethod;
-        }
-        if (cooldownSeconds !== undefined) {
-             updateData.cooldownSeconds = Number(cooldownSeconds);
-             globalCooldownSeconds = Number(cooldownSeconds);
-        }
-        if (Array.isArray(renameRules)) {
-            updateData.renameRules = renameRules;
-            globalRenameRules = renameRules;
-        }
-
-        await settingsCollection.updateOne({ type: 'global_config' }, { $set: updateData }, { upsert: true });
-        
-        if (adminId) currentAdminId = adminId;
-        if (newDestId) destinationChatId = newDestId;
-        res.json({ success: true });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 // 404 handler for API routes to prevent falling through to Vite HTML
 app.all('/api/*', (req, res) => {
