@@ -20,6 +20,7 @@ const activeTasksPerUser = new Map<number, number>();
 const mirrorTopicCache = new Map<string, Map<string, number>>();
 const sourceTopicCache = new Map<string, Map<number, string>>();
 const activeWatchers = new Set<number>();
+const watcherLocks = new Map<number, Promise<void>>();
 let botFloodWaitEnd = 0;
 const mirrorTasks = new Map<string, any[]>();
 let getConnectedUserbotClient: (userId: number) => Promise<any>;
@@ -43,9 +44,18 @@ function sleep(ms: number) {
 
 async function ensureClientConnected(client: TelegramClient | any): Promise<boolean> {
     if (!client) return false;
-    if (client.connected) return true;
+    if (client.connected) {
+        try {
+            // Rapid state check to see if connection is truly alive
+            await client.invoke(new Api.updates.GetState());
+            return true;
+        } catch (e) {
+            console.log("[ConnectionGuard] Active connection check failed, forcing reconnect.");
+            client.connected = false;
+        }
+    }
     try {
-        console.log("[ConnectionGuard] Client disconnected, attempting reconnect...");
+        console.log("[ConnectionGuard] Client disconnected or dead, attempting reconnect...");
         await client.connect();
         return client.connected;
     } catch (e: any) {
@@ -242,9 +252,29 @@ function getMsgId(url: string): number {
     return parseInt(last || '0');
 }
 
-function applyRenameRules(text: string, customRules?: Array<{ keyword: string; replaceWith: string }>): string {
+function normalizeSourceId(id: any): string {
+    if (!id) return "";
+    return id.toString().trim().replace("-100", "");
+}
+
+function applyRenameRules(text: string, customRules?: Array<{ keyword: string; replaceWith: string }>, dynamicContext?: { msgId?: number; topicName?: string; seq?: number }): string {
     if (!text) return "";
     let result = text;
+    
+    // Replace dynamic placeholders first
+    if (dynamicContext) {
+        if (dynamicContext.msgId !== undefined) {
+            result = result.replace(/{id}/gi, dynamicContext.msgId.toString());
+            result = result.replace(/{msgid}/gi, dynamicContext.msgId.toString());
+        }
+        if (dynamicContext.topicName) {
+            result = result.replace(/{topic}/gi, dynamicContext.topicName);
+        }
+        if (dynamicContext.seq !== undefined) {
+            result = result.replace(/{seq}/gi, dynamicContext.seq.toString());
+        }
+    }
+
     const rulesToUse = customRules || globalRenameRules || [];
     for (const rule of rulesToUse) {
         if (rule.keyword) {
@@ -354,11 +384,14 @@ interface Task {
     forceGeneralPath?: boolean;
     overrideTargetId?: any;
     isMirror?: boolean;
+    sourceId?: string;
     isForwardOnly?: boolean;
+    isBotForward?: boolean;
     skipForwarding?: boolean;
     retries?: number;
     fullMirrorSessionId?: string;
     topicCloneSessionId?: string;
+    sequenceIndex?: number;
 }
 
 const MESSAGE_UPDATE_THROTTLE = 2000; // Reduced to 2s for better responsiveness
@@ -511,23 +544,29 @@ async function resumeDownloadFile(
         } catch (e) {}
     }
 
-    let downloadWorkers = 12;
-    let partSizeKb = 2048;
+    // Optimized Download Engine v4.0 (Turbo)
+    let downloadWorkers = 24;
+    let partSizeKb = 512;
 
-    if (totalSize > 500 * 1024 * 1024) { // > 500 MB
-        downloadWorkers = 16;
-    } else if (totalSize > 100 * 1024 * 1024) { // > 100 MB
-        downloadWorkers = 16;
-    } else if (totalSize > 10 * 1024 * 1024) { // > 10 MB
-        downloadWorkers = 12;
+    if (totalSize > 1500 * 1024 * 1024) { // > 1.5 GB
+        downloadWorkers = 48;
         partSizeKb = 1024;
+    } else if (totalSize > 500 * 1024 * 1024) { // > 500 MB
+        downloadWorkers = 32;
+        partSizeKb = 1024;
+    } else if (totalSize > 100 * 1024 * 1024) { // > 100 MB
+        downloadWorkers = 24;
+        partSizeKb = 512;
+    } else if (totalSize > 20 * 1024 * 1024) { // > 20 MB
+        downloadWorkers = 16;
+        partSizeKb = 512;
     } else {
         downloadWorkers = 12;
-        partSizeKb = 512;
+        partSizeKb = 128;
     }
 
     let lastProgressTime = Date.now();
-    const DOWNLOAD_STALL_TIMEOUT = 600000;
+    const DOWNLOAD_STALL_TIMEOUT = 300000; // 5 minutes heartbeat is safer for varying network conditions
     let isFinished = false;
 
     let stallInterval: NodeJS.Timeout | null = null;
@@ -613,7 +652,7 @@ const escapeMarkdown = (text: string) => {
 
 const safeBotCall = async (method: string, ...args: any[]) => {
     let retries = 0;
-    const maxRetries = 5;
+    const maxRetries = 7;
     while (retries < maxRetries) {
         try {
             // Sanitize reply_markup in options
@@ -633,39 +672,34 @@ const safeBotCall = async (method: string, ...args: any[]) => {
                     }
                 }
             }
-            return await (bot as any)?.[method](...args);
+            if (!bot) throw new Error("Bot client not initialized");
+            return await (bot as any)[method](...args);
         } catch (e: any) {
             if (e.message?.includes('can\'t parse reply keyboard markup')) {
                 console.error(`[Bot API] Keyboard Parsing Error on method '${method}':`, JSON.stringify(args, (k,v) => typeof v === 'bigint' ? v.toString() : v));
             }
             const is429 = e.error_code === 429 || e.message?.includes('429');
-            const isNetworkError = e.message?.includes('TIMEOUT') || e.message?.includes('ETIMEDOUT') || e.message?.includes('socket hang up') || e.message?.includes('ECONNRESET') || e.message?.includes('ECONNREFUSED');
+            const isNetworkError = e.message?.toUpperCase().includes('TIMEOUT') || e.message?.includes('ETIMEDOUT') || e.message?.includes('socket hang up') || e.message?.includes('ECONNRESET') || e.message?.includes('ECONNREFUSED');
             if ((is429 || isNetworkError) && retries < maxRetries - 1) {
                 let retryAfter = 15;
                 if (is429) {
-                    // Try to get from parameters
                     if (e.parameters?.retry_after) {
                         retryAfter = e.parameters.retry_after;
                     } else {
-                        // Try to parse from message: "429 Too Many Requests: retry after 1357"
                         const match = e.message.match(/retry after (\d+)/);
                         if (match) {
                             retryAfter = parseInt(match[1], 10);
                         }
                     }
 
-                    // Special 429 Optimize: If it's a cosmetic method like editMessageText or deleteMessage,
-                    // we must NEVER block the calling thread (e.g., active download/upload files) as it gets stuck.
                     if (method === 'editMessageText' || method === 'deleteMessage') {
                         console.warn(`[Bot API] 429 on cosmetic method '${method}' (retry after ${retryAfter}s). Skipping update to avoid blocking file transfers.`);
                         return null;
                     }
                 }
                 
-                // Add a small buffer
-                const waitTime = (is429 ? (retryAfter + 5) : 3) * 1000;
+                const waitTime = (is429 ? (retryAfter + 5) : (3 * (retries + 1))) * 1000;
                 
-                // If wait time is > 30 seconds, do not block the server event loop/queue for so long.
                 if (is429 && waitTime > 30000) {
                     console.warn(`[Bot API] Flood wait too high (${Math.round(waitTime / 1000)}s) on ${method}. Skipping wait.`);
                     return null;
@@ -679,11 +713,10 @@ const safeBotCall = async (method: string, ...args: any[]) => {
             
             // Special handling for common errors
             if (e.message?.includes("can't parse entities")) {
-                console.error(`[Bot API] Parse mode error on ${method}. args: ${JSON.stringify(args)}`);
                 if (args.length > 0 && typeof args[args.length - 1] === 'object') {
                     const options = { ...args[args.length - 1] };
                     if (options.parse_mode) {
-                        console.warn(`[Bot API] Parse mode error on ${method}. Text: ${args[0]}. Retrying without parse_mode.`);
+                        console.warn(`[Bot API] Parse mode error on ${method}. Retrying without parse_mode.`);
                         delete options.parse_mode;
                         args[args.length - 1] = options;
                         retries++;
@@ -705,30 +738,9 @@ const safeBotCall = async (method: string, ...args: any[]) => {
                     }
                 }
             }
-
-            if (is429) throw e; // RETHROW if max retries reached
-            
-            if (e.message?.includes('message is not modified')) {
-                return true;
-            }
-            
-            // For other errors, log and potentially return null if it's an optional call
-            const msgLower = (e.message || '').toLowerCase();
-            const isExpectedSilent = msgLower.includes("message is not modified") || 
-                                     msgLower.includes("there is no text in the message") ||
-                                     msgLower.includes("message can't be edited") ||
-                                     msgLower.includes("chat not found") ||
-                                     msgLower.includes("message to delete not found") ||
-                                     msgLower.includes("inline keyboard expected") ||
-                                     msgLower.includes("message to edit not found");
-            
-            if (!isExpectedSilent) {
-                console.error(`[Bot API] Error on ${method}:`, e.message);
-            }
-            return null;
+            throw e;
         }
     }
-    return null;
 };
 
 const ensureSafeMessageLength = (text: string): string => {
@@ -784,6 +796,25 @@ const safeEditMessage = async (text: string, options: { chat_id: number, message
         if (res) return res;
     } catch (e: any) {
         if (e.message?.includes('Message is not modified')) return true;
+        
+        // If the message is a photo/video, editMessageText fails. Try editMessageCaption.
+        if (e.message?.includes('no text in the message to edit')) {
+            try {
+                const captionOptions = {
+                    chat_id: options.chat_id,
+                    message_id: options.message_id,
+                    caption: safeText,
+                    parse_mode: options.parse_mode,
+                    reply_markup: options.reply_markup
+                };
+                const res = await safeBotCall('editMessageCaption', safeText, captionOptions);
+                if (res) return res;
+            } catch (capErr: any) {
+                if (capErr.message?.includes('Message is not modified')) return true;
+                throw capErr;
+            }
+        }
+
         // If it's a keyboard parsing error, fall back to delete/send
         if (e.message?.includes('can\'t parse reply keyboard markup')) {
              try {
@@ -1065,7 +1096,7 @@ async function resumeFullMirrorSession(chatId: number, sessionId: string, trigge
         let overrideThreadId: number | undefined = dest.destThreadId; // Base thread ID
         let sourceTopicId: number | undefined;
 
-        if (isSourceForum && isDestForum && (m as any).replyTo) {
+        if (isSourceForum && (m as any).replyTo) {
             const replyTo = (m as any).replyTo;
             sourceTopicId = replyTo.replyToTopId || replyTo.replyToMsgId;
             
@@ -1079,36 +1110,38 @@ async function resumeFullMirrorSession(chatId: number, sessionId: string, trigge
                         continue;
                     }
 
-                    if (topicMap[sourceTopicId] !== undefined) {
-                        overrideThreadId = topicMap[sourceTopicId] ?? dest.destThreadId;
-                    } else {
-                        const normalizedTitle = topicTitle.trim().toLowerCase();
-                        if (destTopics[normalizedTitle]) {
-                            topicMap[sourceTopicId] = destTopics[normalizedTitle];
-                            overrideThreadId = destTopics[normalizedTitle];
+                    if (isDestForum) {
+                        if (topicMap[sourceTopicId] !== undefined) {
+                            overrideThreadId = topicMap[sourceTopicId] ?? dest.destThreadId;
                         } else {
-                            try {
-                                const createResult: any = await client.invoke(new Api.channels.CreateForumTopic({
-                                    channel: destEntity,
-                                    title: topicTitle
-                                }));
-                                const update = createResult.updates?.find((u: any) => u.className === 'UpdateNewForumTopic');
-                                let newDestTopicId = update?.topicId;
-                                
-                                if (!newDestTopicId) {
-                                    const retryTopics: any = await client.invoke(new Api.channels.GetForumTopics({ channel: destEntity, limit: 100 }));
-                                    newDestTopicId = retryTopics.topics?.find((t: any) => t.title?.trim().toLowerCase() === normalizedTitle)?.id;
+                            const normalizedTitle = topicTitle.trim().toLowerCase();
+                            if (destTopics[normalizedTitle]) {
+                                topicMap[sourceTopicId] = destTopics[normalizedTitle];
+                                overrideThreadId = destTopics[normalizedTitle];
+                            } else {
+                                try {
+                                    const createResult: any = await client.invoke(new Api.channels.CreateForumTopic({
+                                        channel: destEntity,
+                                        title: topicTitle
+                                    }));
+                                    const update = createResult.updates?.find((u: any) => u.className === 'UpdateNewForumTopic');
+                                    let newDestTopicId = update?.topicId;
+                                    
+                                    if (!newDestTopicId) {
+                                        const retryTopics: any = await client.invoke(new Api.channels.GetForumTopics({ channel: destEntity, limit: 100 }));
+                                        newDestTopicId = retryTopics.topics?.find((t: any) => t.title?.trim().toLowerCase() === normalizedTitle)?.id;
+                                    }
+                                    
+                                    if (newDestTopicId) {
+                                        destTopics[normalizedTitle] = newDestTopicId;
+                                        destTopicsTitleMap[newDestTopicId] = topicTitle;
+                                        topicMap[sourceTopicId] = newDestTopicId;
+                                        overrideThreadId = newDestTopicId;
+                                    }
+                                } catch (e) {
+                                    console.warn(`Failed to create topic ${topicTitle}:`, e);
+                                    topicMap[sourceTopicId] = undefined;
                                 }
-                                
-                                if (newDestTopicId) {
-                                    destTopics[normalizedTitle] = newDestTopicId;
-                                    destTopicsTitleMap[newDestTopicId] = topicTitle;
-                                    topicMap[sourceTopicId] = newDestTopicId;
-                                    overrideThreadId = newDestTopicId;
-                                }
-                            } catch (e) {
-                                console.warn(`Failed to create topic ${topicTitle}:`, e);
-                                topicMap[sourceTopicId] = undefined;
                             }
                         }
                     }
@@ -1267,7 +1300,7 @@ async function updateGlobalMirrorProgress(sessionId: string) {
     
     // Build beautiful progress bar (length 15)
     const barLength = 15;
-    const filledLength = Math.round((filePercentage / 100) * barLength);
+    const filledLength = Math.max(0, Math.min(barLength, Math.round((filePercentage / 100) * barLength)));
     const emptyLength = barLength - filledLength;
     const bar = '█'.repeat(filledLength) + '░'.repeat(emptyLength);
     
@@ -1696,12 +1729,6 @@ async function runActiveWatchdog() {
 // API Route registration block moved earlier for robustness
 app.use(express.json());
 
-// Request logger for API routes
-app.use('/api', (req, res, next) => {
-    console.log(`[API Request] ${req.method} ${req.url}`);
-    next();
-});
-
 app.get('/api/logs', (req, res) => res.json({ logs: sysLogs }));
 app.post('/api/logs/clear', (req, res) => {
     sysLogs.length = 0;
@@ -1842,6 +1869,7 @@ app.get('/api/failed/list', async (req, res) => {
      const failed = (failedTasksCollection && dbStatus === 'Connected') ? await failedTasksCollection.find({}, { maxTimeMS: 20000 }).sort({ failedAt: -1 }).toArray() : [];
      res.json({ failed });
   } catch (err: any) {
+     console.error('[API] Error in /api/failed/list:', err);
      res.status(500).json({ error: err.message });
   }
 });
@@ -1851,6 +1879,7 @@ app.post('/api/failed/retry-all', async (req, res) => {
      const count = await retryAllFailedTasks();
      res.json({ success: true, count });
   } catch (err: any) {
+     console.error('[API] Error in /api/failed/retry-all:', err);
      res.status(500).json({ error: err.message });
   }
 });
@@ -2058,7 +2087,7 @@ app.post('/api/mirror/delete-path', async (req, res) => {
 });
 
 app.post('/api/batch/start', async (req, res) => {
-  const { startLink, endLink, isMirror } = req.body;
+  const { startLink, endLink, isMirror, isForwardOnly, isBotForward } = req.body;
   if (!startLink || !endLink) return res.status(400).json({ error: 'Missing startLink or endLink' });
   
   try {
@@ -2094,7 +2123,9 @@ app.post('/api/batch/start', async (req, res) => {
           batchId, 
           userId: systemAdminId,
           isMirror: !!isMirror,
-          forceGeneralPath: !isMirror
+          forceGeneralPath: !isMirror,
+          isForwardOnly: !!isForwardOnly,
+          isBotForward: !!isBotForward
         });
     }
 
@@ -2201,11 +2232,13 @@ app.post('/api/settings', async (req, res) => {
   }
 });
 
-// 404 handler for API routes to prevent falling through to Vite HTML
+// API Catch-all 404 handler
 app.all('/api/*', (req, res) => {
+    console.warn(`[API 404] Not Found: ${req.method} ${req.url}`);
     res.status(404).json({ error: `API route not found: ${req.method} ${req.url}` });
 });
 
+// Global variables initialization continue...
 if (mongoUri) {
   client = new MongoClient(mongoUri, {
     connectTimeoutMS: 30000,
@@ -3244,23 +3277,85 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
         const destChatId = userDoc?.uploadPath;
         if (!destChatId) throw new Error("Destination path not set. Use /setpath");
         
-        for (let i = start.msgId; i <= end.msgId; i++) {
+        const blockedTopics = (userDoc?.blockedTopics || []).map((t: string) => t.trim().toLowerCase());
+        const sourceEntity = await safelyResolveFullEntity(client, start.chatId).catch(() => null);
+        const isSourceForum = (sourceEntity as any)?.forum;
+        const sourceIdClean = start.chatId.toString().replace('-100', '');
+
+        const CHUNK_SIZE = 50;
+        for (let i = start.msgId; i <= end.msgId; i += CHUNK_SIZE) {
+            const currentEnd = Math.min(i + CHUNK_SIZE - 1, end.msgId);
+            const msgIds = [];
+            for (let j = i; j <= currentEnd; j++) msgIds.push(j);
+
             try {
-                await client.forwardMessages(destChatId, {
-                    messages: [i],
-                    fromPeer: start.chatId,
-                    dropAuthor: true 
-                });
+                let idsToForward = [...msgIds];
+                
+                if (isSourceForum && blockedTopics.length > 0) {
+                    const messages = await client.getMessages(sourceEntity, { ids: msgIds });
+                    idsToForward = [];
+                    for (const m of messages) {
+                        if (!m || m instanceof Api.MessageEmpty) continue;
+                        
+                        const sourceThreadId = m.replyTo?.replyToTopId || m.replyTo?.replyToMsgId || m.replyToMsgId;
+                        if (sourceThreadId) {
+                            const blockStr = `-100${sourceIdClean}_${sourceThreadId}`.toLowerCase();
+                            
+                            // Let's use sourceThreadId
+                            if (blockedTopics.some((bt: string) => bt === sourceThreadId.toString() || bt === blockStr || bt === `${sourceIdClean}_${sourceThreadId}`.toLowerCase())) {
+                                console.log(`[Batch Forward] Skipping blocked topic for message ${m.id} (ID: ${sourceThreadId})`);
+                                continue;
+                            }
+
+                            // Check topic name
+                            let topicName = 'General';
+                            if (!sourceTopicCache.has(sourceIdClean)) sourceTopicCache.set(sourceIdClean, new Map());
+                            const chatTopicCache = sourceTopicCache.get(sourceIdClean)!;
+                            
+                            if (chatTopicCache.has(sourceThreadId)) {
+                                topicName = chatTopicCache.get(sourceThreadId)!;
+                            } else {
+                                try {
+                                    const topicsResult: any = await client.invoke(new Api.channels.GetForumTopics({
+                                        channel: sourceEntity,
+                                        limit: 500
+                                    }));
+                                    const foundTopic = topicsResult.topics?.find((t: any) => t.id === sourceThreadId);
+                                    if (foundTopic) {
+                                        topicName = foundTopic.title;
+                                        chatTopicCache.set(sourceThreadId, topicName);
+                                    }
+                                } catch (e) {}
+                            }
+
+                            if (topicName && topicName !== 'General') {
+                                if (blockedTopics.some((bt: string) => bt === topicName.trim().toLowerCase())) {
+                                    console.log(`[Batch Forward] Skipping blocked topic for message ${m.id} (Name: ${topicName})`);
+                                    continue;
+                                }
+                            }
+                        }
+                        idsToForward.push(m.id);
+                    }
+                }
+
+                if (idsToForward.length > 0) {
+                    await client.forwardMessages(destChatId, {
+                        messages: idsToForward,
+                        fromPeer: start.chatId,
+                        dropAuthor: true 
+                    });
+                }
             } catch (e: any) {
                 if (e.seconds) {
                     console.log(`[FloodWait] Waiting ${e.seconds} seconds.`);
                     await new Promise(r => setTimeout(r, (e.seconds + 1) * 1000));
-                    i--; // Retry this message
+                    i -= CHUNK_SIZE; // Retry this chunk
                 } else {
-                    console.log(`[Individual Forward Error] Msg ${i} failed: ${e.message}`);
+                    console.log(`[Batch Forward Error] Chunk ${i}-${currentEnd} failed: ${e.message}`);
                 }
             }
-            await new Promise(r => setTimeout(r, 600));
+            await new Promise(r => setTimeout(r, 1000));
         }
         safeSendMessage(chatId, "✅ **Batch Forward Complete!**");
     };
@@ -4622,7 +4717,7 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
 
                   let overrideThreadId: number | undefined = dest.destThreadId; // Base thread ID
 
-                  if (isSourceForum && isDestForum && (m as any).replyTo) {
+                  if (isSourceForum && (m as any).replyTo) {
                       const replyTo = (m as any).replyTo;
                       const sourceTopicId = replyTo.replyToTopId || replyTo.replyToMsgId;
                       
@@ -4636,36 +4731,39 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                                   continue;
                               }
 
-                              if (topicMap[sourceTopicId] !== undefined) {
-                                  overrideThreadId = topicMap[sourceTopicId] ?? dest.destThreadId;
-                              } else {
-                                  const normalizedTitle = topicTitle.trim().toLowerCase();
-                                  if (destTopics[normalizedTitle]) {
-                                      topicMap[sourceTopicId] = destTopics[normalizedTitle];
-                                      overrideThreadId = destTopics[normalizedTitle];
+                              // Only handle destination topic creation/mapping if destination is also a forum
+                              if (isDestForum) {
+                                  if (topicMap[sourceTopicId] !== undefined) {
+                                      overrideThreadId = topicMap[sourceTopicId] ?? dest.destThreadId;
                                   } else {
-                                      try {
-                                          const createResult: any = await client.invoke(new Api.channels.CreateForumTopic({
-                                              channel: destEntity,
-                                              title: topicTitle
-                                          }));
-                                          const update = createResult.updates?.find((u: any) => u.className === 'UpdateNewForumTopic');
-                                          let newDestTopicId = update?.topicId;
-                                          
-                                          if (!newDestTopicId) {
-                                              const retryTopics: any = await client.invoke(new Api.channels.GetForumTopics({ channel: destEntity, limit: 100 }));
-                                              newDestTopicId = retryTopics.topics?.find((t: any) => t.title?.trim().toLowerCase() === normalizedTitle)?.id;
+                                      const normalizedTitle = topicTitle.trim().toLowerCase();
+                                      if (destTopics[normalizedTitle]) {
+                                          topicMap[sourceTopicId] = destTopics[normalizedTitle];
+                                          overrideThreadId = destTopics[normalizedTitle];
+                                      } else {
+                                          try {
+                                              const createResult: any = await client.invoke(new Api.channels.CreateForumTopic({
+                                                  channel: destEntity,
+                                                  title: topicTitle
+                                              }));
+                                              const update = createResult.updates?.find((u: any) => u.className === 'UpdateNewForumTopic');
+                                              let newDestTopicId = update?.topicId;
+                                              
+                                              if (!newDestTopicId) {
+                                                  const retryTopics: any = await client.invoke(new Api.channels.GetForumTopics({ channel: destEntity, limit: 100 }));
+                                                  newDestTopicId = retryTopics.topics?.find((t: any) => t.title?.trim().toLowerCase() === normalizedTitle)?.id;
+                                              }
+                                              
+                                              if (newDestTopicId) {
+                                                  destTopics[normalizedTitle] = newDestTopicId;
+                                                  destTopicsTitleMap[newDestTopicId] = topicTitle;
+                                                  topicMap[sourceTopicId] = newDestTopicId;
+                                                  overrideThreadId = newDestTopicId;
+                                              }
+                                          } catch (e) {
+                                              console.warn(`Failed to create topic ${topicTitle}:`, e);
+                                              topicMap[sourceTopicId] = undefined;
                                           }
-                                          
-                                          if (newDestTopicId) {
-                                              destTopics[normalizedTitle] = newDestTopicId;
-                                              destTopicsTitleMap[newDestTopicId] = topicTitle;
-                                              topicMap[sourceTopicId] = newDestTopicId;
-                                              overrideThreadId = newDestTopicId;
-                                          }
-                                      } catch (e) {
-                                          console.warn(`Failed to create topic ${topicTitle}:`, e);
-                                          topicMap[sourceTopicId] = undefined;
                                       }
                                   }
                               }
@@ -4849,7 +4947,15 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
                           }
                           
                           // Final notification
-                          safeSendMessage(chatId, `🎊 **Full Mirror Completed!**\n\n✅ Successfully mirrored **${orderedTasks.length}** messages from \`${sourceId}\` to \`${dest.groupName}\`.\n\nEnjoy your content! 🚀`);
+                          const finalSession = activeFullMirrorSessions.get(sessionId);
+                          const finalSuccess = finalSession ? finalSession.successCount : 0;
+                          const finalTotal = orderedTasks.length;
+                          
+                          if (finalSuccess < finalTotal) {
+                              safeSendMessage(chatId, `🎊 **Full Mirror Finished!**\n\n✅ Successfully mirrored **${finalSuccess}** of **${finalTotal}** messages from \`${sourceId}\` to \`${dest.groupName}\`.\n\n⚠️ _Some messages (about ${finalTotal - finalSuccess}) were skipped because they were likely deleted, restricted, or empty actions._\n\nEnjoy your content! 🚀`);
+                          } else {
+                              safeSendMessage(chatId, `🎊 **Full Mirror Completed!**\n\n✅ Successfully mirrored **${finalSuccess}** messages from \`${sourceId}\` to \`${dest.groupName}\`.\n\nEnjoy your content! 🚀`);
+                          }
                           
                           // Clean up session from active map after a short delay
                           setTimeout(() => activeFullMirrorSessions.delete(sessionId), 60000);
@@ -6216,7 +6322,6 @@ const resolveSettingsUserId = async (fromId: number | undefined): Promise<string
           await bot?.answerCallbackQuery(query.id, { text: "⏭️ Skipping active task...", show_alert: false });
           return;
       }
-
     });
 
     bot.onText(/\/ping/, (msg) => {
@@ -7162,7 +7267,7 @@ const processBulkForward = async (
     threadId: number | undefined,
     onProgress: (done: number) => Promise<void>
 ) => {
-    const CHUNK_SIZE = 100;
+    const CHUNK_SIZE = 50;
     let totalDone = 0;
 
     for (let i = 0; i < msgIds.length; i += CHUNK_SIZE) {
@@ -7182,17 +7287,53 @@ const processBulkForward = async (
             // Small sleep to avoid flood wait for very large groups
             if (msgIds.length > CHUNK_SIZE) await new Promise(r => setTimeout(r, 1000));
         } catch (err: any) {
-            console.error(`[BulkForward] Error in chunk ${i}:`, err.message);
-            // If flood wait, respect it
-            if (err.errorMessage?.includes('FLOOD_WAIT_')) {
-                const seconds = parseInt(err.errorMessage.split('_')[2]) || 10;
+            console.error(`[BulkForward] Error in chunk starting at index ${i}:`, err.message);
+            
+            // Comprehensive FloodWait detection
+            const isFlood = err.name === 'FloodWaitError' || 
+                            err.errorMessage?.includes('FLOOD_WAIT_') || 
+                            (err.message && (err.message.includes('FloodWaitError') || err.message.includes('wait of') || err.message.includes('seconds is required')));
+            
+            if (isFlood) {
+                let seconds = 30;
+                const match = err.message.match(/wait of (\d+) seconds/i) || err.message.match(/(\d+) seconds/i);
+                if (match && match[1]) {
+                    seconds = parseInt(match[1]) + 2;
+                } else if (err.seconds) {
+                    seconds = err.seconds + 2;
+                } else if (err.errorMessage && err.errorMessage.includes('FLOOD_WAIT_')) {
+                    seconds = parseInt(err.errorMessage.split('_')[2]) || 30;
+                }
+                
                 console.log(`[BulkForward] Flood wait detected, sleeping for ${seconds}s`);
                 await new Promise(r => setTimeout(r, seconds * 1000));
-                i -= CHUNK_SIZE; // Retry this chunk
+                i -= CHUNK_SIZE; // Retry this chunk after sleep
                 continue;
             }
-            // Other errors, we might want to log and continue with next chunk or individual fallback?
-            // For "Fast Forward" we'll just log and continue for now.
+
+            // For other errors (like deleted messages), try forwarding individual items in this chunk
+            console.log(`[BulkForward] Chunk failed. Falling back to individual forwarding for ${chunk.length} items...`);
+            let chunkSuccessCount = 0;
+            for (const id of chunk) {
+                try {
+                    await client.invoke(new Api.messages.ForwardMessages({
+                        fromPeer: sourcePeer,
+                        id: [id],
+                        toPeer: destPeer,
+                        dropAuthor: true,
+                        topMsgId: threadId,
+                        randomId: [helpers.generateRandomLong(true)]
+                    }));
+                    chunkSuccessCount++;
+                    // Very small delay for individual items to avoid immediate flood
+                    await new Promise(r => setTimeout(r, 200));
+                } catch (indErr: any) {
+                    // Individually failed, likely deleted or restricted - skip it
+                    console.warn(`[BulkForward] Individual forward failed for msg ${id}:`, indErr.message);
+                }
+            }
+            totalDone += chunkSuccessCount;
+            await onProgress(totalDone);
         }
     }
 };
@@ -7203,6 +7344,7 @@ interface ActiveJob {
     userId: number;
     phase: 'searching' | 'downloading' | 'uploading' | 'cooldown';
     isMirror?: boolean;
+    sourceId?: string;
     progress?: {
         total: number;
         current: number;
@@ -7425,6 +7567,7 @@ async function dbEnqueueTask(task: Task) {
                 forceGeneralPath: task.forceGeneralPath,
                 overrideTargetId: task.overrideTargetId,
                 isMirror: task.isMirror,
+                sourceId: task.sourceId,
                 fullMirrorSessionId: task.fullMirrorSessionId,
                 topicCloneSessionId: task.topicCloneSessionId,
                 isForwardOnly: task.isForwardOnly,
@@ -7633,9 +7776,24 @@ runNextTask = async () => {
     // Find the first task whose user has available task slots
     let taskIndex = -1;
     for (let i = 0; i < taskQueue.length; i++) {
-        const uIdKey = getTaskUserKey(taskQueue[i].userId);
+        const task = taskQueue[i];
+        const uIdKey = getTaskUserKey(task.userId);
         const uActive = activeTasksPerUser.get(uIdKey) || 0;
+        
         if (uActive < MAX_TASKS_PER_USER) {
+            // Enhanced Sequencing: Prevent parallel processing of tasks from the same source
+            // This ensures that for a live mirror, messages are processed one by one in order
+            if (task.isMirror && task.sourceId) {
+                const normalizedTaskSource = normalizeSourceId(task.sourceId);
+                const isSourceBusy = Array.from(activeTaskJobs.values()).some(j => 
+                    j.isMirror && normalizeSourceId(j.sourceId) === normalizedTaskSource
+                );
+                if (isSourceBusy) {
+                    console.log(`[Queue] Skipping task ${task.link} - Source ${task.sourceId} is currently busy. Preserving sequence.`);
+                    continue; 
+                }
+            }
+            
             taskIndex = i;
             break;
         }
@@ -7675,7 +7833,8 @@ runNextTask = async () => {
         userId: task.userId,
         phase: 'searching',
         startTime: Date.now(),
-        isMirror: task.isMirror
+        isMirror: task.isMirror,
+        sourceId: task.sourceId
     });
     
     console.log(`[Queue] Task assigned. activeTasksCount: ${activeTasksCount}, User ${fromIdKey} active: ${currentActiveForUser}`);
@@ -7807,7 +7966,7 @@ runNextTask = async () => {
                 finalDone = true;
             } else {
                 // Task timeout is completely removed as requested, allowing unlimited download time for large content.
-                success = await processTask(task.chatId, task.link, statusMsgId, fromId, task.overrideThreadId, task.forceGeneralPath, task.overrideTargetId, task.isMirror, task.isForwardOnly, task.skipForwarding);
+                success = await processTask(task.chatId, task.link, statusMsgId, fromId, task.overrideThreadId, task.forceGeneralPath, task.overrideTargetId, task.isMirror, task.isForwardOnly, task.isBotForward, task.skipForwarding, task.sequenceIndex);
                 finalDone = true;
             }
         } catch (taskErr: any) {
@@ -7839,7 +7998,7 @@ runNextTask = async () => {
                 taskQueue.unshift(task); // Re-queue at the front
                 dbRequeueFrontTask(task).catch(e => console.error("[Queue DB] requeue front error on retry:", e));
                 await safeEditMessage(`⚠️ **Task Error:** ${taskErr.message}\nRetrying (${task.retries}/3)...\n\n🔗 **Link:** ${task.link}`, { chat_id: task.chatId, message_id: statusMsgId });
-                if (taskErr.message?.includes('Timeout')) {
+                if (taskErr.message?.toUpperCase().includes('TIMEOUT')) {
                     await sleep(3000); // Give MTProto more time
                 }
             } else {
@@ -7962,7 +8121,7 @@ runNextTask = async () => {
     }
 };
 
-async function updateMirrorPathLastId(userId: number, sourceId: string, lastId: number) {
+async function updateMirrorPathLastId(userId: number, sourceId: string, lastId: number, seq?: number) {
     if (!approvedUsersCollection) return;
     try {
         const settingsUid = await resolveSettingsUserId(userId);
@@ -7979,6 +8138,9 @@ async function updateMirrorPathLastId(userId: number, sourceId: string, lastId: 
                 updated = true;
                 if (!p.lastProcessedMsgId || lastId > p.lastProcessedMsgId) {
                     p.lastProcessedMsgId = lastId;
+                }
+                if (seq !== undefined) {
+                    p.sequenceIndex = seq;
                 }
             }
             return p;
@@ -8179,19 +8341,27 @@ async function catchUpLiveMirrors(userId: number, client: TelegramClient) {
                         // Notify user about start
                         bot?.sendMessage(userId, `🚀 **Live Mirror Detected New Content!**\n\nStarting download for: ${virtualLink}`, { parse_mode: 'Markdown' }).catch(() => {});
 
-                const newTask = {
-                    chatId: userId,
-                    link: virtualLink,
-                    userId: userId,
-                    overrideThreadId: destTopicId,
-                    overrideTargetId: destId,
-                    isMirror: true,
-                    isForwardOnly: false,
-                    skipForwarding: true,
-                    retries: 0
-                };
+                        const nextSeq = (pathObj.sequenceIndex || 0) + 1;
+                        pathObj.sequenceIndex = nextSeq;
+
+                        const newTask = {
+                            chatId: userId,
+                            link: virtualLink,
+                            userId: userId,
+                            overrideThreadId: destTopicId,
+                            overrideTargetId: destId,
+                            isMirror: true,
+                            isForwardOnly: false,
+                            skipForwarding: true,
+                            retries: 0,
+                            sourceId: normalizeSourceId(pathObj.sourceId), // Track source for sequential processing
+                            sequenceIndex: nextSeq
+                        };
                         taskQueue.push(newTask);
                         dbEnqueueTask(newTask).catch(e => console.error("[Queue DB] enqueue error:", e));
+                        
+                        // Keep track of the last processed message ID and sequence in real-time
+                        await updateMirrorPathLastId(userId, sourceId, m.id, nextSeq);
 
                         pathObj.lastProcessedMsgId = m.id;
                     }
@@ -8236,18 +8406,37 @@ startAutoMirrorWatcher = async (userId: number, client: TelegramClient) => {
     console.log(`[Watcher] Starting Auto-Mirror for user ${userId}`);
 
     client.addEventHandler(async (event: any) => {
-        try {
-            const message = event.message;
-            if (!message || message.out) return;
+        // Strict Sequencing: Queue the event processing to ensure serial execution for this user
+        const currentLock = watcherLocks.get(userId) || Promise.resolve();
+        const nextLock = currentLock.then(async () => {
+            try {
+                const message = event.message;
+                if (!message || message.out) return;
 
-            // Only detect messages that contain actual files/media (document or photo)
-            const hasFile = message.media && (
-                message.media instanceof Api.MessageMediaDocument ||
-                message.media instanceof Api.MessageMediaPhoto
-            );
+                // Only detect messages that contain actual files/media (document or photo)
+                const hasFile = message.media && (
+                    message.media instanceof Api.MessageMediaDocument ||
+                    message.media instanceof Api.MessageMediaPhoto
+                );
 
-            if (!hasFile) {
-                // Keep track of the last processed message ID so we don't scan it during catch-up
+                if (!hasFile) {
+                    // Keep track of the last processed message ID so we don't scan it during catch-up
+                    let chatIdRaw = '';
+                    if (event.chatId) {
+                        chatIdRaw = event.chatId.toString().replace('-100', '');
+                    } else if (message.peerId) {
+                        const pid = message.peerId;
+                        if (pid.channelId) chatIdRaw = pid.channelId.toString().replace('-100', '');
+                        else if (pid.chatId) chatIdRaw = pid.chatId.toString();
+                        else if (pid.userId) chatIdRaw = pid.userId.toString();
+                    }
+                    if (chatIdRaw) {
+                        await updateMirrorPathLastId(userId, chatIdRaw, message.id).catch(() => {});
+                    }
+                    return;
+                }
+
+                // Use event.match or event.chatId as it's more consistent in GramJS
                 let chatIdRaw = '';
                 if (event.chatId) {
                     chatIdRaw = event.chatId.toString().replace('-100', '');
@@ -8257,223 +8446,216 @@ startAutoMirrorWatcher = async (userId: number, client: TelegramClient) => {
                     else if (pid.chatId) chatIdRaw = pid.chatId.toString();
                     else if (pid.userId) chatIdRaw = pid.userId.toString();
                 }
-                if (chatIdRaw) {
-                    await updateMirrorPathLastId(userId, chatIdRaw, message.id).catch(() => {});
+                
+                if (!chatIdRaw) return;
+                
+                const settingsUid = await resolveSettingsUserId(userId);
+                const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
+                const paths = userDoc?.mirrorPaths || [];
+                
+                // Normalize IDs for robust matching
+                const normalize = (id: any) => id?.toString().replace('-100', '');
+
+                // 1. Match by Normalized Chat ID
+                const cleanChatId = chatIdRaw;
+                let matchingPaths = paths.filter((p: any) => 
+                    p.isLive === true && (
+                        normalize(p.sourceId) === cleanChatId || 
+                        normalize(p.sourceNumericId) === cleanChatId
+                    )
+                );
+
+                // 2. Fallback: match by Username if not matched yet
+                if (matchingPaths.length === 0) {
+                    try {
+                        const chatEntity = await message.getChat();
+                        if (chatEntity && chatEntity.username) {
+                            const currentUsername = chatEntity.username.toLowerCase();
+                            matchingPaths = paths.filter((p: any) => 
+                                p.isLive === true && (
+                                    (p.sourceUsername && p.sourceUsername.toLowerCase() === currentUsername) ||
+                                    (p.sourceId && p.sourceId.replace('@', '').toLowerCase() === currentUsername)
+                                )
+                            );
+                        }
+                    } catch (e) {}
                 }
-                return;
-            }
 
-            // Use event.match or event.chatId as it's more consistent in GramJS
-            let chatIdRaw = '';
-            if (event.chatId) {
-                chatIdRaw = event.chatId.toString().replace('-100', '');
-            } else if (message.peerId) {
-                const pid = message.peerId;
-                if (pid.channelId) chatIdRaw = pid.channelId.toString().replace('-100', '');
-                else if (pid.chatId) chatIdRaw = pid.chatId.toString();
-                else if (pid.userId) chatIdRaw = pid.userId.toString();
-            }
-            
-            if (!chatIdRaw) return;
-            
-            const settingsUid = await resolveSettingsUserId(userId);
-            const userDoc = await approvedUsersCollection?.findOne({ userId: settingsUid });
-            const paths = userDoc?.mirrorPaths || [];
-            
-            // Normalize IDs for robust matching
-            const normalize = (id: any) => id?.toString().replace('-100', '');
+                if (matchingPaths.length > 0) {
+                    const blockedTopics = (userDoc?.blockedTopics || []).map((t: string) => t.trim().toLowerCase());
 
-            // 1. Match by Normalized Chat ID
-            const cleanChatId = chatIdRaw;
-            let matchingPaths = paths.filter((p: any) => 
-                p.isLive === true && (
-                    normalize(p.sourceId) === cleanChatId || 
-                    normalize(p.sourceNumericId) === cleanChatId
-                )
-            );
-
-            // 2. Fallback: match by Username if not matched yet
-            if (matchingPaths.length === 0) {
-                try {
-                    const chatEntity = await message.getChat();
-                    if (chatEntity && chatEntity.username) {
-                        const currentUsername = chatEntity.username.toLowerCase();
-                        matchingPaths = paths.filter((p: any) => 
-                            p.isLive === true && (
-                                (p.sourceUsername && p.sourceUsername.toLowerCase() === currentUsername) ||
-                                (p.sourceId && p.sourceId.replace('@', '').toLowerCase() === currentUsername)
-                            )
-                        );
+                    // ID-based blocked topics check first
+                    const replyTo = message.replyTo;
+                    let sourceTopicId = undefined;
+                    if (replyTo instanceof Api.MessageReplyHeader) {
+                        sourceTopicId = replyTo.replyToTopId || replyTo.replyToMsgId;
                     }
-                } catch (e) {}
-            }
-
-            if (matchingPaths.length > 0) {
-                const blockedTopics = (userDoc?.blockedTopics || []).map((t: string) => t.trim().toLowerCase());
-
-                // ID-based blocked topics check first
-                const replyTo = message.replyTo;
-                let sourceTopicId = undefined;
-                if (replyTo instanceof Api.MessageReplyHeader) {
-                    sourceTopicId = replyTo.replyToTopId || replyTo.replyToMsgId;
-                }
-                
-                if (sourceTopicId && sourceTopicId !== 1) {
-                    const blockStr = `-100${chatIdRaw}_${sourceTopicId}`.toLowerCase();
-                    const blockStrWithoutMinus100 = `${chatIdRaw}_${sourceTopicId}`.toLowerCase();
-                    if (blockedTopics.some((bt: string) => bt === sourceTopicId.toString() || bt === blockStr || bt === blockStrWithoutMinus100)) {
-                        console.log(`[Watcher] Skipping blocked topic for live message ${message.id} (Topic ID: ${sourceTopicId})`);
-                        await updateMirrorPathLastId(userId, chatIdRaw, message.id).catch(() => {});
-                        return;
-                    }
-                }
-
-                let topicName = 'General';
-                
-                // Determine Topic Name from reply header
-                let topicIdForResolution = sourceTopicId;
-                
-                // Proactively handle Topic Creation service messages
-                if (message.action instanceof Api.MessageActionTopicCreate) {
-                    topicName = (message.action as any).title || 'General';
-                    topicIdForResolution = message.id; // The creation message ID is the topic ID
-                    console.log(`[Watcher] New topic detected in source: ${topicName} (ID: ${topicIdForResolution})`);
                     
-                    if (!sourceTopicCache.has(chatIdRaw)) sourceTopicCache.set(chatIdRaw, new Map());
-                    const chatTopicCache = sourceTopicCache.get(chatIdRaw)!;
-                    chatTopicCache.set(topicIdForResolution, topicName);
-                } else if (topicIdForResolution && topicIdForResolution !== 1) {
-                    if (!sourceTopicCache.has(chatIdRaw)) sourceTopicCache.set(chatIdRaw, new Map());
-                    const chatTopicCache = sourceTopicCache.get(chatIdRaw)!;
+                    if (sourceTopicId && sourceTopicId !== 1) {
+                        const blockStr = `-100${chatIdRaw}_${sourceTopicId}`.toLowerCase();
+                        const blockStrWithoutMinus100 = `${chatIdRaw}_${sourceTopicId}`.toLowerCase();
+                        if (blockedTopics.some((bt: string) => bt === sourceTopicId.toString() || bt === blockStr || bt === blockStrWithoutMinus100)) {
+                            console.log(`[Watcher] Skipping blocked topic for live message ${message.id} (Topic ID: ${sourceTopicId})`);
+                            await updateMirrorPathLastId(userId, chatIdRaw, message.id).catch(() => {});
+                            return;
+                        }
+                    }
 
-                    if (chatTopicCache.has(topicIdForResolution)) {
-                        topicName = chatTopicCache.get(topicIdForResolution)!;
-                    } else {
-                        try {
-                            const chatEntity = await message.getChat();
-                            let foundTopic = null;
+                    let topicName = 'General';
+                    
+                    // Determine Topic Name from reply header
+                    let topicIdForResolution = sourceTopicId;
+                    
+                    // Proactively handle Topic Creation service messages
+                    if (message.action instanceof Api.MessageActionTopicCreate) {
+                        topicName = (message.action as any).title || 'General';
+                        topicIdForResolution = message.id; // The creation message ID is the topic ID
+                        console.log(`[Watcher] New topic detected in source: ${topicName} (ID: ${topicIdForResolution})`);
+                        
+                        if (!sourceTopicCache.has(chatIdRaw)) sourceTopicCache.set(chatIdRaw, new Map());
+                        const chatTopicCache = sourceTopicCache.get(chatIdRaw)!;
+                        chatTopicCache.set(topicIdForResolution, topicName);
+                    } else if (topicIdForResolution && topicIdForResolution !== 1) {
+                        if (!sourceTopicCache.has(chatIdRaw)) sourceTopicCache.set(chatIdRaw, new Map());
+                        const chatTopicCache = sourceTopicCache.get(chatIdRaw)!;
+
+                        if (chatTopicCache.has(topicIdForResolution)) {
+                            topicName = chatTopicCache.get(topicIdForResolution)!;
+                        } else {
                             try {
-                                const topicsResult: any = await client.invoke(new Api.channels.GetForumTopics({
-                                    channel: chatEntity,
-                                    limit: 500 // Search deeper
-                                }));
-                                foundTopic = topicsResult.topics?.find((t: any) => t.id === topicIdForResolution);
-                            } catch (e1) {}
+                                const chatEntity = await message.getChat();
+                                let foundTopic = null;
+                                try {
+                                    const topicsResult: any = await client.invoke(new Api.channels.GetForumTopics({
+                                        channel: chatEntity,
+                                        limit: 500 // Search deeper
+                                    }));
+                                    foundTopic = topicsResult.topics?.find((t: any) => t.id === topicIdForResolution);
+                                } catch (e1) {}
 
-                            if (foundTopic) {
-                                topicName = foundTopic.title;
-                                chatTopicCache.set(topicIdForResolution, topicName);
-                            } else {
-                                // Fallback: inspect starting topic message directly
-                                const msgs = await client.getMessages(chatEntity, { ids: [topicIdForResolution] });
-                                if (msgs && msgs.length > 0) {
-                                    const topicMsg = msgs[0];
-                                    if (topicMsg?.action && (topicMsg.action as any).title) {
-                                        topicName = (topicMsg.action as any).title;
-                                        chatTopicCache.set(topicIdForResolution, topicName);
+                                if (foundTopic) {
+                                    topicName = foundTopic.title;
+                                    chatTopicCache.set(topicIdForResolution, topicName);
+                                } else {
+                                    // Fallback: inspect starting topic message directly
+                                    const msgs = await client.getMessages(chatEntity, { ids: [topicIdForResolution] });
+                                    if (msgs && msgs.length > 0) {
+                                        const topicMsg = msgs[0];
+                                        if (topicMsg?.action && (topicMsg.action as any).title) {
+                                            topicName = (topicMsg.action as any).title;
+                                            chatTopicCache.set(topicIdForResolution, topicName);
+                                        }
                                     }
                                 }
+                            } catch (err: any) {
+                                console.error(`[Watcher] Failed to get topic info for ID ${topicIdForResolution}: ${err.message}`);
+                            }
+                        }
+                    }
+
+                    console.log(`[Watcher] Processing message ${message.id} in topic "${topicName}" (ID: ${topicIdForResolution || 'General'})`);
+
+                    // Title-based blocked topics check
+                    if (topicName && topicName !== 'General') {
+                        const normTitle = topicName.trim().toLowerCase();
+                        if (blockedTopics.some((bt: string) => bt === normTitle)) {
+                            console.log(`[Watcher] Skipping blocked topic for live message ${message.id} (Topic Title: ${topicName})`);
+                            await updateMirrorPathLastId(userId, chatIdRaw, message.id).catch(() => {});
+                            return;
+                        }
+                    }
+
+                    // Select the best matching path from matchingPaths based on topicName
+                    let match = matchingPaths.find((p: any) => p.topicName && p.topicName.trim().toLowerCase() === topicName.trim().toLowerCase());
+                    if (!match) {
+                        // Fallback to general/full mirror path
+                        match = matchingPaths.find((p: any) => !p.topicName || p.topicName === 'General');
+                    }
+
+                    if (!match) {
+                        console.log(`[Watcher] No matching path/topic mirror config found for topic "${topicName}" in source ${chatIdRaw}`);
+                        return;
+                    }
+
+                    console.log(`[Watcher] Match found! Source: ${match.sourceId} (Topic: ${topicName}) -> Dest: ${match.destId}`);
+
+                    const destId = match.destId;
+                    let destTopicId = match.destThreadId ? Number(match.destThreadId) : undefined;
+                    
+                    // If the user hasn't pinned it to a specific sub-topic (destThreadId 1 or undefined)
+                    // and we have a valid topic name from source, try to map it.
+                    if ((!destTopicId || destTopicId === 1) && topicName !== 'General') {
+                        try {
+                            const destEntity = await safelyResolveFullEntity(client, destId);
+                            if (destEntity && (destEntity as any).forum) {
+                                const result = await getOrCreateTopic(client, destEntity, topicName);
+                                if (result.topicId) {
+                                    destTopicId = result.topicId;
+                                    console.log(`[Watcher] Resolved/Created dest topic "${topicName}" -> ID: ${destTopicId}`);
+                                } else {
+                                    console.warn(`[Watcher] Could not resolve/create dest topic "${topicName}": ${result.error}`);
+                                }
+                            } else {
+                                console.log(`[Watcher] Destination ${destId} is not a forum, skipping topic resolution.`);
                             }
                         } catch (err: any) {
-                            console.error(`[Watcher] Failed to get topic info for ID ${topicIdForResolution}: ${err.message}`);
+                            console.error(`[Watcher] Topic resolution error for ${topicName}: ${err.message}`);
                         }
                     }
-                }
 
-                console.log(`[Watcher] Processing message ${message.id} in topic "${topicName}" (ID: ${topicIdForResolution || 'General'})`);
-
-                // Title-based blocked topics check
-                if (topicName && topicName !== 'General') {
-                    const normTitle = topicName.trim().toLowerCase();
-                    if (blockedTopics.some((bt: string) => bt === normTitle)) {
-                        console.log(`[Watcher] Skipping blocked topic for live message ${message.id} (Topic Title: ${topicName})`);
-                        await updateMirrorPathLastId(userId, chatIdRaw, message.id).catch(() => {});
+                    const entityId = chatIdRaw.replace('-100', '');
+                    const virtualLink = `https://t.me/c/${entityId}/${message.id}`;
+                    
+                    // If it was just a topic creation, we don't need to mirror a specific message
+                    if (message.action instanceof Api.MessageActionTopicCreate) {
                         return;
                     }
-                }
 
-                // Select the best matching path from matchingPaths based on topicName
-                let match = matchingPaths.find((p: any) => p.topicName && p.topicName.trim().toLowerCase() === topicName.trim().toLowerCase());
-                if (!match) {
-                    // Fallback to general/full mirror path
-                    match = matchingPaths.find((p: any) => !p.topicName || p.topicName === 'General');
-                }
-
-                if (!match) {
-                    console.log(`[Watcher] No matching path/topic mirror config found for topic "${topicName}" in source ${chatIdRaw}`);
-                    return;
-                }
-
-                console.log(`[Watcher] Match found! Source: ${match.sourceId} (Topic: ${topicName}) -> Dest: ${match.destId}`);
-
-                const destId = match.destId;
-                let destTopicId = match.destThreadId ? Number(match.destThreadId) : undefined;
-                
-                // If the user hasn't pinned it to a specific sub-topic (destThreadId 1 or undefined)
-                // and we have a valid topic name from source, try to map it.
-                if ((!destTopicId || destTopicId === 1) && topicName !== 'General') {
-                    try {
-                        const destEntity = await safelyResolveFullEntity(client, destId);
-                        if (destEntity && (destEntity as any).forum) {
-                            const result = await getOrCreateTopic(client, destEntity, topicName);
-                            if (result.topicId) {
-                                destTopicId = result.topicId;
-                                console.log(`[Watcher] Resolved/Created dest topic "${topicName}" -> ID: ${destTopicId}`);
-                            } else {
-                                console.warn(`[Watcher] Could not resolve/create dest topic "${topicName}": ${result.error}`);
-                            }
-                        } else {
-                            console.log(`[Watcher] Destination ${destId} is not a forum, skipping topic resolution.`);
+                    console.log(`[Watcher] Queuing mirror task: ${virtualLink} | Topic Name: ${topicName} | Dest Thread: ${destTopicId || 'General'}`);
+                    
+                    // --- INCREMENTAL MIRRORING CHECK ---
+                    if (mirroredMessagesCollection) {
+                        const alreadyMirrored = await mirroredMessagesCollection.findOne({ link: virtualLink, destId: match.destId });
+                        if (alreadyMirrored) {
+                            console.log(`[Watcher] Message already mirrored, skipping: ${virtualLink}`);
+                            return;
                         }
-                    } catch (err: any) {
-                        console.error(`[Watcher] Topic resolution error for ${topicName}: ${err.message}`);
                     }
-                }
+                    
+                    // Notify user about start
+                    bot?.sendMessage(userId, `🚀 **Live Mirror Detected New Content!**\n\nStarting download for: ${virtualLink}`, { parse_mode: 'Markdown' }).catch(() => {});
 
-                const entityId = chatIdRaw.replace('-100', '');
-                const virtualLink = `https://t.me/c/${entityId}/${message.id}`;
-                
-                // If it was just a topic creation, we don't need to mirror a specific message
-                if (message.action instanceof Api.MessageActionTopicCreate) {
-                    return;
-                }
+                    const nextSeq = (match.sequenceIndex || 0) + 1;
+                    match.sequenceIndex = nextSeq;
 
-                console.log(`[Watcher] Queuing mirror task: ${virtualLink} | Topic Name: ${topicName} | Dest Thread: ${destTopicId || 'General'}`);
-                
-                // --- INCREMENTAL MIRRORING CHECK ---
-                if (mirroredMessagesCollection) {
-                    const alreadyMirrored = await mirroredMessagesCollection.findOne({ link: virtualLink, destId: match.destId });
-                    if (alreadyMirrored) {
-                        console.log(`[Watcher] Message already mirrored, skipping: ${virtualLink}`);
-                        return;
-                    }
+                    const newTask = {
+                        chatId: userId, 
+                        link: virtualLink,
+                        userId: userId,
+                        overrideThreadId: destTopicId,
+                        overrideTargetId: match.destId,
+                        isMirror: true,
+                        isForwardOnly: false,
+                        skipForwarding: true,
+                        retries: 0,
+                        sourceId: normalizeSourceId(match.sourceId), // Track source for sequential processing
+                        sequenceIndex: nextSeq
+                    };
+                    taskQueue.push(newTask);
+                    dbEnqueueTask(newTask).catch(e => console.error("[Queue DB] enqueue error:", e));
+                    
+                    runNextTask();
+                    
+                    // Keep track of the last processed message ID in real-time
+                    await updateMirrorPathLastId(userId, chatIdRaw, message.id, nextSeq);
                 }
-                
-                // Notify user about start
-                bot?.sendMessage(userId, `🚀 **Live Mirror Detected New Content!**\n\nStarting download for: ${virtualLink}`, { parse_mode: 'Markdown' }).catch(() => {});
-
-                const newTask = {
-                    chatId: userId, 
-                    link: virtualLink,
-                    userId: userId,
-                    overrideThreadId: destTopicId,
-                    overrideTargetId: match.destId,
-                    isMirror: true,
-                    isForwardOnly: false,
-                    skipForwarding: true,
-                    retries: 0
-                };
-                taskQueue.push(newTask);
-                dbEnqueueTask(newTask).catch(e => console.error("[Queue DB] enqueue error:", e));
-                
-                runNextTask();
-                
-                // Keep track of the last processed message ID in real-time
-                await updateMirrorPathLastId(userId, chatIdRaw, message.id);
+            } catch (e: any) {
+                console.error(`[Watcher] Event Handler Error: ${e.message}`);
             }
-        } catch (e: any) {
-            console.error(`[Watcher] Event Handler Error: ${e.message}`);
-        }
+        }).catch(err => {
+            console.error(`[Watcher] Sequence Lock Fatal:`, err);
+        });
+        watcherLocks.set(userId, nextLock);
     }, new NewMessage({}));
 
     // Trigger catch-up scanning for any messages sent during downtime
@@ -8865,7 +9047,8 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => {
         return { client: prefClient, userId: preferredUserId, peer: null };
     };
 
-    const processTask = async (chatId: number, link: string, statusMsgId: number, userId: number, threadIdOverride?: number, forceGeneralPath?: boolean, targetIdOverride?: any, isMirror?: boolean, isForwardOnly?: boolean, skipForwarding?: boolean): Promise<boolean> => {
+    const processTask = async (chatId: number, link: string, statusMsgId: number, userId: number, threadIdOverride?: number, forceGeneralPath?: boolean, targetIdOverride?: any, isMirror?: boolean, isForwardOnly?: boolean, isBotForward?: boolean, skipForwarding?: boolean, sequenceIndex?: number): Promise<boolean> => {
+        const task = { chatId, link, statusMsgId, userId, overrideThreadId: threadIdOverride, forceGeneralPath, overrideTargetId: targetIdOverride, isMirror, isForwardOnly, isBotForward, skipForwarding, sequenceIndex };
         let cleanLink = link.trim();
         let destTargetStr = (targetIdOverride || "Default").toString();
         let tempFilePath: string | undefined = undefined;
@@ -9070,17 +9253,19 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => {
             };
 
             await safeEditMessage("🔍 **Locating content...**", { chat_id: chatId, message_id: statusMsgId });
-            const sourcePeer = resolvedSourcePeer || await safelyResolveEntity(sourceClient, linkData.channelId);
-
-            await safeEditMessage("📥 **Retrieving content...**", { chat_id: chatId, message_id: statusMsgId });
-            
             let msg: any;
             let retryCount = 0;
             let timeoutRetryCount = 0;
             const maxRetries = 2;
             const maxTimeoutRetries = 7;
+            let sourcePeer: any = resolvedSourcePeer;
+
             while (retryCount <= maxRetries && timeoutRetryCount <= maxTimeoutRetries) {
                 try {
+                    if (!sourcePeer) {
+                        sourcePeer = await safelyResolveEntity(sourceClient, linkData.channelId);
+                    }
+                    
                     if (typeof sourceClient.getMessages !== 'function') {
                         console.error(`[Error] sourceClient does not have getMessages! Client: ${sourceClient?.constructor?.name}`);
                         throw new Error("sourceClient is not a valid TelegramClient");
@@ -9154,10 +9339,44 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => {
                     const blockStr = `-100${sourceGroupIdStr}_${sourceThreadId}`.toLowerCase();
                     const blockStrWithoutMinus100 = `${sourceGroupIdStr}_${sourceThreadId}`.toLowerCase();
                     
+                    // ID-based block check
                     if (blockedTopics.some((bt: string) => bt === sourceThreadId.toString() || bt === blockStr || bt === blockStrWithoutMinus100)) {
                         console.log(`[Queue] Skipping blocked topic for message ${linkData.msgId} (ThreadId: ${sourceThreadId})`);
-                        await safeEditMessage(`🚫 **Skipped task (Blocked Topic):**\n└ Link: ${link}`, { chat_id: chatId, message_id: statusMsgId });
-                        return true; // Return success so queue continues without breaking
+                        await safeEditMessage(`🚫 **Skipped task (Blocked Topic ID):**\n└ Link: ${link}`, { chat_id: chatId, message_id: statusMsgId });
+                        return true; 
+                    }
+
+                    // Title-based block check (if it's a forum)
+                    const chatEntity = await msg.getChat().catch(() => null);
+                    if (chatEntity && (chatEntity as any).forum) {
+                        let topicName = 'General';
+                        if (!sourceTopicCache.has(sourceGroupIdStr)) sourceTopicCache.set(sourceGroupIdStr, new Map());
+                        const chatTopicCache = sourceTopicCache.get(sourceGroupIdStr)!;
+                        
+                        if (chatTopicCache.has(sourceThreadId)) {
+                            topicName = chatTopicCache.get(sourceThreadId)!;
+                        } else {
+                            try {
+                                const topicsResult: any = await sourceClient.invoke(new Api.channels.GetForumTopics({
+                                    channel: chatEntity,
+                                    limit: 500
+                                }));
+                                const foundTopic = topicsResult.topics?.find((t: any) => t.id === sourceThreadId);
+                                if (foundTopic) {
+                                    topicName = foundTopic.title;
+                                    chatTopicCache.set(sourceThreadId, topicName);
+                                }
+                            } catch (e) {}
+                        }
+
+                        if (topicName && topicName !== 'General') {
+                            const normTitle = topicName.trim().toLowerCase();
+                            if (blockedTopics.some((bt: string) => bt === normTitle)) {
+                                console.log(`[Queue] Skipping blocked topic for message ${linkData.msgId} (Topic Title: ${topicName})`);
+                                await safeEditMessage(`🚫 **Skipped task (Blocked Topic: ${topicName}):**\n└ Link: ${link}`, { chat_id: chatId, message_id: statusMsgId });
+                                return true;
+                            }
+                        }
                     }
                 }
             }
@@ -9167,6 +9386,41 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => {
             
             let forwardAttempted = false;
             let forwardErrorMsg: string | null = null;
+
+            // NEW: Bot-level forward attempt (Bot account instead of Userbot)
+            // We can trigger this if sourceGroupIdStr is a public username or bot is admin there
+            if (isBotForward) {
+                try {
+                    // Try Bot API forward first
+                    // Ensure Bot API format for chat IDs and usernames
+                    const botSourceId = (typeof linkData.channelId === 'string' && !linkData.channelId.startsWith('-') && !linkData.channelId.startsWith('@')) 
+                        ? `@${linkData.channelId}` 
+                        : linkData.channelId;
+                    const botDestId = (typeof uploadTarget === 'string' && !uploadTarget.startsWith('-') && !uploadTarget.startsWith('@') && isNaN(Number(uploadTarget)))
+                        ? `@${uploadTarget}`
+                        : uploadTarget;
+
+                    console.log(`[Bot] Attempting Bot API forward for ${linkData.msgId} from ${botSourceId} to ${botDestId}`);
+                    const botForwardResult = await bot.forwardMessage(botDestId, botSourceId, linkData.msgId);
+                    if (botForwardResult) {
+                        const kb: any[] = [];
+                        const row: any[] = [];
+                        if (link && link.startsWith("http")) row.push({ text: "⏪ Source", url: link });
+                        if (row.length > 0) kb.push(row);
+
+                        await safeEditMessage(`🎯 **Success! (Bot Account Forward)**`, { 
+                            chat_id: chatId, 
+                            message_id: statusMsgId,
+                            reply_markup: kb.length > 0 ? { inline_keyboard: kb } : undefined
+                        });
+                        await recordSuccessfulMirror();
+                        return true;
+                    }
+                } catch (botErr: any) {
+                    console.log(`[Bot] Bot API forward failed: ${botErr.message}. Falling back to Userbot forward.`);
+                }
+            }
+
             if (msg.noforwards || (msg as any).noforwards) {
                 console.log(`[Debug] Direct forward not possible: Message noforwards flag is set.`);
                 canForward = false;
@@ -9267,7 +9521,18 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => {
 
             if (!msg.media || msg.media instanceof Api.MessageMediaWebPage) {
                 await ensureClientConnected(destClient);
-                await destClient.sendMessage(finalDestPeer, { message: applyRenameRules(msg.message || "", customRules), replyTo: threadId });
+                // Sequential Mode: Get topic context for dynamic renaming
+                let msgTopicName = "General";
+                const sourceGroupIdStr = linkData.channelId.toString().replace('-100', '');
+                const sourceThreadId = msg.replyTo?.replyToTopId || msg.replyTo?.replyToMsgId || msg.replyToMsgId;
+                if (sourceThreadId && sourceTopicCache.has(sourceGroupIdStr)) {
+                    msgTopicName = sourceTopicCache.get(sourceGroupIdStr)?.get(sourceThreadId) || "General";
+                }
+
+                await destClient.sendMessage(finalDestPeer, { 
+                    message: applyRenameRules(msg.message || "", customRules, { msgId: msg.id, topicName: msgTopicName, seq: (task as any).sequenceIndex }), 
+                    replyTo: threadId 
+                });
                 
                 const kb: any[] = [];
                 const row: any[] = [];
@@ -9388,7 +9653,21 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => {
             } else if (msg.media instanceof Api.MessageMediaPhoto) {
                 filename = "photo.jpg";
             }
-            filename = applyRenameRules(filename, customRules);
+            // Sequential Mode: Get topic context for dynamic renaming
+            let msgTopicName = "General";
+            const sourceGroupIdStr = linkData.channelId.toString().replace('-100', '');
+            const sourceThreadId = msg.replyTo?.replyToTopId || msg.replyTo?.replyToMsgId || msg.replyToMsgId;
+            if (sourceThreadId && sourceTopicCache.has(sourceGroupIdStr)) {
+                msgTopicName = sourceTopicCache.get(sourceGroupIdStr)?.get(sourceThreadId) || "General";
+            }
+
+            filename = applyRenameRules(filename, customRules, { msgId: msg.id, topicName: msgTopicName, seq: (task as any).sequenceIndex });
+            // Sanitize filename more aggressively to handle wide range of unicode and filesystem restrictions
+            filename = filename.replace(/[\\/:*?"<>|]/g, '_').replace(/[\x00-\x1F\x7F]/g, '');
+            if (filename.length > 150) {
+                const ext = path.extname(filename);
+                filename = filename.substring(0, 140) + ext;
+            }
 
             tempFilePath = path.join(os.tmpdir(), `dl_${userId}_${linkData.channelId}_${linkData.msgId}_${filename}`);
             thumbPath = path.join(os.tmpdir(), `thumb_${userId}_${linkData.channelId}_${linkData.msgId}.jpg`);
@@ -9573,11 +9852,12 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => {
             const totalSize = fs.statSync(tempFilePath).size;
             let lastUploadUpdate = 0;
 
-            let uploadWorkers = 12;
-            if (totalSize > 1000 * 1024 * 1024) { // > 1GB
-                uploadWorkers = 24;
+            // Optimized Upload Engine v4.0 (Turbo)
+            let uploadWorkers = 24;
+            if (totalSize > 1500 * 1024 * 1024) { // > 1.5GB
+                uploadWorkers = 32;
             } else if (totalSize > 500 * 1024 * 1024) { // > 500 MB
-                uploadWorkers = 16;
+                uploadWorkers = 24;
             } else if (totalSize > 100 * 1024 * 1024) {
                 uploadWorkers = 16;
             } else if (totalSize > 20 * 1024 * 1024) {
@@ -9666,7 +9946,15 @@ createProgressMarkup = (jobKey: string, isPaused: boolean) => {
                         }));
                     }
                     
-                    let caption = applyRenameRules(msg.message || "", customRules);
+                    // Sequential Mode: Get topic context for dynamic renaming
+                    let msgTopicName = "General";
+                    const sourceGroupIdStr = linkData.channelId.toString().replace('-100', '');
+                    const sourceThreadId = msg.replyTo?.replyToTopId || msg.replyTo?.replyToMsgId || msg.replyToMsgId;
+                    if (sourceThreadId && sourceTopicCache.has(sourceGroupIdStr)) {
+                        msgTopicName = sourceTopicCache.get(sourceGroupIdStr)?.get(sourceThreadId) || "General";
+                    }
+                    
+                    let caption = applyRenameRules(msg.message || "", customRules, { msgId: msg.id, topicName: msgTopicName, seq: (task as any).sequenceIndex });
                     if (userDoc?.customCaptionTemplate) {
                         const template = userDoc.customCaptionTemplate;
                         caption = template.includes("{original}") ? template.replace("{original}", caption) : `${caption}\n\n${template}`;
@@ -9995,7 +10283,8 @@ async function startTopicClone(chatId: number, fromId: number, sourceGroupId: st
 }
 
     bot.on('message', async (msg) => {
-      const chatId = msg.chat.id;
+      try {
+          const chatId = msg.chat.id;
       const fromId = msg.from?.id;
       const text = msg.text;
 
@@ -11487,19 +11776,25 @@ async function startTopicClone(chatId: number, fromId: number, sourceGroupId: st
                 forceGeneralPath: true
             });
         }
-        if (linkTasksToQueue.length > 0) {
-            taskQueue.push(...linkTasksToQueue);
-            dbEnqueueTasks(linkTasksToQueue).catch(e => console.error("[Queue DB] Bulk enqueue error:", e));
-        }
+          if (linkTasksToQueue.length > 0) {
+              taskQueue.push(...linkTasksToQueue);
+              dbEnqueueTasks(linkTasksToQueue).catch(e => console.error("[Queue DB] Bulk enqueue error:", e));
+          }
 
-        runNextTask();
-        const options: any = { parse_mode: 'Markdown' };
-        if (msg.message_thread_id) options.message_thread_id = msg.message_thread_id;
-         const addedCount = links.length;
-         const totalQueued = taskQueue.length;
-         const message = `╭─ ⌛ 𝗤𝘂𝗲𝘂𝗲𝗱 ───╮\n│ ✅ 𝗔𝗱𝗱𝗲𝗱 : ${addedCount}         \n│ 📦 𝗧𝗼𝘁𝗮𝗹 : ${totalQueued}\n╰────────────╯`;
-         safeSendMessage(msg.chat.id, message, options);
-        return;
+          runNextTask();
+          const options: any = { parse_mode: 'Markdown' };
+          if (msg.message_thread_id) options.message_thread_id = msg.message_thread_id;
+           const addedCount = links.length;
+           const totalQueued = taskQueue.length;
+           const message = `╭─ ⌛ 𝗤𝘂𝗲𝘂𝗲𝗱 ───╮\n│ ✅ 𝗔𝗱𝗱𝗲𝗱 : ${addedCount}         \n│ 📦 𝗧𝗼𝘁𝗮𝗹 : ${totalQueued}\n╰────────────╯`;
+           safeSendMessage(msg.chat.id, message, options);
+          return;
+        }
+      } catch (handlerErr: any) {
+          console.error(`[Message Handler] Fatal Error:`, handlerErr);
+          if (msg.from?.id) {
+              safeSendMessage(msg.chat.id, `❌ **Unexpected Error:** ${handlerErr.message || "Unknown error occurred"}`);
+          }
       }
     });
 
@@ -11555,11 +11850,6 @@ async function startTopicClone(chatId: number, fromId: number, sourceGroupId: st
   }
 }
 
-// 404 handler for API routes to prevent falling through to Vite HTML
-app.all('/api/*', (req, res) => {
-    res.status(404).json({ error: `API route not found: ${req.method} ${req.url}` });
-});
-
 // Global error handlers to prevent unhandled rejections from crashing or being noisy
 process.on('unhandledRejection', (reason: any, promise) => {
     const msg = (reason?.message || String(reason)).toLowerCase();
@@ -11579,7 +11869,8 @@ process.on('unhandledRejection', (reason: any, promise) => {
         msg.includes('peer_id_invalid') ||
         msg.includes('user_deactivated') ||
         msg.includes('input_user_deactivated') ||
-        msg.includes('flood_wait')
+        msg.includes('flood_wait') ||
+        msg.includes('no text in the message to edit')
     ) {
         console.warn('Silent caught known Telegram Rejection:', msg);
     } else {

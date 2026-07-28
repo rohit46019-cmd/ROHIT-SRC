@@ -41,6 +41,7 @@ import type { BotStatus } from './types';
 import SystemStatusBar from './components/SystemStatusBar';
 import LogViewer from './components/LogViewer';
 import MirrorPathManager from './components/MirrorPathManager';
+import BottomNav from './components/BottomNav';
 import { CompactCard, SectionHeader } from './components/UIElements';
 
 type Tab = 'home' | 'control' | 'mirror' | 'config' | 'system';
@@ -60,6 +61,8 @@ export default function App() {
   const [batchStart, setBatchStart] = useState('');
   const [batchEnd, setBatchEnd] = useState('');
   const [batchIsMirror, setBatchIsMirror] = useState(true);
+  const [batchIsFast, setBatchIsFast] = useState(true);
+  const [batchIsBot, setBatchIsBot] = useState(false);
   
   // Settings
   const [adminId, setAdminId] = useState('');
@@ -93,6 +96,8 @@ export default function App() {
           setApiHash(statusData.settings?.apiHash || '');
           setCooldown(statusData.settings?.cooldownSeconds?.toString() || '5');
         }
+        if (historyData) setMirrorHistory(historyData.logs || []);
+        if (failedData) setFailedTasks(failedData.failed || []);
         setTelegramSessions(sessionsData);
       } catch (err) {
         console.error('Fetch error:', err);
@@ -165,24 +170,36 @@ export default function App() {
 
   const handleBatchStart = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!batchBaseUrl || !batchStart || !batchEnd) return alert("Please fill all batch fields.");
+    
+    // Construct links as expected by server
+    const baseUrl = batchBaseUrl.endsWith('/') ? batchBaseUrl : batchBaseUrl + '/';
+    const startLink = baseUrl + batchStart;
+    const endLink = baseUrl + batchEnd;
+
     try {
       const res = await fetch('/api/batch/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
-          baseUrl: batchBaseUrl, 
-          startId: batchStart, 
-          endId: batchEnd, 
-          isMirror: batchIsMirror 
+          startLink, 
+          endLink, 
+          isMirror: batchIsMirror,
+          isForwardOnly: batchIsFast || batchIsBot, // Treat bot forward as a type of forward-only
+          isBotForward: batchIsBot
         })
       });
       if (res.ok) {
         alert('Batch task queued');
-        setBatchBaseUrl('');
         setBatchStart('');
         setBatchEnd('');
+      } else {
+        const err = await res.json();
+        alert('Error: ' + (err.error || 'Failed to start batch'));
       }
-    } catch (e) {}
+    } catch (e) {
+      alert('Network error starting batch');
+    }
   };
 
   const StatusBadge = ({ label, active, icon: Icon }: { label: string, active: boolean, icon: any }) => (
@@ -365,11 +382,20 @@ export default function App() {
             onChange={e => setBatchEnd(e.target.value)}
             className="w-full bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-2 py-1.5 text-xs"
           />
-          <div className="md:col-span-4 flex items-center justify-between">
+          <div className="md:col-span-4 flex items-center gap-4">
             <label className="flex items-center gap-2 cursor-pointer select-none">
               <input type="checkbox" checked={batchIsMirror} onChange={e => setBatchIsMirror(e.target.checked)} className="rounded border-slate-300 dark:border-slate-700" />
               <span className="text-[10px] font-bold text-slate-500 uppercase">Batch Mirror</span>
             </label>
+            <label className="flex items-center gap-2 cursor-pointer select-none">
+              <input type="checkbox" checked={batchIsFast} onChange={e => setBatchIsFast(e.target.checked)} className="rounded border-slate-300 dark:border-slate-700" />
+              <span className="text-[10px] font-bold text-slate-500 uppercase">Fast Forward</span>
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer select-none" title="Bot ID se forward karega (Bot Account)">
+              <input type="checkbox" checked={batchIsBot} onChange={e => setBatchIsBot(e.target.checked)} className="rounded border-slate-300 dark:border-slate-700" />
+              <span className="text-[10px] font-bold text-slate-500 uppercase">Bot ID Forward</span>
+            </label>
+            <div className="flex-1" />
             <button type="submit" className="btn-primary px-8">Start Batch Job</button>
           </div>
         </form>
@@ -565,9 +591,6 @@ export default function App() {
         <div className="flex-1 flex flex-col h-screen overflow-hidden">
           <header className="h-14 border-b border-slate-200 dark:border-slate-900 bg-white/50 dark:bg-[#0b1224]/50 backdrop-blur-md flex items-center justify-between px-4 lg:px-8 shrink-0">
             <div className="flex items-center gap-4">
-              <button onClick={() => setIsSidebarOpen(true)} className="lg:hidden p-1.5 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg text-slate-500 transition-colors">
-                <Menu size={18} />
-              </button>
               <div className="flex items-center gap-3">
                 <StatusBadge label={data?.status || 'Offline'} active={data?.status === 'Running'} icon={Activity} />
                 <StatusBadge label="MongoDB" active={data?.dbStatus === 'Connected'} icon={Database} />
@@ -585,7 +608,7 @@ export default function App() {
             </div>
           </header>
 
-          <main className="flex-1 overflow-y-auto p-4 lg:p-8 custom-scrollbar">
+          <main className="flex-1 overflow-y-auto p-4 lg:p-8 pb-24 lg:pb-8 custom-scrollbar">
             <div className="max-w-4xl mx-auto space-y-6">
               <SystemStatusBar />
               {activeTab === 'home' && renderHome()}
@@ -595,6 +618,7 @@ export default function App() {
               {activeTab === 'system' && renderSystem()}
             </div>
           </main>
+          <BottomNav activeTab={activeTab} setActiveTab={setActiveTab} />
         </div>
       </div>
     </div>
